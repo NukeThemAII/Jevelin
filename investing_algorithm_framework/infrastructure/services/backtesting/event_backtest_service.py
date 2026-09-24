@@ -1,0 +1,304 @@
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List
+
+from investing_algorithm_framework.domain import BacktestDateRange, \
+    BacktestRun, BacktestWindow, generate_backtest_summary_metrics, Backtest, \
+    PositionMode
+from investing_algorithm_framework.domain.models.trade.trade_status import \
+    TradeStatus
+from investing_algorithm_framework.services import DataProviderService, \
+    create_backtest_metrics
+from .schedule_generation import generate_backtest_schedule
+
+
+logger = logging.getLogger(__name__)
+
+
+class EventBacktestService:
+    """
+    Service that handles event-driven backtesting.
+
+    This service encapsulates the logic for running event-driven backtests,
+    where the strategy's `on_run` method is called at each scheduled time
+    step. This is different from vectorized backtesting where buy/sell
+    signals are generated in a vectorized manner.
+
+    The event-driven backtest simulates the trading bot running in real-time,
+    executing strategies at their scheduled intervals and processing orders,
+    trades, stop losses, and take profits at each iteration.
+    """
+
+    def __init__(
+        self,
+        data_provider_service: DataProviderService,
+        order_service,
+        portfolio_service,
+        portfolio_snapshot_service,
+        position_repository,
+        trade_service,
+        configuration_service,
+        portfolio_configuration_service,
+    ):
+        """
+        Initialize the EventBacktestService.
+
+        Args:
+            data_provider_service: Service for fetching market data.
+            order_service: Service for managing orders.
+            portfolio_service: Service for managing portfolios.
+            portfolio_snapshot_service: Service for creating
+                portfolio snapshots.
+            position_repository: Repository for positions.
+            trade_service: Service for managing trades.
+            configuration_service: Service for configuration management.
+            portfolio_configuration_service: Service for
+                portfolio configuration.
+        """
+        self._data_provider_service = data_provider_service
+        self._order_service = order_service
+        self._portfolio_service = portfolio_service
+        self._portfolio_snapshot_service = portfolio_snapshot_service
+        self._position_repository = position_repository
+        self._trade_service = trade_service
+        self._configuration_service = configuration_service
+        self._portfolio_configuration_service = portfolio_configuration_service
+
+    def run(
+        self,
+        algorithm,
+        backtest_date_range: BacktestDateRange,
+        risk_free_rate: float,
+        event_loop_service,
+        trade_order_evaluator,
+        show_progress: bool = True,
+        metrics_backend: str = "python",
+    ) -> BacktestRun:
+        """
+        Run an event-driven backtest for an algorithm.
+
+        This method executes the algorithm's strategies according to their
+        scheduled intervals, simulating real-time trading behavior.
+
+        Args:
+            algorithm: The algorithm containing strategies and tasks to run.
+            backtest_date_range: The date range for the backtest.
+            risk_free_rate: The risk-free rate for calculating metrics.
+            event_loop_service: The event loop service instance
+                (pre-configured).
+            trade_order_evaluator: The trade order evaluator for handling
+                pending orders, stop losses, and take profits.
+            show_progress: Whether to show progress bars.
+            metrics_backend: "python", "rust" for native risk metrics,
+                or "auto" with Python fallback. The event loop stays Python.
+
+        Returns:
+            BacktestRun: The backtest run containing results and metrics.
+        """
+        # Generate schedule
+        schedule = self.generate_schedule(
+            algorithm.strategies,
+            algorithm.tasks,
+            backtest_date_range.start_date,
+            backtest_date_range.end_date
+        )
+
+        # Initialize and run the event loop
+        event_loop_service.initialize(
+            algorithm=algorithm,
+            trade_order_evaluator=trade_order_evaluator
+        )
+        event_loop_service.start(
+            schedule=schedule, show_progress=show_progress
+        )
+
+        # Create backtest run from results
+        return self._create_backtest_run(
+            algorithm=algorithm,
+            backtest_date_range=backtest_date_range,
+            number_of_runs=event_loop_service.total_number_of_runs,
+            risk_free_rate=risk_free_rate,
+            recorded_values=event_loop_service.context
+            .get_recorded_values(),
+            metrics_backend=metrics_backend,
+        )
+
+    def generate_schedule(
+        self,
+        strategies,
+        tasks,
+        start_date: datetime,
+        end_date: datetime
+    ) -> Dict[datetime, Dict[str, List[str]]]:
+        """
+        Generates a dict-based schedule: datetime => {strategy_ids, task_ids}
+
+        This schedule determines when each strategy should be executed during
+        the backtest based on their defined time units and intervals.
+
+        Args:
+            strategies: List of strategies to schedule.
+            tasks: List of tasks to schedule.
+            start_date: Start date of the backtest.
+            end_date: End date of the backtest.
+
+        Returns:
+            Dict mapping datetime to strategy_ids and task_ids to run.
+
+        Delegates to the shared implementation in
+        ``schedule_generation.py`` — kept in sync with
+        ``BacktestService.generate_schedule`` since both engines
+        drive the same event loop.
+        """
+        return generate_backtest_schedule(
+            strategies, tasks, start_date, end_date
+        )
+
+    def _create_backtest_run(
+        self,
+        algorithm,
+        backtest_date_range: BacktestDateRange,
+        number_of_runs: int,
+        risk_free_rate: float,
+        recorded_values: dict = None,
+        metrics_backend: str = "python",
+    ) -> BacktestRun:
+        """
+        Create a BacktestRun from the current state after event loop execution.
+
+        Args:
+            algorithm: The algorithm that was backtested.
+            backtest_date_range: The date range of the backtest.
+            number_of_runs: Total number of strategy executions.
+            risk_free_rate: Risk-free rate for metrics calculation.
+            recorded_values: Optional dict of recorded values from context.
+
+        Returns:
+            BacktestRun: The completed backtest run with metrics.
+        """
+        # Get the portfolio
+        portfolio = self._portfolio_service.get_all()[0]
+        portfolio_configuration = self._portfolio_configuration_service \
+            .resolve_for_portfolio(portfolio)
+        position_mode = getattr(
+            portfolio_configuration, "position_mode", PositionMode.NETTING
+        )
+
+        # Get initial unallocated amount
+        initial_unallocated = self._get_initial_unallocated()
+
+        # Create the backtest run
+        run = BacktestRun(
+            backtest_window=BacktestWindow(train_range=backtest_date_range),
+            initial_unallocated=initial_unallocated,
+            created_at=datetime.now(tz=timezone.utc),
+            portfolio_snapshots=(
+                self._portfolio_snapshot_service.repository.iter_all(
+                    {"portfolio_id": portfolio.id}
+                )
+            ),
+            number_of_runs=number_of_runs,
+            trades=self._trade_service.repository.iter_all(
+                {"portfolio_id": portfolio.id}
+            ),
+            orders=self._order_service.repository.iter_all(
+                {"portfolio_id": portfolio.id}
+            ),
+            positions=self._position_repository.get_all(
+                {"portfolio": portfolio.id}
+            ),
+            recorded_values=recorded_values or {},
+            metadata={"position_mode": PositionMode(position_mode).value},
+        )
+
+        # Populate summary counts so consumers (CLI/MCP/reports) don't see
+        # zeros even though trades/orders are present.
+        run.number_of_days = max(
+            (backtest_date_range.end_date -
+             backtest_date_range.start_date).days,
+            0,
+        )
+        run.number_of_trades = len(run.trades)
+        run.number_of_trades_closed = sum(
+            1 for t in run.trades
+            if getattr(t, "status", None) == TradeStatus.CLOSED.value
+            or getattr(t, "status", None) == TradeStatus.CLOSED
+        )
+        run.number_of_trades_open = sum(
+            1 for t in run.trades
+            if getattr(t, "status", None) == TradeStatus.OPEN.value
+            or getattr(t, "status", None) == TradeStatus.OPEN
+        )
+        run.number_of_orders = len(run.orders)
+        run.number_of_positions = len(run.positions)
+
+        # Calculate and add metrics
+        backtest_metrics = create_backtest_metrics(
+            run, risk_free_rate=risk_free_rate, metrics_backend=metrics_backend
+        )
+        run.backtest_metrics = backtest_metrics
+
+        return run
+
+    def _get_initial_unallocated(self) -> float:
+        """
+        Get the initial unallocated amount for the backtest.
+
+        Returns:
+            float: The initial unallocated amount.
+        """
+        portfolios = self._portfolio_service.get_all()
+        initial_unallocated = 0.0
+
+        for portfolio in portfolios:
+            initial_unallocated += portfolio.initial_balance
+
+        return initial_unallocated
+
+    def create_backtest(
+        self,
+        algorithm,
+        backtest_date_range: BacktestDateRange,
+        number_of_runs: int,
+        risk_free_rate: float,
+    ) -> Backtest:
+        """
+        Create a Backtest object from the current state.
+
+        This method creates a full Backtest object containing the backtest
+        run, metrics, and summary.
+
+        Args:
+            algorithm: The algorithm that was backtested.
+            backtest_date_range: The date range of the backtest.
+            number_of_runs: Total number of strategy executions.
+            risk_free_rate: Risk-free rate for metrics calculation.
+
+        Returns:
+            Backtest: The completed backtest with run and summary.
+        """
+        run = self._create_backtest_run(
+            algorithm=algorithm,
+            backtest_date_range=backtest_date_range,
+            number_of_runs=number_of_runs,
+            risk_free_rate=risk_free_rate,
+        )
+
+        algorithm_id = (
+            algorithm.algorithm_id
+            if hasattr(algorithm, 'algorithm_id')
+            else algorithm.id
+        )
+        strategy_ids = [
+            s.strategy_id for s in getattr(algorithm, 'strategies', [])
+        ]
+
+        return Backtest(
+            algorithm_id=algorithm_id,
+            strategy_ids=strategy_ids,
+            event_runs=[run],
+            event_summary=generate_backtest_summary_metrics(
+                [run.backtest_metrics]
+            ),
+            risk_free_rate=risk_free_rate,
+        )

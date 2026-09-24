@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title }}</title>
+<style>
+{{ css }}
+</style>
+<script src="https://finterion.com/sdk/finterion-auth.js"></script>
+</head>
+<body>
+
+{# ── Top controls ─────────────────────────────────────────────── #}
+<div class="top-controls">
+  <button class="finterion-tab" onclick="showPage('finterion')">
+    <img class="logo-dark" src="data:image/png;base64,{{ logo_dark_b64 }}" alt="Finterion" height="22">
+    <img class="logo-light" src="data:image/png;base64,{{ logo_light_b64 }}" alt="Finterion" height="22">
+  </button>
+  <button class="save-btn" onclick="saveReport()" title="Save report as HTML">&#128190; Save</button>
+  <button class="notes-toggle-btn" onclick="toggleNotesPane()" title="Report Builder">&#128203;</button>
+  <button class="theme-toggle" onclick="toggleTheme()">&#9788;</button>
+</div>
+
+{# ── Sidebar ──────────────────────────────────────────────────── #}
+<nav class="sidebar">
+  <div class="sidebar-title">{{ title }}</div>
+  <div class="sb-item active" data-page="overview"
+       onclick="showPage('overview')">
+    <span class="sb-dot overview-dot"></span>Overview
+  </div>
+  <div class="sb-item" data-page="windows"
+       onclick="showPage('windows')">
+    <span class="sb-dot" style="background:var(--accent)"></span>Windows
+  </div>
+  {% if not is_single %}
+  <div class="sb-item" data-page="compare"
+       onclick="showPage('compare')" id="sb-compare" style="display:none">
+    <span class="sb-dot" style="background:var(--amber)"></span>Compare
+  </div>
+  {% endif %}
+  <div class="sb-divider"></div>
+  <div class="sb-label">Strategies</div>
+  {% set tags_used = strategies | selectattr('tag') | map(attribute='tag') | unique | list %}
+  {% if tags_used | length > 0 %}
+    {% for tag in tags_used %}
+    <div class="sb-tag-group">
+      <div class="sb-tag-toggle collapsed" onclick="toggleSbTag(this)">
+        <span class="sb-tag-arrow">&#9660;</span>
+        <span class="tag-badge">{{ tag }}</span>
+        <span style="font-size:0.6rem;color:var(--text-dim)">({{ strategies | selectattr('tag', 'equalto', tag) | list | length }})</span>
+      </div>
+      <div class="sb-tag-children collapsed">
+        {% for s in strategies %}
+        {% if s.tag == tag %}
+        <div class="sb-item" data-page="{{ s.id }}" data-strat-idx="{{ loop.index0 }}">
+          <input type="checkbox" class="sb-cb" data-idx="{{ loop.index0 }}" onclick="event.stopPropagation();toggleSbStrat({{ loop.index0 }},this.checked)" title="Include in comparison">
+          <span class="sb-dot" style="background:{{ s.color }}"></span>
+          <span class="sb-name" onclick="showPage('{{ s.id }}')">{{ s.name }}</span>
+          <button class="sb-chal-btn" data-idx="{{ loop.index0 }}" onclick="event.stopPropagation();toggleSbChallenger({{ loop.index0 }})" title="Set as challenger">&#9873;</button>
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+    {% set untagged = strategies | rejectattr('tag') | list %}
+    {% if untagged | length > 0 %}
+    {% for s in untagged %}
+    <div class="sb-item" data-page="{{ s.id }}" data-strat-idx="{{ loop.index0 }}">
+      <input type="checkbox" class="sb-cb" data-idx="{{ loop.index0 }}" onclick="event.stopPropagation();toggleSbStrat({{ loop.index0 }},this.checked)" title="Include in comparison">
+      <span class="sb-dot" style="background:{{ s.color }}"></span>
+      <span class="sb-name" onclick="showPage('{{ s.id }}')">{{ s.name }}</span>
+      <button class="sb-chal-btn" data-idx="{{ loop.index0 }}" onclick="event.stopPropagation();toggleSbChallenger({{ loop.index0 }})" title="Set as challenger">&#9873;</button>
+    </div>
+    {% endfor %}
+    {% endif %}
+  {% else %}
+    {% for s in strategies %}
+    <div class="sb-item" data-page="{{ s.id }}" data-strat-idx="{{ loop.index0 }}">
+      <input type="checkbox" class="sb-cb" data-idx="{{ loop.index0 }}" onclick="event.stopPropagation();toggleSbStrat({{ loop.index0 }},this.checked)" title="Include in comparison">
+      <span class="sb-dot" style="background:{{ s.color }}"></span>
+      <span class="sb-name" onclick="showPage('{{ s.id }}')">{{ s.name }}</span>
+      <button class="sb-chal-btn" data-idx="{{ loop.index0 }}" onclick="event.stopPropagation();toggleSbChallenger({{ loop.index0 }})" title="Set as challenger">&#9873;</button>
+    </div>
+    {% endfor %}
+  {% endif %}
+</nav>
+
+{# ── Main Content ─────────────────────────────────────────────── #}
+<div class="main">
+
+{# ━━ Overview page ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #}
+<div class="page active" id="page-overview">
+  <h2 class="page-title">
+    Overview
+    {% if not is_single %}
+    <select id="overview-window-select" class="view-select"
+            onchange="onOverviewWindowChange(this.value)">
+      <option value="summary">All Windows</option>
+    </select>
+    <button class="view-select" onclick="openStrategyModal()" id="strat-select-btn" style="cursor:pointer">
+      Strategies <span id="strat-select-count" style="font-weight:700;color:var(--accent)"></span>
+    </button>
+    {% endif %}
+  </h2>
+
+  <div class="kpi-row" id="overview-kpi-row">
+    <div class="kpi-card">
+      <div class="kpi-label">Strategies</div>
+      <div class="kpi-value">{{ strategies | length }}</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Backtest Windows</div>
+      <div class="kpi-value">{{ windows_meta | length }}</div>
+    </div>
+  </div>
+
+  {# Benchmark Insights (right under KPIs) #}
+  {% if benchmarks and not is_single %}
+  <div class="chart-card" id="bench-insights-card">
+    <div class="chart-title">Benchmark Insights <span id="benchmark-chips"></span></div>
+    <div id="bench-insights"></div>
+  </div>
+  {% endif %}
+
+  {# Window Coverage (collapsed by default) #}
+  {% if not is_single %}
+  <div id="overview-window-coverage"></div>
+  {% endif %}
+
+  {# Key Metrics ranking table #}
+  <div class="chart-card">
+    <div class="chart-title">
+      Key Metrics
+      <span id="ranking-count" style="font-size:12px;color:var(--dim);font-weight:normal"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="comp-table" id="comp-table">
+        <thead>
+          <tr>
+            <th class="shortlist-col" title="Shortlist">&#9733;</th>
+            <th class="sticky-col">Strategy</th>
+            <th data-col="cagr">CAGR <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="sharpe_ratio">Sharpe <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="sortino_ratio">Sortino <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="calmar_ratio">Calmar <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="max_drawdown">Max DD <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="annual_volatility">Volatility <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="recovery_factor">Recovery <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="total_net_gain_percentage">Net Gain % <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="consistency_score">Consistency <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="stability_score">Stability <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="var_95">VaR 95% <span class="sort-arrow">&#9650;</span></th>
+            <th data-col="cvar_95">CVaR 95% <span class="sort-arrow">&#9650;</span></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  {# Trading Activity Ranking (overview) #}
+  <div id="overview-trading-activity"></div>
+
+  {# Return Scenarios (overview) #}
+  <div id="overview-return-scenarios"></div>
+
+  {# Equity canvas #}
+  <div class="chart-card" id="overview-eq-card">
+    <div class="chart-title">Equity Curves (Normalized %)</div>
+    <div class="chart-wrap" id="overview-eq-wrap">
+      <canvas id="c-overview-eq"></canvas>
+      <div class="tooltip" id="tt-overview-eq"></div>
+    </div>
+    <div id="equity-legend" class="eq-legend"></div>
+  </div>
+
+  {# Drawdown over time (multi-strategy only) #}
+  {% if not is_single %}
+  <div class="chart-card">
+    <div class="chart-title">Drawdown Over Time</div>
+    <div class="chart-wrap" id="overview-dd-wrap">
+      <canvas id="c-overview-dd"></canvas>
+      <div class="tooltip" id="tt-overview-dd"></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Risk-Return Scatter (multi-strategy only) #}
+  {% if not is_single %}
+  <div class="chart-card">
+    <div class="chart-title">Risk-Return Scatter</div>
+    <div class="chart-wrap">
+      <canvas id="c-overview-scatter"></canvas>
+      <div class="tooltip" id="tt-overview-scatter"></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Return Distribution + Correlation Matrix side-by-side #}
+  {% if not is_single %}
+  <div class="grid-2x2">
+    <div class="chart-card">
+      <div class="chart-title">Return Distribution (per Window)</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-return-dist"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Correlation Matrix</div>
+      <div id="corr-matrix" class="corr-container"></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Rolling Sharpe (multi-strategy only) #}
+  {% if not is_single %}
+  <div class="chart-card">
+    <div class="chart-title">Rolling Sharpe Ratio</div>
+    <div class="chart-wrap" id="overview-rsharpe-wrap">
+      <canvas id="c-overview-rsharpe"></canvas>
+      <div class="tooltip" id="tt-overview-rsharpe"></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Rolling Returns (multi-strategy only) #}
+  {% if not is_single %}
+  <div class="chart-card">
+    <div class="chart-title">Rolling 12-Month Returns
+      <select id="overview-rolling-ret-period" class="view-select" style="font-size:0.7rem;margin-left:8px"
+              onchange="drawRollingReturns('overview')">
+        <option value="12">12-Month</option>
+        <option value="6">6-Month</option>
+        <option value="3">3-Month</option>
+      </select>
+    </div>
+    <div class="chart-wrap" id="overview-rolling-ret-wrap">
+      <canvas id="c-overview-rolling-ret"></canvas>
+      <div class="tooltip" id="tt-overview-rolling-ret"></div>
+    </div>
+  </div>
+  {% endif %}
+
+  {# 2×3 metric comparison grid (multi-strategy only) #}
+  {% if not is_single %}
+  <div class="grid-2x3">
+    <div class="chart-card">
+      <div class="chart-title">CAGR</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-cmp-cagr"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Sharpe Ratio</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-cmp-sharpe"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Sortino Ratio</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-cmp-sortino"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Calmar Ratio</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-cmp-calmar"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Max Drawdown</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-cmp-dd"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Win Rate</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-cmp-wr"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Profit Factor</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-cmp-pf"></canvas></div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+{# ━━ Windows page ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #}
+<div class="page" id="page-windows" style="display:none">
+  <h2 class="page-title">
+    Backtest Window Analysis
+    {% if not is_single %}
+    <button class="view-select" onclick="openStrategyModal()" style="cursor:pointer">
+      Strategies <span class="strat-select-count-mirror" style="font-weight:700;color:var(--accent)"></span>
+    </button>
+    {% endif %}
+  </h2>
+
+  <div class="kpi-row">
+    <div class="kpi-card">
+      <div class="kpi-label">Total Windows</div>
+      <div class="kpi-value">{{ windows_meta | length }}</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Strategies</div>
+      <div class="kpi-value">{{ strategies | length }}</div>
+    </div>
+  </div>
+
+  <div class="chart-card">
+    <div class="chart-title">All Backtest Windows</div>
+    <div class="table-wrap">
+      <table class="comp-table">
+        <thead>
+          <tr>
+            <th>Window</th><th>Start</th><th>End</th>
+            <th>Days</th><th>Strategies</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for w in windows_meta %}
+          <tr>
+            <td>{{ w.label }}</td><td>{{ w.start }}</td>
+            <td>{{ w.end }}</td><td>{{ w.days }}</td>
+            <td>{{ w.n_strategies }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {# Window Coverage (on windows page, expanded by default) #}
+  <div id="windows-page-coverage"></div>
+</div>
+
+{# ━━ Per-strategy pages (lazy-rendered by JS on first visit) ━━━ #}
+<div id="strategy-pages-container"></div>
+
+{# ━━ Compare page (multi-strategy only) ━━━━━━━━━━━━━━━━━━━━━━━ #}
+{% if not is_single %}
+<div class="page" id="page-compare" style="display:none">
+  <h2 class="page-title">Strategy Comparison
+    <select id="compare-window-select" class="view-select"
+            onchange="onCompareWindowChange(this.value)">
+      <option value="summary">All Windows</option>
+    </select>
+  </h2>
+
+  {# Key Metrics ranking (same style as overview) #}
+  <div id="compare-key-metrics"></div>
+
+  {# Parameters Comparison #}
+  <div id="compare-parameters"></div>
+
+  {# Trading Activity ranking (same style as overview) #}
+  <div id="compare-trading-activity"></div>
+
+  {# Return Scenarios #}
+  <div id="compare-return-scenarios"></div>
+
+  {# Return/Growth Distribution #}
+  <div id="compare-return-distribution"></div>
+
+  {# Equity + legend #}
+  <div class="chart-card">
+    <div class="chart-title">Equity Curves</div>
+    <div class="chart-wrap">
+      <canvas id="c-compare-eq"></canvas>
+      <div class="tooltip" id="tt-compare-eq"></div>
+    </div>
+    <div id="compare-eq-legend" class="eq-legend"></div>
+  </div>
+
+  {# Drawdown overlay #}
+  <div class="chart-card">
+    <div class="chart-title">Drawdown Over Time</div>
+    <div class="chart-wrap" id="compare-dd-wrap">
+      <canvas id="c-compare-dd-time"></canvas>
+      <div class="tooltip" id="tt-compare-dd-time"></div>
+    </div>
+  </div>
+
+  {# 2×3 metric bar grid #}
+  <div class="grid-2x3">
+    <div class="chart-card">
+      <div class="chart-title">CAGR</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-cagr"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Sharpe Ratio</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-sharpe"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Sortino Ratio</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-sortino"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Calmar Ratio</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-calmar"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Max Drawdown</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-dd"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Win Rate</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-wr"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Profit Factor</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-pf"></canvas></div>
+    </div>
+  </div>
+
+  {# Return distribution + Correlation matrix #}
+  <div class="grid-2x2">
+    <div class="chart-card">
+      <div class="chart-title">Return Distribution (per Window)</div>
+      <div class="chart-wrap chart-sm"><canvas id="c-compare-dist"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Correlation Matrix</div>
+      <div id="compare-corr-matrix" class="corr-container"></div>
+    </div>
+  </div>
+
+  {# Rolling Sharpe #}
+  <div class="chart-card">
+    <div class="chart-title">Rolling Sharpe Ratio</div>
+    <div class="chart-wrap" id="compare-rsharpe-wrap">
+      <canvas id="c-compare-rsharpe"></canvas>
+      <div class="tooltip" id="tt-compare-rsharpe"></div>
+    </div>
+  </div>
+
+  {# Risk-Return Scatter #}
+  <div class="chart-card">
+    <div class="chart-title">Risk-Return Scatter</div>
+    <div class="chart-wrap">
+      <canvas id="c-compare-scatter"></canvas>
+      <div class="tooltip" id="tt-compare-scatter"></div>
+    </div>
+  </div>
+
+  {# Rolling Returns #}
+  <div class="chart-card">
+    <div class="chart-title">Rolling 12-Month Returns
+      <select id="compare-rolling-ret-period" class="view-select" style="font-size:0.7rem;margin-left:8px"
+              onchange="drawRollingReturns('compare')">
+        <option value="12">12-Month</option>
+        <option value="6">6-Month</option>
+        <option value="3">3-Month</option>
+      </select>
+    </div>
+    <div class="chart-wrap" id="compare-rolling-ret-wrap">
+      <canvas id="c-compare-rolling-ret"></canvas>
+      <div class="tooltip" id="tt-compare-rolling-ret"></div>
+    </div>
+  </div>
+
+  {# Relative Performance #}
+  <div class="chart-card">
+    <div class="chart-title">Relative Performance (vs First Selected)</div>
+    <div class="chart-wrap">
+      <canvas id="c-compare-relative"></canvas>
+      <div class="tooltip" id="tt-compare-relative"></div>
+    </div>
+  </div>
+
+  <div id="compare-table-container"></div>
+  <div id="compare-yearly"></div>
+</div>
+{% endif %}
+
+{# ━━ Finterion Marketplace page ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #}
+<div class="page" id="page-finterion" style="display:none">
+
+  {# Hero #}
+  <div class="fin-hero">
+    <div class="fin-hero-logo">
+      <img class="hero-logo-dark" src="data:image/png;base64,{{ logo_dark_b64 }}" alt="Finterion" height="38">
+      <img class="hero-logo-light" src="data:image/png;base64,{{ logo_light_b64 }}" alt="Finterion" height="38">
+    </div>
+    <h2 class="fin-hero-title">Finterion Marketplace</h2>
+    <p class="fin-hero-sub">
+      Monetize your trading strategy.
+      Publish your algorithm on Finterion and let investors subscribe to it.
+    </p>
+    <a class="finterion-cta" href="https://finterion.com" target="_blank"
+       rel="noopener noreferrer">Get Started &rarr;</a>
+    <div style="margin-top:1.25rem">
+      <button id="connect-btn" class="finterion-connect-btn">Connect to Finterion</button>
+    </div>
+    <div id="finterion-user-info" class="fin-user-info" style="display:none">
+      <span class="fin-user-dot"></span>
+      Connected as <strong id="finterion-username"></strong>
+    </div>
+  </div>
+
+  {# Features #}
+  <div class="fin-features">
+    <div class="fin-feature">
+      <div class="fin-feature-icon">&#128200;</div>
+      <h4>Prove Performance</h4>
+      <p>Use this framework to backtest your strategy across multiple windows and build a verified track record.</p>
+    </div>
+    <div class="fin-feature">
+      <div class="fin-feature-icon">&#127760;</div>
+      <h4>Reach Investors</h4>
+      <p>List your algorithm on the Finterion marketplace where investors browse and subscribe to strategies.</p>
+    </div>
+    <div class="fin-feature">
+      <div class="fin-feature-icon">&#128176;</div>
+      <h4>Monetize</h4>
+      <p>Set your own usage terms. Investors subscribe to your algorithm and you earn on your own conditions.</p>
+    </div>
+  </div>
+
+  {# How it works #}
+  <div class="chart-card" style="margin-top:1.5rem">
+    <div class="chart-title">How to Publish Your Strategy</div>
+    <div class="fin-timeline">
+      <div class="fin-tl-step">
+        <div class="step-num">1</div>
+        <div class="fin-tl-content">
+          <h4>Install the Plugin</h4>
+          <code>pip install finterion-investing-algorithm-framework</code>
+        </div>
+      </div>
+      <div class="fin-tl-step">
+        <div class="step-num">2</div>
+        <div class="fin-tl-content">
+          <h4>Get Your API Key</h4>
+          <p>Sign up at <a href="https://finterion.com" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">finterion.com</a> and grab the API key from your developer dashboard.</p>
+        </div>
+      </div>
+      <div class="fin-tl-step">
+        <div class="step-num">3</div>
+        <div class="fin-tl-content">
+          <h4>Register Components</h4>
+          <p>Add the Finterion order executor, portfolio provider, and ping action to your algorithm.</p>
+        </div>
+      </div>
+      <div class="fin-tl-step">
+        <div class="step-num">4</div>
+        <div class="fin-tl-content">
+          <h4>Deploy &amp; Monetize</h4>
+          <p>Deploy your algorithm, set your usage terms, and start earning when investors subscribe.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {# Bottom CTA #}
+  <div class="fin-bottom-cta">
+    <p>Ready to monetize your trading algorithm?</p>
+    <a class="finterion-cta" href="https://finterion.com" target="_blank"
+       rel="noopener noreferrer">Visit Finterion Marketplace &rarr;</a>
+  </div>
+</div>
+
+</div>{# /main #}
+
+{# Placeholder for persisted notes data — MUST appear before main <script>
+   so loadSavedReportData() can find it during script execution #}
+<script id="saved-report-data" type="application/json"></script>
+
+<script>
+// ===== DATA =====
+const IS_SINGLE = {{ is_single | tojson }};
+const WINDOWS_META = {{ windows_meta | tojson }};
+const STRATEGIES = {{ strategies | tojson }};
+const RUN_DATA = {{ run_data | tojson }};
+const RUN_LABELS = {{ run_labels | tojson }};
+const BENCHMARKS = {{ benchmarks | tojson }};
+// ===== STATIC JS =====
+{{ js }}
+
+// ===== FINTERION AUTH =====
+(function() {
+  if (typeof FinterionAuth === 'undefined') return;
+  var auth = new FinterionAuth();
+  var btn = document.getElementById('connect-btn');
+  if (!btn) return;
+  btn.addEventListener('click', function() {
+    auth.login()
+      .then(function(user) {
+        var info = document.getElementById('finterion-user-info');
+        var name = document.getElementById('finterion-username');
+        if (info && name) {
+          name.textContent = user.username;
+          info.style.display = 'inline-flex';
+        }
+        btn.style.display = 'none';
+      })
+      .catch(function(err) {
+        console.log('Auth flow cancelled');
+      });
+  });
+})();
+</script>
+
+<button class="compare-btn" id="compare-btn"
+        onclick="openCompare()">&#9881; Compare Selected</button>
+
+{# Strategy selection modal #}
+{% if not is_single %}
+<div class="modal-overlay" id="strat-modal-overlay" onclick="closeStrategyModal()">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span class="modal-title">Select Strategies</span>
+        <div class="modal-tabs">
+          <button class="modal-tab active" data-modal-tab="metrics" onclick="switchModalTab('metrics')">Metrics</button>
+          <button class="modal-tab" data-modal-tab="parameters" onclick="switchModalTab('parameters')">Parameters</button>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <label style="font-size:0.72rem;color:var(--text-secondary);cursor:pointer;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="modal-select-all" onclick="modalToggleAll(this)"> All
+        </label>
+        <button class="modal-close" onclick="closeStrategyModal()">&times;</button>
+      </div>
+    </div>
+    <div class="modal-body" id="strat-modal-body"></div>
+    <div class="modal-body" id="strat-modal-params-body" style="display:none"></div>
+    <div class="modal-footer">
+      <span id="modal-selected-count" style="font-size:0.72rem;color:var(--text-secondary)"></span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:0.65rem;color:var(--text-dim)">Top:</span>
+        <button class="view-select" onclick="modalSelectTopN(5)" style="cursor:pointer;padding:3px 8px;font-size:0.7rem" title="Select top 5 by current sort">5</button>
+        <button class="view-select" onclick="modalSelectTopN(10)" style="cursor:pointer;padding:3px 8px;font-size:0.7rem" title="Select top 10 by current sort">10</button>
+        <button class="view-select" onclick="modalSelectTopN(25)" style="cursor:pointer;padding:3px 8px;font-size:0.7rem" title="Select top 25 by current sort">25</button>
+        <span style="border-left:1px solid var(--border);height:16px"></span>
+        <select id="modal-page-size" class="view-select" onchange="modalPageSizeChange(this.value)" style="font-size:0.7rem;padding:3px 6px">
+          <option value="10">10 rows</option>
+          <option value="25" selected>25 rows</option>
+          <option value="50">50 rows</option>
+          <option value="0">All</option>
+        </select>
+        <button class="view-select" id="modal-prev" onclick="modalPagePrev()" style="cursor:pointer;padding:3px 8px;font-size:0.7rem">&laquo;</button>
+        <span id="modal-page-info" style="font-size:0.68rem;color:var(--text-secondary);white-space:nowrap"></span>
+        <button class="view-select" id="modal-next" onclick="modalPageNext()" style="cursor:pointer;padding:3px 8px;font-size:0.7rem">&raquo;</button>
+        <button class="view-select" onclick="closeStrategyModal()" style="cursor:pointer;padding:6px 16px">Done</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{# ── Report Builder Pane ───────────────────────────────────────── #}
+<div class="notes-pane" id="notes-pane">
+  <div class="notes-header">
+    <div class="notes-tabs">
+      <button class="notes-tab active" data-notes-tab="notes" onclick="switchNotesTab('notes')">&#128221; Notes</button>
+      <button class="notes-tab" data-notes-tab="export" onclick="switchNotesTab('export')">&#128196; Export</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <button class="notes-expand-btn" id="notes-expand-btn" onclick="toggleNotesPaneExpand()" title="Expand panel">
+        <svg viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+      </button>
+      <button class="notes-close" onclick="toggleNotesPane()" title="Close">&times;</button>
+    </div>
+  </div>
+
+  {# Notes panel — list + detail rendered by JS #}
+  <div class="notes-panel active" id="notes-panel-notes">
+    <div class="notes-actions">
+      <button class="notes-action-btn" onclick="newNote()" style="flex:1">+ New Note</button>
+    </div>
+    <div class="notes-list" id="notes-list"></div>
+    <div class="notes-empty" id="notes-empty">
+      <div style="font-size:1.5rem;margin-bottom:0.5rem">&#128221;</div>
+      <div>No analysis notes yet</div>
+      <div style="font-size:0.68rem;color:var(--text-dim);margin-top:0.25rem">Create a note to document your analysis with markdown, strategy selections, and snapshots</div>
+    </div>
+  </div>
+
+  {# Export panel #}
+  <div class="notes-panel" id="notes-panel-export">
+    <div class="export-panel">
+      <div class="export-section">
+        <div class="export-section-title">Report Summary</div>
+        <div id="export-summary" class="export-summary">Create notes to see the summary here.</div>
+      </div>
+      <div class="export-section">
+        <div class="export-section-title">Analysis Notes</div>
+        <div id="export-notes" class="export-content"></div>
+      </div>
+      <div class="export-actions">
+        <button class="export-btn" onclick="exportReportMarkdown()">&#128196; Copy as Markdown</button>
+        <button class="export-btn secondary" onclick="saveReport()">&#128190; Save HTML Report</button>
+      </div>
+
+      <div class="ai-section">
+        <div class="ai-section-header">
+          <span class="ai-icon">&#129302;</span>
+          <span class="ai-section-title">AI Analysis</span>
+        </div>
+        <div class="ai-section-desc">
+          Export all strategy data, metrics, per-window breakdowns, and trade data
+          as structured text. Paste into GitHub Copilot Chat, ChatGPT, or Claude for
+          AI-powered analysis, strategy selection, and recommendations.
+        </div>
+        <button class="export-btn ai-btn" id="ai-copy-btn" onclick="copyAIAnalysisData()">
+          &#129302; Copy All Data for AI Analysis
+        </button>
+        <div class="ai-tip">
+          <strong>Tip:</strong> Use with the MCP server for deeper integration — Copilot
+          can then query your backtest data directly in VS Code.
+          <code>pip install investing-algorithm-framework[mcp]</code>
+        </div>
+
+        <div class="ai-section" style="margin-top:1rem">
+          <div class="ai-section-header">
+            <span class="ai-icon">&#9881;</span>
+            <span class="ai-section-title">MCP Server Setup</span>
+          </div>
+          <div class="ai-section-desc">
+            The MCP server exposes all backtest data as tools an LLM can call.
+            Start it from a terminal pointing at your backtest directory:
+          </div>
+          <div style="background:var(--surface2);border-radius:6px;padding:0.6rem 0.8rem;margin:0.5rem 0;font-family:'JetBrains Mono',monospace;font-size:0.68rem;line-height:1.6;overflow-x:auto;white-space:pre;color:var(--text-secondary)">
+<span style="color:var(--text-dim)"># Single directory</span>
+iaf mcp -d /path/to/your/batch
+
+<span style="color:var(--text-dim)"># Multiple directories</span>
+iaf mcp -d batch_one -d batch_two
+
+<span style="color:var(--text-dim)"># Or without the CLI installed</span>
+python -m investing_algorithm_framework.cli.mcp_server -d /path/to/batch</div>
+          <div class="ai-section-desc" style="margin-top:0.4rem">
+            Then configure VS Code (<code>.vscode/settings.json</code>):
+          </div>
+          <div style="background:var(--surface2);border-radius:6px;padding:0.6rem 0.8rem;margin:0.5rem 0;font-family:'JetBrains Mono',monospace;font-size:0.68rem;line-height:1.6;overflow-x:auto;white-space:pre;color:var(--text-secondary)">{
+  "mcp": {
+    "servers": {
+      "backtest-analysis": {
+        "command": "iaf",
+        "args": ["mcp", "-d", "batch_one", "-d", "batch_two"]
+      }
+    }
+  }
+}</div>
+          <div class="ai-section-desc" style="margin-top:0.4rem;font-size:0.65rem;color:var(--text-dim)">
+            Once running, Copilot Chat (or any MCP client) can list strategies, compare metrics,
+            pull equity curves, create notes, and more — 23 tools in total.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

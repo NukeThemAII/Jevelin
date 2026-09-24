@@ -1,0 +1,29 @@
+from datetime import datetime
+
+from investing_algorithm_framework import (
+    BacktestDateRange, BacktestWindow, Study, Universe,
+)
+from investing_algorithm_framework import create_app
+from strategies.my_strategy import MyTradingStrategy
+
+app = create_app()
+app.add_strategy(MyTradingStrategy)
+app.add_market(market="BITVAVO", trading_symbol="EUR")
+
+
+if __name__ == "__main__":
+    backtest_date_range = BacktestDateRange(
+        start_date=datetime(2023, 1, 1),
+        end_date=datetime(2023, 12, 31),
+    )
+    results = app.run_backtest(
+        study=Study(
+            universe=Universe(market="BITVAVO", trading_symbol="EUR"),
+            initial_capital=1000,
+            backtest_windows=[
+                BacktestWindow(train_range=backtest_date_range),
+            ],
+        ),
+    )
+    print(results.df)
+    print(f"Full backtests saved in {results.directory}")

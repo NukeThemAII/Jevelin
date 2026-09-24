@@ -1,0 +1,168 @@
+from investing_algorithm_framework.domain import OrderSide, OrderType, OrderStatus
+from investing_algorithm_framework.domain import PortfolioConfiguration, MarketCredential
+from tests.resources import TestBase
+from datetime import datetime, timedelta, timezone
+
+
+class TestSQLOrderRepositoryIntegration(TestBase):
+    market_credentials = [
+        MarketCredential(
+            market="BINANCE",
+            api_key="api_key",
+            secret_key="secret_key",
+        )
+    ]
+    portfolio_configurations = [
+        PortfolioConfiguration(
+            market="BINANCE",
+            trading_symbol="EUR"
+        )
+    ]
+    external_balances = {
+        "EUR": 1000,
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.order_service = self.app.container.order_service()
+        self.portfolio_service = self.app.container.portfolio_service()
+        self.portfolio = self.portfolio_service.get_all()[0]
+        self.repository = self.app.container.order_repository()
+
+    def _create_order(self, **kwargs):
+        default_order = {
+            "portfolio_id": self.portfolio.id,
+            "target_symbol": "BTC",
+            "amount": 1,
+            "trading_symbol": "EUR",
+            "price": 10,
+            "order_side": OrderSide.BUY.value,
+            "order_type": OrderType.LIMIT.value,
+            "status": OrderStatus.OPEN.value,
+        }
+        default_order.update(kwargs)
+        order = self.order_service.create(default_order)
+
+        if "external_id" in kwargs:
+            order = self.order_service.update(
+                order.id,
+                {"external_id": kwargs["external_id"]}
+            )
+
+        if "status" in kwargs:
+            order = self.order_service.update(
+                order.id,
+                {"status": kwargs["status"]}
+            )
+
+        return order
+
+    def test_create(self):
+        data = {
+            "target_symbol": "BTC",
+            "amount": 1,
+            "trading_symbol": "EUR",
+            "price": 10,
+            "order_side": OrderSide.BUY.value,
+            "order_type": OrderType.LIMIT.value,
+            "status": OrderStatus.OPEN.value,
+        }
+        order = self.repository.create(data)
+        self.assertIsNotNone(order.id)
+
+        # Check that created at and updated at are set and are timezone utc
+        self.assertIsNotNone(order.created_at)
+        self.assertIsNotNone(order.updated_at)
+        self.assertEqual(order.created_at.tzinfo, timezone.utc)
+        self.assertEqual(order.updated_at.tzinfo, timezone.utc)
+
+    def test_filter_by_id(self):
+        order = self._create_order()
+        result = self.repository.get_all({"id": order.id})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].id, order.id)
+
+    def test_created_after_is_exclusive(self):
+        watermark = datetime(2026, 1, 2, tzinfo=timezone.utc)
+        for identity, date in enumerate((
+            watermark - timedelta(days=1), watermark,
+            watermark + timedelta(microseconds=1),
+        ), 1):
+            self.repository.create({
+                'id': identity, 'target_symbol': 'BTC',
+                'trading_symbol': 'EUR', 'amount': 1., 'price': 10.,
+                'order_side': OrderSide.BUY, 'order_type': OrderType.LIMIT,
+                'created_at': date,
+            })
+        self.assertEqual([row.id for row in self.repository.get_all({
+            'created_at_gt': watermark,
+        })], [3])
+
+    def test_filter_by_external_id(self):
+        self._create_order(external_id="custom_ext_id_123")
+        result = self.repository.get_all({"external_id": "custom_ext_id_123"})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].external_id, "custom_ext_id_123")
+
+    def test_filter_by_order_type_and_status(self):
+        order = self._create_order(order_type="LIMIT", status="CLOSED")
+        result = self.repository.get_all({
+            "order_type": "LIMIT",
+            "status": "CLOSED"
+        })
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].status, OrderStatus.CLOSED.value)
+
+    def test_filter_by_portfolio_id(self):
+        self._create_order()
+        result = self.repository.get_all({"portfolio_id": self.portfolio.id})
+        self.assertEqual(len(result), 1)
+
+    def test_filter_by_price_and_amount(self):
+        self._create_order(price=99.99, amount=3.0)
+        result = self.repository.get_all({"price": 99.99, "amount": 3.0})
+        self.assertEqual(len(result), 1)
+
+    def test_filter_by_target_symbol_and_trading_symbol(self):
+        order = self._create_order(target_symbol="ETH", trading_symbol="EUR")
+        result = self.repository.get_all({
+            "target_symbol": "ETH",
+            "trading_symbol": "EUR"
+        })
+        self.assertEqual(len(result), 1)
+
+    def test_order_by_created_at_asc(self):
+        self._create_order()
+        self._create_order()
+        results = self.repository.get_all({
+            "order_by_created_at_asc": True
+        })
+        self.assertLessEqual(results[0].created_at, results[1].created_at)
+
+    def test_simultaneous_orders_have_stable_business_order(self):
+        created_at = datetime(2023, 11, 27, 10, tzinfo=timezone.utc)
+        for identifier, symbol, price in (
+            (100, "DOT", 10), (300, "BTC", 11), (200, "BTC", 10),
+        ):
+            self._create_order(
+                id=identifier, target_symbol=symbol,
+                price=price, created_at=created_at,
+            )
+        for ascending in (False, True):
+            with self.subTest(ascending=ascending):
+                results = self.repository.get_all({
+                    "order_by_created_at_asc": ascending,
+                    "status": OrderStatus.OPEN.value,
+                })
+                self.assertEqual(
+                    [("BTC", 10), ("BTC", 11), ("DOT", 10)],
+                    [(order.target_symbol, order.price) for order in results],
+                )
+
+    def test_order_by_created_at_desc(self):
+        self._create_order()
+        self._create_order()
+        results = self.repository.get_all({
+            "order_by_created_at_asc": False
+        })
+        self.assertGreaterEqual(results[0].created_at, results[1].created_at)

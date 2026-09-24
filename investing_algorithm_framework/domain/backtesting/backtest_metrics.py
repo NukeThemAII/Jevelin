@@ -1,0 +1,687 @@
+import os
+from pathlib import Path
+from dataclasses import dataclass, field, fields
+from logging import getLogger
+from typing import Tuple, List, Dict, Optional
+from datetime import datetime, date
+import json
+import pandas as pd
+
+from investing_algorithm_framework.domain.models import Trade
+
+from .backtest_date_range import BacktestDateRange
+from .backtest_window import BacktestWindow
+from .history import BacktestHistory, SerializedHistory
+
+
+logger = getLogger(__name__)
+
+
+def _serialize_metric_point(point):
+    value, timestamp = point
+    return value, (timestamp.isoformat() if hasattr(timestamp, 'isoformat')
+                   else timestamp)
+
+
+_METRIC_HISTORY_FIELDS = frozenset({
+    'equity_curve', 'cumulative_return_series', 'rolling_sharpe_ratio',
+    'monthly_returns', 'yearly_returns', 'drawdown_series',
+    'twr_equity_curve', 'twr_drawdown_series',
+})
+
+
+@dataclass
+class BacktestMetrics:
+    """
+    Represents the result of a backtest, including metrics such as
+    total return, annualized return, volatility, Sharpe ratio,
+    and maximum drawdown.
+
+    Time series are read-only ``BacktestHistory`` sequences of
+    ``(value, timestamp)`` pairs. Assign any iterable to replace a series;
+    use ``series.materialize()`` for a mutable in-memory copy.
+
+    .. note:: Field semantics & known duplicates (issue #511)
+
+        - ``total_loss`` is the **gross loss magnitude** (a non-negative
+          number equal to ``sum(abs(net_gain))`` over losing trades).
+          ``total_loss_percentage`` is ``total_loss /
+          initial_unallocated`` (decimal, non-negative). These fields
+          no longer mirror ``total_net_gain`` / ``total_net_gain_pct``;
+          see B1 in issue #511.
+
+        - ``total_growth`` / ``total_growth_percentage`` are
+          numerically equivalent to ``total_net_gain`` /
+          ``total_net_gain_percentage`` for the standard
+          mark-to-market portfolio used in backtests. They are kept as
+          legacy aliases. See B3 in issue #511.
+
+    Attributes:
+        backtest_date_range_name (str): The name of the date range
+            used for the backtest.
+        backtest_start_date (datetime): The start date of the backtest.
+        backtest_end_date (datetime): The end date of the backtest.
+        initial_unallocated (float): The initial unallocated cash
+            at the start of the backtest.
+        final_value (float): The final value of the portfolio at the end
+            of the backtest.
+        equity_curve (BacktestHistory): Equity curve pairs containing
+            the portfolio value and its timestamp.
+        total_growth (float): The growth of the portfolio over the
+            backtest period.
+        total_growth_percentage (float): The percentage growth of the portfolio
+            over the backtest period.
+        total_net_gain (float): The total return of the backtest.
+        total_net_gain_percentage (float): The total return percentage
+        total_loss (float): The total loss of the backtest.
+        total_loss_percentage (float): The total loss percentage
+        cagr (float): The compound annual growth rate of the backtest.
+        sharpe_ratio (float): The Sharpe ratio of the backtest, indicating
+            risk-adjusted return.
+        rolling_sharpe_ratio (BacktestHistory): A series of rolling
+            Sharpe ratios over the backtest period.
+        sortino_ratio (float): The Sortino ratio of the backtest, focusing
+            on downside risk.
+        calmar_ratio (float): The Calmar ratio of the backtest, comparing
+            CAGR to maximum drawdown.
+        profit_factor (float): The profit factor of the backtest, calculated
+            as total profit divided by total loss.
+        annual_volatility (float): The annualized volatility of the
+            portfolio returns.
+        monthly_returns (BacktestHistory): A series of monthly
+            returns during the backtest.
+        yearly_returns (BacktestHistory): A series of yearly returns
+            during the backtest.
+        drawdown_series (BacktestHistory): A series of drawdown
+            values over the backtest period.
+        max_drawdown (float): The maximum drawdown observed during
+            the backtest.
+        max_drawdown_absolute (float): The maximum absolute drawdown
+            observed during the backtest.
+        max_daily_drawdown (float): The maximum daily drawdown
+            observed during the backtest.
+        max_drawdown_duration (int): The duration of the maximum
+            drawdown in days.
+        trades_per_year (float): The average number of trades
+            executed per year.
+        trade_per_day (float): The average number of trades executed per day.
+        exposure_ratio (float): The exposure ratio, indicating the
+            average exposure of the portfolio.
+        cumulative_exposure (float): The cumulative exposure, indicating the
+            total exposure of the portfolio over the backtest period.
+        average_trade_size (float): The average size of trades executed
+            during the backtest.
+        average_trade_loss (float): The average loss from losing trades.
+        average_trade_loss_percentage (float): The average loss percentage
+            from losing trades.
+        average_trade_gain (float): The average gain from winning trades.
+        average_trade_gain_percentage (float): The average gain percentage
+            from winning trades.
+        average_trade_return (float): The average return from all trades.
+        average_trade_return_percentage (float): The average return percentage
+            from all trades.
+        median_trade_return (float): The median return from all trades.
+        median_trade_return_percentage (float): The median return percentage
+            from all trades.
+        number_of_positive_trades (int): The total number of profitable trades
+            executed during the backtest.
+        number_of_negative_trades (int): The total number of unprofitable
+            trades executed during the backtest.
+        best_trade (float): A string representation of the best trade,
+            including net gain and percentage.
+        worst_trade (float): A string representation of the worst trade,
+            including net loss and percentage.
+        average_trade_duration (float): The average duration of
+            trades in hours.
+        number_of_trades (int): The total number of trades executed
+            during the backtest.
+        number_of_trades_closed (int): The total number of trades close
+            during the backtest.
+        number_of_trades_opened (int): The total number of trades opened
+            during the backtest.
+        number_of_trades_open_at_end (int): The number of trades
+            still open at the end of the backtest.
+        win_rate (float): The win rate of the trades, expressed
+            as a percentage.
+        current_win_rate (float): The current win rate of the trades,
+            including open trades.
+        win_loss_ratio (float): The ratio of winning trades
+            to losing trades.
+        current_win_loss_ratio (float): The current ratio of winning
+            trades to losing trades, including open trades.
+        percentage_winning_months (float): The percentage of months
+            with positive returns.
+        percentage_winning_years (float): The percentage of years with
+            positive returns.
+        percentage_positive_trades (float): The percentage of trades that
+            were profitable.
+        percentage_negative_trades (float): The percentage of trades that
+            were unprofitable.
+        average_monthly_return (float): The average monthly return
+            of the portfolio.
+        average_monthly_return_losing_months (float): The average monthly
+            return during losing months.
+        average_monthly_return_winning_months (float): The average monthly
+            return during winning months.
+        best_month (datetime): A string representation of the best month,
+            including return and date.
+        best_year (datetime): A string representation of the best year,
+            including return and date.
+        worst_month (datetime): A string representation of the worst month,
+            including return and date.
+        worst_year (datetime): A string representation of the worst year,
+            including return and date.
+        metadata (Dict[str, str]): A dictionary to store any additional
+            metadata related to the backtest.
+    """
+    backtest_window: BacktestWindow
+    initial_unallocated: float = 0.0
+    equity_curve: BacktestHistory = field(default_factory=BacktestHistory)
+    total_growth: float = 0.0
+    total_growth_percentage: float = 0.0
+    total_net_gain: float = 0.0
+    total_net_gain_percentage: float = 0.0
+    total_loss: float = 0.0
+    total_loss_percentage: float = 0.0
+    final_value: float = 0.0
+    cumulative_return: float = 0.0
+    cumulative_return_series: BacktestHistory = \
+        field(default_factory=BacktestHistory)
+    cagr: float = 0.0
+    sharpe_ratio: float = 0.0
+    rolling_sharpe_ratio: BacktestHistory = \
+        field(default_factory=BacktestHistory)
+    sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
+    omega_ratio: float = 0.0
+    profit_factor: float = 0.0
+    gross_profit: float = None
+    gross_loss: float = None
+    annual_volatility: float = 0.0
+    ulcer_index: float = 0.0
+    monthly_returns: BacktestHistory = field(default_factory=BacktestHistory)
+    yearly_returns: BacktestHistory = field(default_factory=BacktestHistory)
+    drawdown_series: BacktestHistory = field(default_factory=BacktestHistory)
+    max_drawdown: float = 0.0
+    max_drawdown_absolute: float = 0.0
+    max_daily_drawdown: float = 0.0
+    max_drawdown_duration: int = 0
+    # TWR (alpha-only) variants — scrub external cash flows so deposits
+    # don't mask drawdowns. The raw fields above remain account-value
+    # based for absolute reporting.
+    twr_equity_curve: BacktestHistory = field(default_factory=BacktestHistory)
+    twr_drawdown_series: BacktestHistory = field(
+        default_factory=BacktestHistory)
+    twr_max_drawdown: float = 0.0
+    twr_max_drawdown_duration: int = 0
+    trades_per_year: float = 0.0
+    trades_per_week: float = 0.0
+    trades_per_month: float = 0.0
+    trade_per_day: float = 0.0
+    exposure_ratio: float = 0.0
+    cumulative_exposure: float = 0.0
+    best_trade: Trade = None
+    worst_trade: Trade = None
+    number_of_positive_trades: int = 0
+    percentage_positive_trades: float = 0.0
+    number_of_negative_trades: int = 0
+    percentage_negative_trades: float = 0.0
+    average_trade_duration: float = 0.0
+    average_win_duration: float = 0.0
+    average_loss_duration: float = 0.0
+    average_trade_size: float = 0.0
+    average_trade_loss: float = 0.0
+    average_trade_loss_percentage: float = 0.0
+    average_trade_gain: float = 0.0
+    average_trade_gain_percentage: float = 0.0
+    average_trade_return: float = 0.0
+    average_trade_return_percentage: float = 0.0
+    average_mae: float = 0.0
+    average_mae_percentage: float = 0.0
+    average_mfe: float = 0.0
+    average_mfe_percentage: float = 0.0
+    max_mae: float = 0.0
+    max_mfe: float = 0.0
+    mfe_mae_ratio: float = 0.0
+    current_average_trade_gain: float = 0.0
+    current_average_trade_gain_percentage: float = 0.0
+    current_average_trade_return: float = 0.0
+    current_average_trade_return_percentage: float = 0.0
+    current_average_trade_duration: float = 0.0
+    current_average_trade_loss: float = 0.0
+    current_average_trade_loss_percentage: float = 0.0
+    median_trade_return: float = 0.0
+    median_trade_return_percentage: float = 0.0
+    number_of_trades: int = 0
+    number_of_trades_closed: int = 0
+    number_of_trades_opened: int = 0
+    number_of_trades_open_at_end: int = 0
+    number_of_long_trades: int = 0
+    number_of_long_trades_closed: int = 0
+    number_of_winning_long_trades: int = 0
+    number_of_losing_long_trades: int = 0
+    long_win_rate: float = 0.0
+    number_of_short_trades: int = 0
+    number_of_short_trades_closed: int = 0
+    number_of_winning_short_trades: int = 0
+    number_of_losing_short_trades: int = 0
+    short_win_rate: float = 0.0
+    win_rate: float = 0.0
+    current_win_rate: float = 0.0
+    win_loss_ratio: float = 0.0
+    current_win_loss_ratio: float = 0.0
+    percentage_winning_months: float = 0.0
+    percentage_winning_years: float = 0.0
+    average_monthly_return: float = 0.0
+    average_monthly_return_losing_months: float = 0.0
+    average_monthly_return_winning_months: float = 0.0
+    best_month: Tuple[float, datetime] = None
+    best_year: Tuple[float, date] = None
+    worst_month: Tuple[float, datetime] = None
+    worst_year: Tuple[float, date] = None
+    total_number_of_days: int = None
+    var_95: float = 0.0
+    cvar_95: float = 0.0
+    max_consecutive_wins: int = 0
+    max_consecutive_losses: int = 0
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # Derived active-range fields
+    # ------------------------------------------------------------------
+
+    @property
+    def _active_range(self) -> BacktestDateRange:
+        w = self.backtest_window
+        return w.test_range if w.test_range is not None else w.train_range
+
+    @property
+    def backtest_start_date(self) -> datetime:
+        """Start of the active range.
+
+        Uses ``test_range`` when set, otherwise ``train_range``.
+        """
+        return self._active_range.start_date
+
+    @property
+    def backtest_end_date(self) -> datetime:
+        """End of the active range."""
+        return self._active_range.end_date
+
+    @property
+    def backtest_date_range_name(self) -> Optional[str]:
+        """Name of the active range; joins back to the study's windows."""
+        return self._active_range.name
+
+    @property
+    def window_role(self) -> str:
+        """``"test"`` for OOS runs, ``"train"`` for in-sample-only fits."""
+        return (
+            "test"
+            if self.backtest_window.test_range is not None
+            else "train"
+        )
+
+    def __post_init__(self):
+        self.total_number_of_days = (
+            self.backtest_end_date - self.backtest_start_date
+        ).days
+
+    def __setattr__(self, name, value):
+        if name in _METRIC_HISTORY_FIELDS and not isinstance(
+                value, BacktestHistory):
+            value = BacktestHistory(value)
+        object.__setattr__(self, name, value)
+
+    def to_dict(self, *, materialize_history: bool = True) -> dict:
+        """
+        Convert the BacktestMetrics instance to a dictionary.
+        Ensures all datetime values are serialized to ISO format, but
+        leaves strings unchanged.
+
+        Returns:
+            dict: A dictionary representation of the BacktestMetrics instance.
+        """
+
+        def ensure_iso(value):
+            return value.isoformat() \
+                if hasattr(value, "isoformat") else value
+
+        def series(history):
+            view = SerializedHistory(history, _serialize_metric_point)
+            return list(view) if materialize_history else view
+
+        return {
+            "backtest_window": self.backtest_window.to_dict(),
+            "backtest_start_date": ensure_iso(self.backtest_start_date),
+            "backtest_end_date": ensure_iso(self.backtest_end_date),
+            "backtest_date_range_name": self.backtest_date_range_name,
+            "window_role": self.window_role,
+            "initial_unallocated": self.initial_unallocated,
+            "equity_curve": series(self.equity_curve),
+            "final_value": self.final_value,
+            "total_net_gain": self.total_net_gain,
+            "total_net_gain_percentage": self.total_net_gain_percentage,
+            "total_growth": self.total_growth,
+            "total_growth_percentage": self.total_growth_percentage,
+            "total_loss": self.total_loss,
+            "total_loss_percentage": self.total_loss_percentage,
+            "cumulative_return": self.cumulative_return,
+            "cumulative_return_series": series(self.cumulative_return_series),
+            "cagr": self.cagr,
+            "sharpe_ratio": self.sharpe_ratio,
+            "rolling_sharpe_ratio": series(self.rolling_sharpe_ratio),
+            "sortino_ratio": self.sortino_ratio,
+            "calmar_ratio": self.calmar_ratio,
+            "omega_ratio": self.omega_ratio,
+            "profit_factor": self.profit_factor,
+            "gross_profit": self.gross_profit,
+            "gross_loss": self.gross_loss,
+            "annual_volatility": self.annual_volatility,
+            "ulcer_index": self.ulcer_index,
+            "monthly_returns": series(self.monthly_returns),
+            "yearly_returns": series(self.yearly_returns),
+            "drawdown_series": series(self.drawdown_series),
+            "max_drawdown": self.max_drawdown,
+            "max_drawdown_absolute": self.max_drawdown_absolute,
+            "max_daily_drawdown": self.max_daily_drawdown,
+            "max_drawdown_duration": self.max_drawdown_duration,
+            "twr_equity_curve": series(self.twr_equity_curve),
+            "twr_drawdown_series": series(self.twr_drawdown_series),
+            "twr_max_drawdown": self.twr_max_drawdown,
+            "twr_max_drawdown_duration": self.twr_max_drawdown_duration,
+            "trades_per_year": self.trades_per_year,
+            "trades_per_week": self.trades_per_week,
+            "trades_per_month": self.trades_per_month,
+            "trade_per_day": self.trade_per_day,
+            "exposure_ratio": self.exposure_ratio,
+            "cumulative_exposure": self.cumulative_exposure,
+            "average_trade_gain": self.average_trade_gain,
+            "average_trade_gain_percentage":
+                self.average_trade_gain_percentage,
+            "average_trade_loss": self.average_trade_loss,
+            "average_trade_loss_percentage":
+                self.average_trade_loss_percentage,
+            "average_trade_return": self.average_trade_return,
+            "average_trade_return_percentage":
+                self.average_trade_return_percentage,
+            "average_mae": self.average_mae,
+            "average_mae_percentage": self.average_mae_percentage,
+            "average_mfe": self.average_mfe,
+            "average_mfe_percentage": self.average_mfe_percentage,
+            "max_mae": self.max_mae,
+            "max_mfe": self.max_mfe,
+            "mfe_mae_ratio": self.mfe_mae_ratio,
+            "median_trade_return": self.median_trade_return,
+            "median_trade_return_percentage":
+                self.median_trade_return_percentage,
+            "number_of_positive_trades": self.number_of_positive_trades,
+            "percentage_positive_trades": self.percentage_positive_trades,
+            "number_of_negative_trades": self.number_of_negative_trades,
+            "percentage_negative_trades": self.percentage_negative_trades,
+            "best_trade": self.best_trade.to_dict()
+                if self.best_trade else None,
+            "worst_trade": self.worst_trade.to_dict()
+                if self.worst_trade else None,
+            "average_trade_duration": self.average_trade_duration,
+            "average_win_duration": self.average_win_duration,
+            "average_loss_duration": self.average_loss_duration,
+            "average_trade_size": self.average_trade_size,
+            "number_of_trades": self.number_of_trades,
+            "number_of_trades_closed": self.number_of_trades_closed,
+            "number_of_trades_opened": self.number_of_trades_opened,
+            "number_of_long_trades": self.number_of_long_trades,
+            "number_of_long_trades_closed": self.number_of_long_trades_closed,
+            "number_of_winning_long_trades":
+                self.number_of_winning_long_trades,
+            "number_of_losing_long_trades":
+                self.number_of_losing_long_trades,
+            "long_win_rate": self.long_win_rate,
+            "number_of_short_trades": self.number_of_short_trades,
+            "number_of_short_trades_closed":
+                self.number_of_short_trades_closed,
+            "number_of_winning_short_trades":
+                self.number_of_winning_short_trades,
+            "number_of_losing_short_trades":
+                self.number_of_losing_short_trades,
+            "short_win_rate": self.short_win_rate,
+            "win_rate": self.win_rate,
+            "current_win_rate": self.current_win_rate,
+            "win_loss_ratio": self.win_loss_ratio,
+            "current_win_loss_ratio": self.current_win_loss_ratio,
+            "percentage_winning_months": self.percentage_winning_months,
+            "percentage_winning_years": self.percentage_winning_years,
+            "average_monthly_return": self.average_monthly_return,
+            "average_monthly_return_losing_months":
+                self.average_monthly_return_losing_months,
+            "average_monthly_return_winning_months":
+                self.average_monthly_return_winning_months,
+            "best_month": (
+                (self.best_month[0], ensure_iso(self.best_month[1]))
+                if self.best_month else None
+            ),
+            "best_year": (
+                (self.best_year[0], ensure_iso(self.best_year[1]))
+                if self.best_year else None
+            ),
+            "worst_month": (
+                (self.worst_month[0], ensure_iso(self.worst_month[1]))
+                if self.worst_month else None
+            ),
+            "worst_year": (
+                (self.worst_year[0], ensure_iso(self.worst_year[1]))
+                if self.worst_year else None
+            ),
+            "var_95": self.var_95,
+            "cvar_95": self.cvar_95,
+            "max_consecutive_wins": self.max_consecutive_wins,
+            "max_consecutive_losses": self.max_consecutive_losses,
+        }
+
+    def save(self, file_path: str | Path) -> None:
+        """
+        Save the backtest metrics to a file in JSON format. The metrics will
+        always be saved in a file named `metrics.json`
+
+        Args:
+            file_path (str): The directory where the metrics
+            file will be saved.
+        """
+        with open(file_path, 'w') as file:
+            json.dump(self.to_dict(), file, indent=4, default=str)
+
+    @staticmethod
+    def _parse_tuple_list_datetime(
+        data: List[List]
+    ) -> BacktestHistory:
+        """Parse serialized points directly into disk-backed history."""
+        return BacktestHistory(
+            (float(value), datetime.fromisoformat(date_str))
+            for value, date_str in data
+        )
+
+    @staticmethod
+    def _parse_tuple_list_date(data: List[List]) -> BacktestHistory:
+        """Parse serialized date points directly into disk-backed history."""
+        return BacktestHistory(
+            (float(value), datetime.fromisoformat(date_str).date())
+            for value, date_str in data
+        )
+
+    @staticmethod
+    def _parse_tuple_datetime(data) -> Tuple[float, datetime]:
+        """Parse a [value, datetime_string] into Tuple[float, datetime]"""
+        if data is None:
+            return None, None
+
+        # Check if the value is NaN, None, or the string '<NA>'
+        if pd.isna(data[0]) or data[0] is None or data[0] == '<NA>':
+            value = pd.NA
+        else:
+            value = float(data[0])
+
+        # Parse the datetime string
+        if data[1] is None or pd.isna(data[1]) or data[1] == '<NA>':
+            date_value = None
+        else:
+            # Convert the string to a datetime object
+            date_value = datetime.fromisoformat(data[1])
+
+        return (value, date_value)
+
+    @staticmethod
+    def _parse_tuple_date(data) -> Tuple[float, date]:
+        """Parse a [value, date_string] into Tuple[float, date]"""
+        if data is None:
+            return None, None
+
+        # Check if the value is NaN, None, or the string '<NA>'
+        if pd.isna(data[0]) or data[0] is None or data[0] == '<NA>':
+            value = pd.NA
+        else:
+            value = float(data[0])
+
+        # Parse the date string
+        if data[1] is None or pd.isna(data[1]) or data[1] == '<NA>':
+            date = None
+        else:
+            date = datetime.fromisoformat(data[1]).date()
+
+        return (value, date)
+
+    @staticmethod
+    def open(file_path: str | Path) -> 'BacktestMetrics':
+        """
+        Open a backtest metrics file from a directory and
+        return a BacktestMetrics instance.
+
+        Args:
+            file_path (str): The path to the metrics file.
+
+        Returns:
+            BacktestMetrics: An instance of BacktestMetrics
+                loaded from the file.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Metrics file not found at {file_path}")
+
+        with open(file_path, 'r') as file:
+            data = json.load(file)
+
+        return BacktestMetrics.from_dict(data)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'BacktestMetrics':
+        """
+        Reconstruct a ``BacktestMetrics`` from a plain dict (the inverse
+        of :py:meth:`to_dict`). Used by the JSON loader and by the
+        binary bundle loader (issue #487).
+        """
+        if data is None:
+            return None
+
+        # Work on a shallow copy to avoid mutating the caller's dict
+        data = dict(data)
+
+        # Rehydrate the parent BacktestWindow
+        window = data.get('backtest_window')
+        if window is None:
+            # Legacy bundles (pre issue #511 window refactor) stored the
+            # active range directly as backtest_start_date/end_date/
+            # backtest_date_range_name instead of a full BacktestWindow.
+            # Reconstruct a single-range window from those so old
+            # bundles keep loading instead of being silently dropped.
+            start = data.get('backtest_start_date')
+            end = data.get('backtest_end_date')
+            if start is None or end is None:
+                raise ValueError(
+                    "BacktestMetrics.from_dict requires a "
+                    "'backtest_window' key (or legacy "
+                    "'backtest_start_date'/'backtest_end_date' keys)."
+                )
+            if isinstance(start, str):
+                start = datetime.fromisoformat(start)
+            if isinstance(end, str):
+                end = datetime.fromisoformat(end)
+            window = BacktestWindow(
+                train_range=BacktestDateRange(
+                    start_date=start,
+                    end_date=end,
+                    name=data.get('backtest_date_range_name'),
+                )
+            )
+        if not isinstance(window, BacktestWindow):
+            window = BacktestWindow.from_dict(window)
+        data['backtest_window'] = window
+
+        # Drop derived keys — they're read-only properties on the dataclass.
+        for key in (
+            'backtest_start_date',
+            'backtest_end_date',
+            'backtest_date_range_name',
+            'window_role',
+        ):
+            data.pop(key, None)
+
+        # Parse tuple lists with datetime
+        data['equity_curve'] = cls._parse_tuple_list_datetime(
+            data.get('equity_curve', [])
+        )
+        data['rolling_sharpe_ratio'] = cls._parse_tuple_list_datetime(
+            data.get('rolling_sharpe_ratio', [])
+        )
+        data['monthly_returns'] = cls._parse_tuple_list_datetime(
+            data.get('monthly_returns', [])
+        )
+        data['drawdown_series'] = cls._parse_tuple_list_datetime(
+            data.get('drawdown_series', [])
+        )
+        data['twr_equity_curve'] = cls._parse_tuple_list_datetime(
+            data.get('twr_equity_curve', [])
+        )
+        data['twr_drawdown_series'] = cls._parse_tuple_list_datetime(
+            data.get('twr_drawdown_series', [])
+        )
+        data['cumulative_return_series'] = cls._parse_tuple_list_datetime(
+            data.get('cumulative_return_series', [])
+        )
+
+        # Parse tuple lists with date
+        data['yearly_returns'] = cls._parse_tuple_list_date(
+            data.get('yearly_returns', [])
+        )
+
+        # Parse single tuples
+        data['best_month'] = cls._parse_tuple_datetime(data.get('best_month'))
+        data['worst_month'] = cls._parse_tuple_datetime(
+            data.get('worst_month')
+        )
+        data['best_year'] = cls._parse_tuple_date(data.get('best_year'))
+        data['worst_year'] = cls._parse_tuple_date(data.get('worst_year'))
+
+        # Parse Trade objects if they exist
+        if data.get('best_trade'):
+            data['best_trade'] = Trade.from_dict(data['best_trade'])
+        if data.get('worst_trade'):
+            data['worst_trade'] = Trade.from_dict(data['worst_trade'])
+
+        # Drop fields computed in __post_init__ to avoid duplicate kwargs
+        data.pop('total_number_of_days', None)
+
+        # Drop any unknown keys (forward-compat with new fields written
+        # by a newer version)
+        valid = {f.name for f in fields(cls)}
+        data = {k: v for k, v in data.items() if k in valid}
+
+        return cls(**data)
+
+    def __repr__(self):
+        """
+        Return a string representation of the Backtest instance.
+
+        Returns:
+            str: A string representation of the Backtest instance.
+        """
+        return json.dumps(
+            self.to_dict(), indent=4, sort_keys=True, default=str
+        )

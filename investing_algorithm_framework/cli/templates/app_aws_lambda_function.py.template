@@ -1,0 +1,70 @@
+import logging.config
+import os
+
+from dotenv import load_dotenv
+
+from investing_algorithm_framework import (
+    create_app,
+    AWSS3StorageStateHandler,
+    AWS_S3_STATE_BUCKET_NAME,
+    AWS_LAMBDA_LOGGING_CONFIG,
+    RESOURCE_DIRECTORY,
+)
+
+from strategies.my_strategy import MyTradingStrategy
+
+load_dotenv()
+logging.config.dictConfig(AWS_LAMBDA_LOGGING_CONFIG)
+logger = logging.getLogger(__name__)
+
+# Lambda's filesystem is read-only except for /tmp; route the framework's
+# writable resources there.
+app = create_app(
+    config={RESOURCE_DIRECTORY: os.path.join("/tmp", "resources")}
+)
+
+# The S3 bucket is provisioned and exported as an env var by the
+# `deploy_aws_lambda` CLI command.
+app.add_state_handler(
+    AWSS3StorageStateHandler(bucket_name=os.getenv(AWS_S3_STATE_BUCKET_NAME))
+)
+
+app.add_market(market="bitvavo", trading_symbol="EUR", initial_balance=1000)
+app.add_strategy(MyTradingStrategy)
+
+
+def lambda_handler(event, context):
+    """
+    AWS Lambda handler.
+
+    By default runs a single iteration of the trading bot. Pass
+    ``{"action": "stop"}`` / ``{"action": "start"}`` / ``{"action":
+    "status"}`` (e.g. via a direct invoke, or an API Gateway route
+    that forwards its JSON body as the event) to control it instead —
+    the enabled/disabled flag is persisted to S3 via the state
+    handler above, so it is honored by every future scheduled
+    invocation too.
+    """
+    action = (event or {}).get("action", "run")
+
+    try:
+        if action == "stop":
+            app.stop_algorithm(reason=event.get("reason"))
+            return {"statusCode": 200, "body": app.get_algorithm_control_state()}
+        if action == "start":
+            app.start_algorithm()
+            return {"statusCode": 200, "body": app.get_algorithm_control_state()}
+        if action == "status":
+            return {"statusCode": 200, "body": app.get_algorithm_control_state()}
+
+        if not app.is_algorithm_enabled():
+            return {"statusCode": 200, "body": "Algorithm is disabled, skipped."}
+
+        app.run(number_of_iterations=1)
+        return {
+            "statusCode": 200,
+            "body": "Trading strategy executed successfully.",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(exc)
+        return {"statusCode": 500, "body": str(exc)}

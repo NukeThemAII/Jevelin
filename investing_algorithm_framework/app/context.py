@@ -1,0 +1,3273 @@
+import logging
+from datetime import datetime, timezone
+from typing import List, Union
+
+from investing_algorithm_framework.services import ConfigurationService, \
+    MarketCredentialService, OrderService, PortfolioConfigurationService, \
+    PortfolioService, PositionService, TradeService, DataProviderService, \
+    TradeStopLossService, TradeTakeProfitService, BrokerBalanceTracker
+from investing_algorithm_framework.services.portfolios import (
+    PortfolioProviderLookup,
+)
+from investing_algorithm_framework.domain import OrderStatus, OrderType, \
+    OrderSide, OperationalException, Portfolio, RoundingService, \
+    BACKTESTING_FLAG, INDEX_DATETIME, Order, \
+    Position, Trade, TradeStatus, MarketCredential, TradeStopLoss, \
+    TradeTakeProfit, SyncResult, PortfolioOutOfSyncError, Environment, \
+    ENVIRONMENT
+
+logger = logging.getLogger("investing_algorithm_framework")
+
+
+class Context:
+    """
+    Context class to store the state of the algorithm and
+    give access to objects such as orders, positions, trades and
+    portfolio.
+    """
+
+    def __init__(
+        self,
+        configuration_service: ConfigurationService,
+        portfolio_configuration_service: PortfolioConfigurationService,
+        portfolio_service: PortfolioService,
+        position_service: PositionService,
+        order_service: OrderService,
+        market_credential_service: MarketCredentialService,
+        trade_service: TradeService,
+        trade_stop_loss_service: TradeStopLossService,
+        trade_take_profit_service: TradeTakeProfitService,
+        data_provider_service: DataProviderService,
+        portfolio_provider_lookup: PortfolioProviderLookup = None,
+        broker_balance_tracker: BrokerBalanceTracker = None,
+    ):
+        self.configuration_service: ConfigurationService = \
+            configuration_service
+        self.portfolio_configuration_service: PortfolioConfigurationService = \
+            portfolio_configuration_service
+        self.portfolio_service: PortfolioService = portfolio_service
+        self.position_service: PositionService = position_service
+        self.order_service: OrderService = order_service
+        self.market_credential_service: MarketCredentialService = \
+            market_credential_service
+        self.data_provider_service: DataProviderService = data_provider_service
+        self.trade_service: TradeService = trade_service
+        self.trade_stop_loss_service: TradeStopLossService = \
+            trade_stop_loss_service
+        self.trade_take_profit_service: TradeTakeProfitService = \
+            trade_take_profit_service
+        self.portfolio_provider_lookup: PortfolioProviderLookup = \
+            portfolio_provider_lookup
+        self.broker_balance_tracker: BrokerBalanceTracker = \
+            broker_balance_tracker
+        self._blotter = None
+        self._fx_rate_provider = None
+        self._base_currency = None
+        self._recorded_values = {}  # key -> list of (datetime, value)
+        # Set by EventLoopService right before it runs a strategy, so
+        # orders/trades created during that call can be attributed to
+        # the strategy that created them without every strategy author
+        # having to pass strategy_id explicitly.
+        self._current_strategy_id = None
+
+    def _attach_strategy_attribution(self, order_data: dict) -> None:
+        """
+        Stamps ``order_data`` with the strategy currently running (if
+        any), unless the caller already supplied an explicit
+        ``strategy_id`` or ``metadata['strategy_id']``.
+        """
+        strategy_id = self._current_strategy_id
+
+        if strategy_id is None:
+            return
+
+        order_data.setdefault("strategy_id", strategy_id)
+        metadata = order_data.setdefault("metadata", {}) or {}
+        order_data["metadata"] = metadata
+        metadata.setdefault("strategy_id", strategy_id)
+
+    def _validate_target_symbol(self, target_symbol, market=None):
+        """
+        Validate the target_symbol for order creation:
+        1. Prevents orders where target_symbol equals trading_symbol
+           (e.g. EUR/EUR).
+        2. Checks that a data source exists for the
+           target_symbol/trading_symbol combination (e.g. BTC/EUR).
+
+        Args:
+            target_symbol: The symbol of the asset to trade
+            market: The market to check against
+
+        Raises:
+            OperationalException: If validation fails
+        """
+        portfolio = self.portfolio_service.find({"market": market})
+        trading_symbol = portfolio.trading_symbol
+
+        # Check target_symbol != trading_symbol
+        if target_symbol.upper() == trading_symbol.upper():
+            raise OperationalException(
+                f"target_symbol '{target_symbol}' is the same as "
+                f"the trading_symbol '{trading_symbol}'. "
+                f"This would result in a "
+                f"'{trading_symbol}/{trading_symbol}' "
+                f"order which is not valid. "
+                f"To skip this check, set validate_symbol=False "
+                f"or omit the parameter."
+            )
+
+        # Check that a data source is registered for this pair
+        expected_symbol = f"{target_symbol}/{trading_symbol}".upper()
+        known_symbols = set()
+
+        if self.data_provider_service.data_provider_index is not None:
+            for data_source, _ in \
+                    self.data_provider_service \
+                    .data_provider_index.get_all():
+                if data_source.symbol is not None:
+                    known_symbols.add(data_source.symbol.upper())
+
+        if expected_symbol not in known_symbols:
+            sorted_symbols = sorted(known_symbols)
+            raise OperationalException(
+                f"No data source registered for '{expected_symbol}'. "
+                f"A data source is required to track price history. "
+                f"Registered data source symbols: {sorted_symbols}. "
+                f"To skip this check, set validate_symbol=False "
+                f"or omit the parameter."
+            )
+
+    @property
+    def config(self):
+        """
+        Function to get a config instance. This allows users when
+        having access to the algorithm instance also to read the
+        configs of the app.
+        """
+        return self.configuration_service.get_config()
+
+    def get_config(self):
+        """
+        Function to get a config instance. This allows users when
+        having access to the algorithm instance also to read the
+        configs of the app.
+        """
+        return self.configuration_service.get_config()
+
+    def create_order(
+        self,
+        target_symbol,
+        price,
+        order_type,
+        order_side,
+        amount,
+        market=None,
+        execute=True,
+        validate=True,
+        sync=True,
+        validate_symbol=False,
+        stop_price=None,
+    ) -> Order:
+        """
+        Function to create an order. This function will create an order
+        and execute it if the execute parameter is set to True. If the
+        validate parameter is set to True, the order will be validated
+
+        Args:
+            target_symbol: The symbol of the asset to trade
+            price: The price of the asset
+            order_type: The type of the order
+            order_side: The side of the order
+            amount: The amount of the asset to trade
+            market: The market to trade the asset
+            execute: If set to True, the order will be executed
+            validate: If set to True, the order will be validated
+            sync: If set to True, the created order will be synced
+            with the portfolio of the algorithm.
+            validate_symbol: Default False. If set to True,
+              validates that target_symbol is not the trading_symbol.
+            stop_price: Required for STOP and STOP_LIMIT order types.
+              The trigger price at which the order activates.
+
+        Returns:
+            The order created
+        """
+        if validate_symbol:
+            self._validate_target_symbol(target_symbol, market=market)
+
+        portfolio = self.portfolio_service.find({"market": market})
+        order_data = {
+            "target_symbol": target_symbol,
+            "price": price,
+            "amount": amount,
+            "order_type": order_type,
+            "order_side": order_side,
+            "portfolio_id": portfolio.id,
+            "status": OrderStatus.CREATED.value,
+            "trading_symbol": portfolio.trading_symbol,
+        }
+
+        if stop_price is not None:
+            order_data["stop_price"] = stop_price
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            order_data["created_at"] = \
+                self.configuration_service.config[INDEX_DATETIME]
+
+        self._attach_strategy_attribution(order_data)
+        order_data["_execute"] = execute
+        order_data["_validate"] = validate
+        order_data["_sync"] = sync
+
+        return self._blotter.place_order(order_data, self)
+
+    def has_balance(self, symbol, amount, market=None):
+        """
+        Function to check if the portfolio has enough balance to
+        create an order. This function will return True if the
+        portfolio has enough balance to create an order, False
+        otherwise.
+
+        Parameters:
+            symbol: The symbol of the asset
+            amount: The amount of the asset
+            market: The market of the asset
+
+        Returns:
+            Boolean: True if the portfolio has enough balance
+        """
+
+        portfolio = self.portfolio_service.find({"market": market})
+        position = self.position_service.find(
+            {"portfolio": portfolio.id, "symbol": symbol}
+        )
+
+        if position is None:
+            return False
+
+        return position.get_amount() >= amount
+
+    def create_limit_order(
+        self,
+        target_symbol,
+        price,
+        order_side,
+        amount=None,
+        amount_trading_symbol=None,
+        percentage=None,
+        percentage_of_portfolio=None,
+        percentage_of_position=None,
+        precision=None,
+        market=None,
+        execute=True,
+        validate=True,
+        sync=True,
+        metadata=None,
+        validate_symbol=False
+    ) -> Order:
+        """
+        Function to create a limit order. This function will create a limit
+        order and execute it if the execute parameter is set to True. If the
+        validate parameter is set to True, the order will be validated
+
+        Args:
+            target_symbol: The symbol of the asset to trade
+            price: The price of the asset
+            order_side: The side of the order
+            amount (optional): The amount of the asset to trade
+            amount_trading_symbol (optional): The amount of the
+              trading symbol to trade
+            percentage (optional): The percentage of the portfolio
+              to allocate to the
+                order
+            percentage_of_portfolio (optional): The percentage
+              of the portfolio to allocate to the order
+            percentage_of_position (optional): The percentage
+              of the position to allocate to
+                the order. (Only supported for SELL orders)
+            precision (optional): The precision of the amount
+            market (optional): The market to trade the asset
+            execute (optional): Default True. If set to True,
+              the order will be executed
+            validate (optional): Default True. If set to
+              True, the order will be validated
+            sync (optional): Default True. If set to True,
+              the created order will be synced with the
+                portfolio of the algorithm
+            validate_symbol (optional): Default False. If set to True,
+              validates that target_symbol is not the trading_symbol.
+
+        Returns:
+            Order: Instance of the order created
+        """
+        if validate_symbol:
+            self._validate_target_symbol(target_symbol, market=market)
+
+        portfolio = self.portfolio_service.find({"market": market})
+
+        if percentage_of_portfolio is not None:
+            if not OrderSide.BUY.equals(order_side):
+                raise OperationalException(
+                    "Percentage of portfolio is only supported for BUY orders."
+                )
+
+            net_size = portfolio.get_net_size()
+            size = net_size * (percentage_of_portfolio / 100)
+            amount = size / price
+
+        elif percentage_of_position is not None:
+
+            if not OrderSide.SELL.equals(order_side):
+                raise OperationalException(
+                    "Percentage of position is only supported for SELL orders."
+                )
+
+            position = self.position_service.find(
+                {
+                    "symbol": target_symbol,
+                    "portfolio": portfolio.id
+                }
+            )
+            amount = position.get_amount() * (percentage_of_position / 100)
+
+        elif percentage is not None:
+            net_size = portfolio.get_net_size()
+            size = net_size * (percentage / 100)
+            amount = size / price
+
+        if precision is not None:
+            amount = RoundingService.round_down(amount, precision)
+
+        if amount_trading_symbol is not None:
+            amount = amount_trading_symbol / price
+
+        if amount is None:
+            raise OperationalException(
+                "The amount parameter is required to create a limit order." +
+                "Either the amount, amount_trading_symbol, percentage, " +
+                "percentage_of_portfolio or percentage_of_position "
+                "parameter must be specified."
+            )
+
+        logger.info(
+            f"Creating limit order: {target_symbol} "
+            f"{order_side} {amount} @ {price}"
+        )
+        order_data = {
+            "target_symbol": target_symbol,
+            "price": price,
+            "amount": amount,
+            "order_type": OrderType.LIMIT.value,
+            "order_side": OrderSide.from_value(order_side).value,
+            "portfolio_id": portfolio.id,
+            "status": OrderStatus.CREATED.value,
+            "trading_symbol": portfolio.trading_symbol,
+        }
+
+        if metadata is not None:
+            order_data["metadata"] = metadata
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            order_data["created_at"] = \
+                self.configuration_service.config[INDEX_DATETIME]
+
+        self._attach_strategy_attribution(order_data)
+        order_data["_execute"] = execute
+        order_data["_validate"] = validate
+        order_data["_sync"] = sync
+
+        return self._blotter.place_order(order_data, self)
+
+    def create_market_order(
+        self,
+        target_symbol,
+        order_side,
+        amount=None,
+        amount_trading_symbol=None,
+        percentage=None,
+        percentage_of_portfolio=None,
+        percentage_of_position=None,
+        precision=None,
+        market=None,
+        execute=True,
+        validate=True,
+        sync=True,
+        metadata=None
+    ) -> Order:
+        """
+        Function to create a market order. Market orders execute at
+        the best available price. In backtesting, this means the
+        open price of the next candle (+ slippage).
+
+        An estimated price (current latest price) is used for amount
+        calculation and cash reservation. The actual fill price is
+        determined at fill time and the portfolio is reconciled.
+
+        Args:
+            target_symbol: The symbol of the asset to trade
+            order_side: The side of the order (BUY or SELL)
+            amount (optional): The amount of the asset to trade
+            amount_trading_symbol (optional): The amount of the
+              trading symbol to trade
+            percentage (optional): The percentage of the portfolio
+              to allocate to the order
+            percentage_of_portfolio (optional): The percentage
+              of the portfolio to allocate to the order
+            percentage_of_position (optional): The percentage
+              of the position to allocate to the
+                order. (Only supported for SELL orders)
+            precision (optional): The precision of the amount
+            market (optional): The market to trade the asset
+            execute (optional): Default True. If set to True,
+              the order will be executed
+            validate (optional): Default True. If set to
+              True, the order will be validated
+            sync (optional): Default True. If set to True,
+              the created order will be synced with the
+                portfolio of the algorithm
+            metadata (optional): Additional metadata for the order
+
+        Returns:
+            Order: Instance of the order created
+        """
+        portfolio = self.portfolio_service.find({"market": market})
+        full_symbol = (f"{target_symbol}/{portfolio.trading_symbol}")
+        estimated_price = self.get_latest_price(full_symbol, market=market)
+
+        if estimated_price is None:
+            raise OperationalException(
+                f"Cannot create market order for {target_symbol}: "
+                f"no price data available to estimate order size."
+            )
+
+        if percentage_of_portfolio is not None:
+            if not OrderSide.BUY.equals(order_side):
+                raise OperationalException(
+                    "Percentage of portfolio is only supported for BUY orders."
+                )
+
+            net_size = portfolio.get_net_size()
+            size = net_size * (percentage_of_portfolio / 100)
+            amount = size / estimated_price
+
+        elif percentage_of_position is not None:
+
+            if not OrderSide.SELL.equals(order_side):
+                raise OperationalException(
+                    "Percentage of position is only supported for SELL orders."
+                )
+
+            position = self.position_service.find(
+                {
+                    "symbol": target_symbol,
+                    "portfolio": portfolio.id
+                }
+            )
+            amount = position.get_amount() * (percentage_of_position / 100)
+
+        elif percentage is not None:
+            net_size = portfolio.get_net_size()
+            size = net_size * (percentage / 100)
+            amount = size / estimated_price
+
+        if precision is not None:
+            amount = RoundingService.round_down(amount, precision)
+
+        if amount_trading_symbol is not None:
+            amount = amount_trading_symbol / estimated_price
+
+        if amount is None:
+            raise OperationalException(
+                "The amount parameter is required to create a market order. "
+                "Either the amount, amount_trading_symbol, percentage, "
+                "percentage_of_portfolio or percentage_of_position "
+                "parameter must be specified."
+            )
+
+        logger.info(
+            f"Creating market order: {target_symbol} "
+            f"{order_side} {amount} @ estimated {estimated_price}"
+        )
+
+        order_metadata = metadata if metadata is not None else {}
+        order_metadata["estimated_price"] = estimated_price
+
+        order_data = {
+            "target_symbol": target_symbol,
+            "price": estimated_price,
+            "amount": amount,
+            "order_type": OrderType.MARKET.value,
+            "order_side": OrderSide.from_value(order_side).value,
+            "portfolio_id": portfolio.id,
+            "status": OrderStatus.CREATED.value,
+            "trading_symbol": portfolio.trading_symbol,
+            "metadata": order_metadata,
+        }
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            order_data["created_at"] = \
+                self.configuration_service.config[INDEX_DATETIME]
+
+        self._attach_strategy_attribution(order_data)
+        order_data["_execute"] = execute
+        order_data["_validate"] = validate
+        order_data["_sync"] = sync
+
+        return self._blotter.place_order(order_data, self)
+
+    # ------------------------------------------------------------------
+    # Short-selling order creation (#434 phase 1).
+    #
+    # Plumbing only: ``execute`` and ``sync`` default to ``False`` so
+    # the order is validated and persisted but never reaches the
+    # event-engine sync paths (which are implemented in phase 2). Use
+    # ``validate=True, execute=False, sync=False`` (the defaults) to
+    # exercise the SHORT/COVER validators in tests today. The vector
+    # backtest engine routes SHORT/COVER independently via
+    # ``generate_signal_series`` with SignalSide.OPEN_SHORT /
+    # SignalSide.CLOSE_SHORT (#433).
+    # ------------------------------------------------------------------
+    def create_short_order(
+        self,
+        target_symbol,
+        price,
+        amount=None,
+        percentage_of_portfolio=None,
+        order_type=OrderType.LIMIT,
+        market=None,
+        execute=True,
+        validate=True,
+        sync=True,
+        metadata=None,
+    ) -> Order:
+        """
+        Create a SHORT (short-entry) order.
+
+        Sizing: pass either ``amount`` (units of the underlying) or
+        ``percentage_of_portfolio`` (cash collateral as a percentage
+        of the portfolio's net size, full collateral, no leverage).
+
+        Args:
+            target_symbol (str): The symbol to short.
+            price (float): Limit price (or reference price for
+                MARKET/STOP orders).
+            amount (float, optional): Units of the underlying to
+                short.
+            percentage_of_portfolio (float, optional): Cash collateral
+                as a percentage of portfolio net size (1–100).
+            order_type (OrderType): Order type (defaults to LIMIT).
+            market (str, optional): Market the order routes through.
+            execute (bool): Whether to execute via the configured
+                order executor (default True).
+            validate (bool): Run the SHORT validator (default True).
+            sync (bool): Whether to sync the portfolio/position state
+                with the created order (default True).
+            metadata (dict, optional): Order metadata.
+
+        Returns:
+            Order: The created order.
+        """
+        if amount is None and percentage_of_portfolio is None:
+            raise OperationalException(
+                "Either amount or percentage_of_portfolio must be "
+                "specified to create a short order."
+            )
+
+        portfolio = self.portfolio_service.find({"market": market})
+
+        if percentage_of_portfolio is not None:
+            if price is None or price <= 0:
+                raise OperationalException(
+                    "A positive price is required to size a short "
+                    "order by percentage_of_portfolio."
+                )
+            net_size = portfolio.get_net_size()
+            collateral = net_size * (percentage_of_portfolio / 100)
+            amount = collateral / price
+
+        order_data = {
+            "target_symbol": target_symbol,
+            "price": price,
+            "amount": amount,
+            "order_type": OrderType.from_value(order_type).value,
+            "order_side": OrderSide.SHORT.value,
+            "portfolio_id": portfolio.id,
+            "status": OrderStatus.CREATED.value,
+            "trading_symbol": portfolio.trading_symbol,
+        }
+
+        if metadata is not None:
+            order_data["metadata"] = metadata
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            order_data["created_at"] = \
+                self.configuration_service.config[INDEX_DATETIME]
+
+        self._attach_strategy_attribution(order_data)
+        order_data["_execute"] = execute
+        order_data["_validate"] = validate
+        order_data["_sync"] = sync
+
+        return self._blotter.place_order(order_data, self)
+
+    def create_cover_order(
+        self,
+        target_symbol,
+        price,
+        amount=None,
+        percentage_of_position=None,
+        order_type=OrderType.LIMIT,
+        market=None,
+        execute=True,
+        validate=True,
+        sync=True,
+        metadata=None,
+    ) -> Order:
+        """
+        Create a COVER (short-close) order.
+
+        Sizing: pass either ``amount`` (units of the underlying) or
+        ``percentage_of_position`` (percentage of the open short to
+        close, 1–100).
+
+        Args:
+            target_symbol (str): The symbol of the open short.
+            price (float): Limit price (or reference price for
+                MARKET/STOP orders).
+            amount (float, optional): Units to cover.
+            percentage_of_position (float, optional): Percentage of
+                the open short to close.
+            order_type (OrderType): Order type (defaults to LIMIT).
+            market (str, optional): Market the order routes through.
+            execute (bool): Whether to execute via the configured
+                order executor (default True).
+            validate (bool): Run the COVER validator (default True).
+            sync (bool): Whether to sync the portfolio/position state
+                with the created order (default True).
+            metadata (dict, optional): Order metadata.
+
+        Returns:
+            Order: The created order.
+        """
+        if amount is None and percentage_of_position is None:
+            raise OperationalException(
+                "Either amount or percentage_of_position must be "
+                "specified to create a cover order."
+            )
+
+        portfolio = self.portfolio_service.find({"market": market})
+
+        if percentage_of_position is not None:
+            position = self.position_service.find(
+                {
+                    "symbol": target_symbol,
+                    "portfolio": portfolio.id,
+                }
+            )
+            position_amount = position.get_amount() or 0
+            if position_amount >= 0:
+                raise OperationalException(
+                    f"Can't size cover by percentage_of_position: "
+                    f"no open short on {target_symbol} "
+                    f"(amount={position_amount})"
+                )
+            amount = abs(position_amount) * (percentage_of_position / 100)
+
+        order_data = {
+            "target_symbol": target_symbol,
+            "price": price,
+            "amount": amount,
+            "order_type": OrderType.from_value(order_type).value,
+            "order_side": OrderSide.COVER.value,
+            "portfolio_id": portfolio.id,
+            "status": OrderStatus.CREATED.value,
+            "trading_symbol": portfolio.trading_symbol,
+        }
+
+        if metadata is not None:
+            order_data["metadata"] = metadata
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            order_data["created_at"] = \
+                self.configuration_service.config[INDEX_DATETIME]
+
+        self._attach_strategy_attribution(order_data)
+        order_data["_execute"] = execute
+        order_data["_validate"] = validate
+        order_data["_sync"] = sync
+
+        return self._blotter.place_order(order_data, self)
+
+    def create_market_buy_order(
+        self,
+        target_symbol,
+        amount=None,
+        percentage_of_portfolio=None,
+        market=None,
+        portfolio_id=None,
+        metadata=None
+    ) -> Order:
+        """
+        Function to create a market buy order.
+
+        Args:
+            target_symbol (str): The symbol of the asset to buy
+            amount (float, optional): The amount of the asset to buy
+            percentage_of_portfolio (float, optional): The percentage of the
+                portfolio to buy.
+            market (str, optional): the portfolio corresponding to the market
+                to buy the asset
+            portfolio_id (str, optional): The ID of the portfolio to buy
+                the asset from.
+            metadata (dict, optional): Additional metadata for the order
+
+        Returns:
+            Order: The order created
+        """
+
+        if amount is None and percentage_of_portfolio is None:
+            raise OperationalException(
+                "Either amount or percentage_of_portfolio must be specified "
+                "to create a market buy order."
+            )
+
+        return self.create_market_order(
+            target_symbol=target_symbol,
+            order_side=OrderSide.BUY,
+            amount=amount,
+            percentage_of_portfolio=percentage_of_portfolio,
+            market=market,
+            metadata=metadata
+        )
+
+    def create_market_sell_order(
+        self,
+        target_symbol,
+        amount=None,
+        percentage_of_position=None,
+        market=None,
+        portfolio_id=None,
+        metadata=None
+    ) -> Order:
+        """
+        Function to create a market sell order.
+
+        Args:
+            target_symbol (str): The symbol of the asset to sell
+            amount (float, optional): The amount of the asset to sell
+            percentage_of_position (float, optional): The percentage of the
+                position to sell.
+            market (str, optional): the portfolio corresponding to the market
+                to sell the asset
+            portfolio_id (str, optional): The ID of the portfolio to sell
+                the asset from.
+            metadata (dict, optional): Additional metadata for the order
+
+        Returns:
+            Order: The order created
+        """
+
+        if amount is None and percentage_of_position is None:
+            raise OperationalException(
+                "Either amount or percentage_of_position must be specified "
+                "to create a market sell order."
+            )
+
+        return self.create_market_order(
+            target_symbol=target_symbol,
+            order_side=OrderSide.SELL,
+            amount=amount,
+            percentage_of_position=percentage_of_position,
+            market=market,
+            metadata=metadata
+        )
+
+    def create_limit_sell_order(
+        self,
+        target_symbol,
+        price,
+        amount=None,
+        percentage_of_position=None,
+        market=None,
+        portfolio_id=None
+    ) -> Order:
+        """
+        Function to create a limit sell order. This function will create
+        a limit sell order. If the amount parameter is specified, the
+        order will be created with the specified amount. If the
+        percentage_of_position parameter is specified, the order will be
+        created with the percentage of the position specified. If neither
+        the amount nor the percentage_of_position parameter is specified,
+        an OperationalException will be raised.
+
+        Args:
+            target_symbol (str): The symbol of the asset to sell
+            price (float): The price at which to sell the asset
+            amount (float, optional): The amount of the asset to sell
+            percentage_of_position (float, optional): The percentage of the
+                position to sell.
+            market (str, optional): the portfolio corresponding to the market
+                to sell the asset
+            portfolio_id: (str, optional): The ID of the portfolio to sell
+                the asset from.
+
+        Returns:
+            Order: The order created
+        """
+        if amount is None and percentage_of_position is None:
+            raise OperationalException(
+                "Either amount or percentage_of_position must be specified "
+                "to create a limit sell order."
+            )
+
+        return self.create_limit_order(
+            target_symbol=target_symbol,
+            price=price,
+            order_side=OrderSide.SELL,
+            amount=amount,
+            percentage_of_position=percentage_of_position,
+            market=market,
+        )
+
+    def create_limit_buy_order(
+        self,
+        target_symbol,
+        price,
+        amount=None,
+        percentage_of_portfolio=None,
+        market=None,
+        portfolio_id=None
+    ) -> Order:
+        """
+        Function to create a limit buy order. This function will create
+        a limit buy order. If the amount parameter is specified, the
+        order will be created with the specified amount. If the
+        percentage_of_portfolio parameter is specified, the order will be
+        created with the percentage of the portfolio specified. If neither
+        the amount nor the percentage_of_portfolio parameter is specified,
+        an OperationalException will be raised.
+
+        Args:
+            target_symbol (str): The symbol of the asset to buy
+            price (float): The price at which to buy the asset
+            amount (float, optional): The amount of the asset to buy
+            percentage_of_portfolio (float, optional): The percentage of the
+                portfolio to buy.
+            market (str, optional): the portfolio corresponding to the market
+                to buy the asset
+            portfolio_id (str, optional): The ID of the portfolio to buy
+                the asset from.
+
+        Returns:
+            Order: The order created
+        """
+
+        if amount is None and percentage_of_portfolio is None:
+            raise OperationalException(
+                "Either amount or percentage_of_portfolio must be specified "
+                "to create a limit buy order."
+            )
+
+        return self.create_limit_order(
+            target_symbol=target_symbol,
+            price=price,
+            order_side=OrderSide.BUY,
+            amount=amount,
+            percentage_of_portfolio=percentage_of_portfolio,
+            market=market,
+        )
+
+    def order_value(
+        self,
+        target_symbol,
+        value,
+        order_side,
+        price,
+        market=None,
+        precision=None,
+        metadata=None,
+    ) -> Order:
+        """
+        Place a LIMIT order for a fixed currency amount.
+
+        The order amount is computed as ``value / price``.
+
+        Args:
+            target_symbol: The symbol of the asset to trade.
+            value: Currency amount to spend (BUY) or to sell (SELL).
+            order_side: ``OrderSide.BUY`` or ``OrderSide.SELL``.
+            price: Limit price.
+            market: Optional market identifier.
+            precision: Optional decimal precision to round the
+              computed amount down.
+            metadata: Optional order metadata.
+
+        Returns:
+            Order: The created order.
+        """
+        if value is None or value <= 0:
+            raise OperationalException(
+                "`value` must be a positive number."
+            )
+        if price is None or price <= 0:
+            raise OperationalException(
+                "`price` must be a positive number."
+            )
+        amount = value / price
+        if precision is not None:
+            amount = RoundingService.round_down(amount, precision)
+        return self.create_limit_order(
+            target_symbol=target_symbol,
+            price=price,
+            order_side=order_side,
+            amount=amount,
+            market=market,
+            metadata=metadata,
+        )
+
+    def order_percent(
+        self,
+        target_symbol,
+        percent,
+        order_side,
+        price,
+        market=None,
+        precision=None,
+        metadata=None,
+    ) -> Order:
+        """
+        Place a LIMIT order for ``percent`` of the portfolio's net size.
+
+        Args:
+            target_symbol: The symbol of the asset to trade.
+            percent: Percentage (0-100) of portfolio net size to allocate.
+            order_side: ``OrderSide.BUY`` or ``OrderSide.SELL``.
+            price: Limit price.
+            market: Optional market identifier.
+            precision: Optional decimal precision to round the
+              computed amount down.
+            metadata: Optional order metadata.
+
+        Returns:
+            Order: The created order.
+        """
+        if percent is None or percent <= 0:
+            raise OperationalException(
+                "`percent` must be a positive number."
+            )
+        portfolio = self.portfolio_service.find({"market": market})
+        net_size = portfolio.get_net_size()
+        value = net_size * (percent / 100.0)
+        return self.order_value(
+            target_symbol=target_symbol,
+            value=value,
+            order_side=order_side,
+            price=price,
+            market=market,
+            precision=precision,
+            metadata=metadata,
+        )
+
+    def order_target(
+        self,
+        target_symbol,
+        target_amount,
+        price,
+        market=None,
+        precision=None,
+        metadata=None,
+    ) -> Order:
+        """
+        Adjust the position in ``target_symbol`` to hold exactly
+        ``target_amount`` units.
+
+        The difference between the current position size and
+        ``target_amount`` is submitted as a BUY (positive diff) or
+        SELL (negative diff) LIMIT order. If the position already
+        matches the target, no order is placed.
+
+        Args:
+            target_symbol: The symbol of the asset to adjust.
+            target_amount: Desired position size in units.
+            price: Limit price.
+            market: Optional market identifier.
+            precision: Optional decimal precision to round the diff down.
+            metadata: Optional order metadata.
+
+        Returns:
+            Order: The created order, or ``None`` if no adjustment
+              was required.
+        """
+        if target_amount is None or target_amount < 0:
+            raise OperationalException(
+                "`target_amount` must be a non-negative number."
+            )
+        if price is None or price <= 0:
+            raise OperationalException(
+                "`price` must be a positive number."
+            )
+        portfolio = self.portfolio_service.find({"market": market})
+        try:
+            position = self.position_service.find(
+                {"symbol": target_symbol, "portfolio": portfolio.id}
+            )
+            current_amount = position.get_amount() \
+                if position is not None else 0
+        except OperationalException:
+            current_amount = 0
+        diff = target_amount - current_amount
+        if precision is not None:
+            sign = 1 if diff >= 0 else -1
+            diff = sign * RoundingService.round_down(abs(diff), precision)
+        if diff == 0:
+            return None
+        order_side = OrderSide.BUY if diff > 0 else OrderSide.SELL
+        return self.create_limit_order(
+            target_symbol=target_symbol,
+            price=price,
+            order_side=order_side,
+            amount=abs(diff),
+            market=market,
+            metadata=metadata,
+        )
+
+    def order_target_value(
+        self,
+        target_symbol,
+        target_value,
+        price,
+        market=None,
+        precision=None,
+        metadata=None,
+    ) -> Order:
+        """
+        Adjust the position in ``target_symbol`` so its market value at
+        ``price`` equals ``target_value``.
+
+        Args:
+            target_symbol: The symbol of the asset to adjust.
+            target_value: Desired position market value in trading currency.
+            price: Limit price.
+            market: Optional market identifier.
+            precision: Optional decimal precision to round the diff down.
+            metadata: Optional order metadata.
+
+        Returns:
+            Order: The created order, or ``None`` if no adjustment
+              was required.
+        """
+        if target_value is None or target_value < 0:
+            raise OperationalException(
+                "`target_value` must be a non-negative number."
+            )
+        if price is None or price <= 0:
+            raise OperationalException(
+                "`price` must be a positive number."
+            )
+        target_amount = target_value / price
+        return self.order_target(
+            target_symbol=target_symbol,
+            target_amount=target_amount,
+            price=price,
+            market=market,
+            precision=precision,
+            metadata=metadata,
+        )
+
+    def order_target_percent(
+        self,
+        target_symbol,
+        target_percent,
+        price,
+        market=None,
+        precision=None,
+        metadata=None,
+    ) -> Order:
+        """
+        Adjust the position in ``target_symbol`` so its market value
+        equals ``target_percent`` of the portfolio's net size.
+
+        Args:
+            target_symbol: The symbol of the asset to adjust.
+            target_percent: Desired position size as a percentage (0-100)
+              of portfolio net size.
+            price: Limit price.
+            market: Optional market identifier.
+            precision: Optional decimal precision to round the diff down.
+            metadata: Optional order metadata.
+
+        Returns:
+            Order: The created order, or ``None`` if no adjustment
+              was required.
+        """
+        if target_percent is None or target_percent < 0:
+            raise OperationalException(
+                "`target_percent` must be a non-negative number."
+            )
+        portfolio = self.portfolio_service.find({"market": market})
+        net_size = portfolio.get_net_size()
+        target_value = net_size * (target_percent / 100.0)
+        return self.order_target_value(
+            target_symbol=target_symbol,
+            target_value=target_value,
+            price=price,
+            market=market,
+            precision=precision,
+            metadata=metadata,
+        )
+
+    def get_portfolio(self, market=None) -> Portfolio:
+        """
+        Function to get the portfolio of the algorithm. This function
+        will return the portfolio of the algorithm. If the market
+        parameter is specified, the portfolio of the specified market
+        will be returned.
+
+        Parameters:
+            market: The market of the portfolio
+
+        Returns:
+            Portfolio: The portfolio of the algorithm
+        """
+
+        if market is None:
+            portfolio = self.portfolio_service.get_all()[0]
+        else:
+            portfolio = self.portfolio_service.find({"market": market})
+
+        # Retrieve positions
+        positions = self.position_service.get_all(
+            {"portfolio": portfolio.id}
+        )
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            date = self.configuration_service.config[INDEX_DATETIME]
+        else:
+            date = datetime.now(tz=timezone.utc)
+
+        allocated = 0.0
+
+        for position in positions:
+
+            if position.symbol != portfolio.trading_symbol:
+                ticker = self.data_provider_service.get_ticker_data(
+                    symbol=f"{position.symbol}/{portfolio.trading_symbol}",
+                    market=portfolio.market,
+                    date=date
+                )
+                if ticker is not None and "bid" in ticker:
+                    allocated += position.get_amount() * ticker["bid"]
+
+        portfolio.allocated = allocated
+        return portfolio
+
+    def get_latest_price(self, symbol, market=None):
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            date = self.configuration_service.config[INDEX_DATETIME]
+        else:
+            date = datetime.now(tz=timezone.utc)
+
+        ticker = self.data_provider_service.get_ticker_data(
+            symbol=symbol,
+            market=market,
+            date=date
+        )
+
+        return ticker['bid'] if ticker and 'bid' in ticker else None
+
+    def get_fx_rate(
+        self, from_currency: str, to_currency: str
+    ) -> float:
+        """
+        Get the exchange rate between two currencies using the
+        registered FX rate provider.
+
+        Args:
+            from_currency: Source currency code (e.g. "USD").
+            to_currency: Target currency code (e.g. "EUR").
+
+        Returns:
+            float: The exchange rate. Returns 1.0 if the currencies
+                are the same.
+
+        Raises:
+            OperationalException: If no FX rate provider is registered.
+        """
+        from_c = from_currency.upper()
+        to_c = to_currency.upper()
+
+        if from_c == to_c:
+            return 1.0
+
+        if self._fx_rate_provider is None:
+            raise OperationalException(
+                f"Cannot convert {from_c} to {to_c}: "
+                "no FX rate provider registered. "
+                "Use app.add_fx_rate_provider() to register one."
+            )
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            date = self.configuration_service.config[INDEX_DATETIME]
+        else:
+            date = datetime.now(tz=timezone.utc)
+
+        return self._fx_rate_provider.get_rate(from_c, to_c, date=date)
+
+    def convert_to_base_currency(
+        self, amount: float, from_currency: str
+    ) -> float:
+        """
+        Convert an amount to the base currency.
+
+        Args:
+            amount: The amount to convert.
+            from_currency: The currency of the amount.
+
+        Returns:
+            float: The converted amount in the base currency.
+
+        Raises:
+            OperationalException: If no base currency is set or no
+                FX rate provider is registered.
+        """
+        if self._base_currency is None:
+            raise OperationalException(
+                "No base currency configured. "
+                "Use app.set_base_currency() to set one."
+            )
+
+        rate = self.get_fx_rate(from_currency, self._base_currency)
+        return amount * rate
+
+    def get_portfolio_value(self) -> float:
+        """
+        Compute the total portfolio value across all markets,
+        converted to the base currency.
+
+        If no base currency is set, returns the total value of
+        the first (default) portfolio in its own trading currency.
+
+        Each portfolio's value = unallocated cash + sum of
+        (position_amount * current_price), converted via FX rates
+        to the base currency.
+
+        Returns:
+            float: Total portfolio value in the base currency.
+        """
+        portfolios = self.portfolio_service.get_all()
+
+        if BACKTESTING_FLAG in self.configuration_service.config \
+                and self.configuration_service.config[BACKTESTING_FLAG]:
+            date = self.configuration_service.config[INDEX_DATETIME]
+        else:
+            date = datetime.now(tz=timezone.utc)
+
+        total_value = 0.0
+
+        for portfolio in portfolios:
+            trading_symbol = portfolio.trading_symbol
+            positions = self.position_service.get_all(
+                {"portfolio": portfolio.id}
+            )
+
+            # Portfolio value in its local trading currency
+            local_value = 0.0
+
+            for position in positions:
+                if position.symbol == trading_symbol:
+                    local_value += position.get_amount()
+                else:
+                    ticker = self.data_provider_service.get_ticker_data(
+                        symbol=(
+                            f"{position.symbol}/{trading_symbol}"
+                        ),
+                        market=portfolio.market,
+                        date=date
+                    )
+
+                    if ticker is not None and "bid" in ticker:
+                        local_value += (
+                            position.get_amount() * ticker["bid"]
+                        )
+
+            # Convert to base currency if configured
+            if (
+                self._base_currency is not None
+                and self._fx_rate_provider is not None
+                and trading_symbol != self._base_currency
+            ):
+                rate = self._fx_rate_provider.get_rate(
+                    trading_symbol, self._base_currency, date=date
+                )
+                total_value += local_value * rate
+            else:
+                total_value += local_value
+
+        return total_value
+
+    def get_portfolios(self):
+        """
+        Function to get all portfolios of the algorithm. This function
+        will return all portfolios of the algorithm.
+
+        Returns:
+            List[Portfolio]: A list of all portfolios of the algorithm
+        """
+        return self.portfolio_service.get_all()
+
+    def get_unallocated(self, market=None) -> float:
+        """
+        Function to get the unallocated balance of the portfolio. This
+        function will return the unallocated balance of the portfolio.
+        If the market parameter is specified, the unallocated balance
+        of the specified market will be returned.
+
+        Args:
+            market: The market of the portfolio
+
+        Returns:
+            float: The unallocated balance of the portfolio
+        """
+
+        if market:
+            portfolio = self.portfolio_service.find({{"market": market}})
+        else:
+            portfolio = self.portfolio_service.get_all()[0]
+
+        trading_symbol = portfolio.trading_symbol
+        return self.position_service.find(
+            {"portfolio": portfolio.id, "symbol": trading_symbol}
+        ).get_amount()
+
+    def sync_portfolio(
+        self,
+        market: str = None,
+        allow_withdrawals: bool = False,
+        tolerance: float = 1e-9,
+    ) -> SyncResult:
+        """Reconcile the local portfolio's unallocated balance with the broker.
+
+        This is the **canonical entry point** for "make my strategy aware of
+        cash that arrived (or left) my account out-of-band". The contract is
+        identical across live and backtest modes:
+
+        1. Ask the broker (live: registered :class:`PortfolioProvider`;
+           backtest: simulated :class:`BrokerBalanceTracker`) what the
+           trading-symbol balance currently is.
+        2. In live mode, subtract cash reserved for orders the framework
+           knows about but the exchange has not yet acknowledged
+           (``OrderStatus.CREATED``). Without this, the natural race
+           between local order creation and exchange acknowledgement
+           would surface as a phantom "deposit".
+        3. Compute ``delta = adjusted_broker_available - local_unallocated``.
+        4. ``abs(delta) <= tolerance`` → no-op.
+        5. ``delta > 0`` → an external deposit landed; absorb it by topping
+           up ``unallocated``.
+        6. ``delta < 0`` → the broker reports *less* than the framework
+           expected (an external withdrawal, an out-of-band fill, an
+           unrecorded fee, …). By default this raises
+           :class:`PortfolioOutOfSyncError` because silently shrinking
+           the strategy's working capital is almost always the wrong
+           thing to do. Pass ``allow_withdrawals=True`` to explicitly
+           accept the drain.
+
+        The absorbed cash flow is recorded on the
+        :class:`BrokerBalanceTracker` so the snapshot service can attach
+        it to the next portfolio snapshot's ``cash_flow`` field, which in
+        turn lets return metrics (CAGR, monthly/yearly returns) compute
+        true time-weighted returns instead of being inflated by deposits.
+
+        Args:
+            market: Market identifier. Defaults to the first registered
+                portfolio. Case-insensitive.
+            allow_withdrawals: When ``True``, negative deltas drain
+                ``unallocated`` instead of raising. The drain is still
+                refused if it would push ``unallocated`` below zero.
+            tolerance: Absolute drift below which the sync is treated as
+                a noop. Defaults to ``1e-9`` to swallow floating-point
+                dust. Useful to bump (e.g. ``1.0``) for live mode if
+                small fee/rounding glitches keep tripping the check.
+
+        Returns:
+            :class:`SyncResult` describing the outcome.
+
+        Raises:
+            PortfolioOutOfSyncError: On negative delta when
+                ``allow_withdrawals=False``, or when the resulting
+                ``unallocated`` would be negative.
+            OperationalException: When live mode is configured but no
+                :class:`PortfolioProvider` / :class:`MarketCredential`
+                is registered for the market.
+        """
+        if tolerance < 0:
+            raise OperationalException(
+                f"sync_portfolio: tolerance must be non-negative, got "
+                f"{tolerance}."
+            )
+        portfolio = self._resolve_portfolio_for_sync(market)
+        market_id = portfolio.market
+        previous_unallocated = float(portfolio.get_unallocated() or 0.0)
+
+        broker_available, reserved = self._fetch_broker_available(
+            portfolio, previous_unallocated
+        )
+
+        delta = broker_available - previous_unallocated
+
+        if abs(delta) <= tolerance:
+            return SyncResult(
+                market=market_id,
+                kind="noop",
+                delta=delta,
+                broker_available=broker_available,
+                previous_unallocated=previous_unallocated,
+                new_unallocated=previous_unallocated,
+                within_tolerance=delta != 0,
+                reserved_for_pending_orders=reserved,
+            )
+
+        if delta < 0 and not allow_withdrawals:
+            raise PortfolioOutOfSyncError(
+                f"Portfolio out of sync on market '{market_id}': local "
+                f"unallocated {previous_unallocated} > broker available "
+                f"{broker_available} (delta {delta}, "
+                f"{reserved} reserved for pending orders). This usually "
+                f"means an external withdrawal happened, an order filled "
+                f"out-of-band, or fees were charged the framework did not "
+                f"see. Pass allow_withdrawals=True to drain unallocated, "
+                f"or investigate the broker account.",
+                market=market_id,
+                local_unallocated=previous_unallocated,
+                broker_available=broker_available,
+                delta=delta,
+            )
+
+        new_unallocated = broker_available
+        if new_unallocated < 0:
+            raise PortfolioOutOfSyncError(
+                f"Refusing to set unallocated to a negative value on market "
+                f"'{market_id}': broker reports {broker_available}, which is "
+                f"below zero. Investigate the broker account.",
+                market=market_id,
+                local_unallocated=previous_unallocated,
+                broker_available=broker_available,
+                delta=delta,
+            )
+
+        kind = "deposit" if delta > 0 else "withdrawal"
+        self._apply_unallocated_change(portfolio, new_unallocated)
+
+        # Record the cash flow so the next portfolio snapshot gets a
+        # non-zero ``cash_flow`` and TWR-aware metrics work correctly.
+        if self.broker_balance_tracker is not None:
+            self.broker_balance_tracker.record_cash_flow(market_id, delta)
+
+        logger.info(
+            "sync_portfolio[%s] %s: local %.6f -> %.6f (broker reports %.6f, "
+            "delta %+.6f, reserved %.6f)",
+            market_id, kind, previous_unallocated, new_unallocated,
+            broker_available, delta, reserved,
+        )
+
+        return SyncResult(
+            market=market_id,
+            kind=kind,
+            delta=delta,
+            broker_available=broker_available,
+            previous_unallocated=previous_unallocated,
+            new_unallocated=new_unallocated,
+            within_tolerance=False,
+            reserved_for_pending_orders=reserved,
+        )
+
+    def _resolve_portfolio_for_sync(self, market) -> Portfolio:
+        if market is not None:
+            # Portfolio.market is canonically uppercased on creation; match
+            # case-insensitively so users can pass "binance" or "BINANCE".
+            normalized = str(market).upper()
+            portfolio = self.portfolio_service.find({"market": normalized})
+            if portfolio is None:
+                portfolio = self.portfolio_service.find({"market": market})
+        else:
+            portfolios = self.portfolio_service.get_all()
+            if not portfolios:
+                raise OperationalException(
+                    "sync_portfolio: no portfolio registered. "
+                    "Did you call app.add_market(...)?"
+                )
+            portfolio = portfolios[0]
+        if portfolio is None:
+            raise OperationalException(
+                f"sync_portfolio: no portfolio found for market '{market}'."
+            )
+        return portfolio
+
+    def _fetch_broker_available(
+        self, portfolio: Portfolio, previous_unallocated: float
+    ) -> tuple:
+        """Returns (broker_available, reserved_for_pending_orders)."""
+        config = self.configuration_service.get_config()
+        environment = config.get(ENVIRONMENT)
+
+        is_backtest = environment in (
+            Environment.BACKTEST.value,
+            Environment.BACKTEST,
+        )
+
+        if is_backtest:
+            if self.broker_balance_tracker is None:
+                # No tracker wired (legacy app construction); deposits cannot
+                # be simulated → broker == local.
+                return previous_unallocated, 0.0
+            pending = self.broker_balance_tracker.consume_pending(
+                portfolio.market
+            )
+            return previous_unallocated + pending, 0.0
+
+        # Live mode
+        if self.portfolio_provider_lookup is None:
+            raise OperationalException(
+                "sync_portfolio: no PortfolioProviderLookup wired into the "
+                "context. This usually means the app was constructed without "
+                "the standard dependency container."
+            )
+        market_credential = self.market_credential_service.get(
+            portfolio.market
+        )
+        if market_credential is None:
+            raise OperationalException(
+                f"sync_portfolio: no market credential registered for "
+                f"market '{portfolio.market}'. Live broker reconciliation "
+                f"requires API credentials."
+            )
+        provider = self.portfolio_provider_lookup.get_portfolio_provider(
+            portfolio.market
+        )
+        if provider is None:
+            raise OperationalException(
+                f"sync_portfolio: no PortfolioProvider registered for market "
+                f"'{portfolio.market}'."
+            )
+        position = provider.get_position(
+            portfolio, portfolio.trading_symbol, market_credential
+        )
+        raw = float(position.amount) if position is not None else 0.0
+
+        # Subtract cash reserved for orders the framework has issued but
+        # the exchange has not yet acknowledged. ``free`` from the broker
+        # already excludes acknowledged open orders, but not those in
+        # CREATED state — without this adjustment a brief race window
+        # between create_order() and the exchange ack would surface as a
+        # phantom "deposit" of the order's cost.
+        reserved = self._reserved_cash_for_pending_orders(portfolio)
+        return raw - reserved, reserved
+
+    def _reserved_cash_for_pending_orders(
+        self, portfolio: Portfolio
+    ) -> float:
+        """Sum of trading-symbol cash locked by orders the framework has
+        created but the exchange has not yet filled or cancelled.
+
+        Buys consume cash; sells release it. Only ``CREATED`` orders are
+        counted because the broker's ``free`` balance already excludes
+        acknowledged open orders.
+        """
+        try:
+            created_orders = self.order_service.get_all({
+                "portfolio_id": portfolio.id,
+                "status": OrderStatus.CREATED.value,
+            })
+        except Exception:  # noqa: BLE001
+            return 0.0
+        reserved = 0.0
+        for order in created_orders or []:
+            try:
+                price = float(order.get_price() or 0.0)
+                amount = float(
+                    order.get_remaining() or order.get_amount() or 0.0
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if OrderSide.BUY.equals(order.get_order_side()):
+                reserved += price * amount
+            # Sells release cash on fill; not counted here.
+        return reserved
+
+    def _apply_unallocated_change(
+        self, portfolio: Portfolio, new_unallocated: float
+    ) -> None:
+        self.portfolio_service.update(
+            portfolio.id, {"unallocated": new_unallocated}
+        )
+        # Keep the trading-symbol position in lockstep, mirroring the
+        # behaviour of PortfolioSyncService.sync_unallocated().
+        try:
+            trading_position = self.position_service.find({
+                "portfolio": portfolio.id,
+                "symbol": portfolio.trading_symbol,
+            })
+        except Exception:  # noqa: BLE001 — repository raises on miss
+            trading_position = None
+        if trading_position is not None:
+            self.position_service.update(
+                trading_position.id, {"amount": new_unallocated}
+            )
+
+    def get_total_size(self):
+        """
+        Returns the total size of the portfolio.
+
+        The total size of the portfolio is the unallocated balance and the
+        allocated balance of the portfolio.
+
+        Returns:
+            float: The total size of the portfolio
+        """
+        return self.get_unallocated() + self.get_allocated()
+
+    def get_order(
+        self,
+        reference_id=None,
+        market=None,
+        target_symbol=None,
+        trading_symbol=None,
+        order_side=None,
+        order_type=None
+    ) -> Order:
+        """
+        Function to retrieve an order.
+
+        Exception is thrown when no param has been provided.
+
+        Args:
+            reference_id [optional] (int): id given by the external
+                market or exchange.
+            market [optional] (str): the market that the order was
+                executed on.
+            target_symbol [optional] (str): the symbol of the asset
+                that the order was executed
+        """
+        query_params = {}
+
+        if reference_id:
+            query_params["reference_id"] = reference_id
+
+        if target_symbol:
+            query_params["target_symbol"] = target_symbol
+
+        if trading_symbol:
+            query_params["trading_symbol"] = trading_symbol
+
+        if order_side:
+            query_params["order_side"] = order_side
+
+        if order_type:
+            query_params["order_type"] = order_type
+
+        if market:
+            portfolio = self.portfolio_service.find({"market": market})
+            positions = self.position_service.get_all(
+                {"portfolio": portfolio.id}
+            )
+            query_params["position"] = [position.id for position in positions]
+
+        if not query_params:
+            raise OperationalException(
+                "No parameters provided to get order."
+            )
+
+        return self.order_service.find(query_params)
+
+    def get_orders(
+        self,
+        target_symbol=None,
+        status=None,
+        order_type=None,
+        order_side=None,
+        market=None
+    ) -> List[Order]:
+
+        if market is None:
+            portfolio = self.portfolio_service.get_all()[0]
+        else:
+            portfolio = self.portfolio_service.find({"market": market})
+
+        positions = self.position_service.get_all({"portfolio": portfolio.id})
+        return self.order_service.get_all(
+            {
+                "position": [position.id for position in positions],
+                "target_symbol": target_symbol,
+                "status": status,
+                "order_type": order_type,
+                "order_side": order_side
+            }
+        )
+
+    def get_positions(
+        self,
+        market=None,
+        identifier=None,
+        amount_gt=None,
+        amount_gte=None,
+        amount_lt=None,
+        amount_lte=None
+    ) -> List[Position]:
+        """
+        Function to get all positions. This function will return all
+        positions that match the specified query parameters. If the
+        market parameter is specified, the positions of the specified
+        market will be returned. If the identifier parameter is
+        specified, the positions of the specified portfolio will be
+        returned. If the amount_gt parameter is specified, the positions
+        with an amount greater than the specified amount will be returned.
+        If the amount_gte parameter is specified, the positions with an
+        amount greater than or equal to the specified amount will be
+        returned. If the amount_lt parameter is specified, the positions
+        with an amount less than the specified amount will be returned.
+        If the amount_lte parameter is specified, the positions with an
+        amount less than or equal to the specified amount will be returned.
+
+        Parameters:
+            market: The market of the portfolio where the positions are
+            identifier: The identifier of the portfolio
+            amount_gt: The amount of the asset must be greater than this
+            amount_gte: The amount of the asset must be greater than or
+                equal to this
+            amount_lt: The amount of the asset must be less than this
+            amount_lte: The amount of the asset must be less than or equal
+                to this
+
+        Returns:
+            List[Position]: A list of positions that match the query parameters
+        """
+        query_params = {}
+
+        if market is not None:
+            query_params["market"] = market
+
+        if identifier is not None:
+            query_params["identifier"] = identifier
+
+        if amount_gt is not None:
+            query_params["amount_gt"] = amount_gt
+
+        if amount_gte is not None:
+            query_params["amount_gte"] = amount_gte
+
+        if amount_lt is not None:
+            query_params["amount_lt"] = amount_lt
+
+        if amount_lte is not None:
+            query_params["amount_lte"] = amount_lte
+
+        portfolios = self.portfolio_service.get_all(query_params)
+
+        if not portfolios:
+            raise OperationalException("No portfolio found.")
+
+        portfolio = portfolios[0]
+        return self.position_service.get_all(
+            {"portfolio": portfolio.id}
+        )
+
+    def get_position(self, symbol, market=None, identifier=None) -> Position:
+        """
+        Function to get a position. This function will return the
+        position that matches the specified query parameters. If the
+        market parameter is specified, the position of the specified
+        market will be returned. If the identifier parameter is
+        specified, the position of the specified portfolio will be
+        returned.
+
+        Parameters:
+            symbol: The symbol of the asset that represents the position
+            market: The market of the portfolio where the position is located
+            identifier: The identifier of the portfolio
+
+        Returns:
+            Position: The position that matches the query parameters
+        """
+
+        query_params = {}
+
+        if market is not None:
+            query_params["market"] = market
+
+        if identifier is not None:
+            query_params["identifier"] = identifier
+
+        portfolios = self.portfolio_service.get_all(query_params)
+
+        if not portfolios:
+            raise OperationalException("No portfolio found.")
+
+        portfolio = portfolios[0]
+
+        try:
+            return self.position_service.find(
+                {"portfolio": portfolio.id, "symbol": symbol}
+            )
+        except OperationalException:
+            return None
+
+    def has_position(
+        self,
+        symbol,
+        market=None,
+        identifier=None,
+        amount_gt=0,
+        amount_gte=None,
+        amount_lt=None,
+        amount_lte=None
+    ):
+        """
+        Function to check if a position exists. This function will return
+        True if a position exists, False otherwise. This function will check
+        if the amount > 0 condition by default.
+
+        Parameters:
+            param symbol: The symbol of the asset
+            param market: The market of the asset
+            param identifier: The identifier of the portfolio
+            param amount_gt: The amount of the asset must be greater than this
+            param amount_gte: The amount of the asset must be greater than
+            or equal to this
+            param amount_lt: The amount of the asset must be less than this
+            param amount_lte: The amount of the asset must be less than
+            or equal to this
+
+        Returns:
+            Boolean: True if a position exists, False otherwise
+        """
+
+        return self.position_exists(
+            symbol=symbol,
+            market=market,
+            identifier=identifier,
+            amount_gt=amount_gt,
+            amount_gte=amount_gte,
+            amount_lt=amount_lt,
+            amount_lte=amount_lte
+        )
+
+    def position_exists(
+            self,
+            symbol,
+            market=None,
+            identifier=None,
+            amount_gt=None,
+            amount_gte=None,
+            amount_lt=None,
+            amount_lte=None
+    ) -> bool:
+        """
+        Function to check if a position exists. This function will return
+        True if a position exists, False otherwise. This function will
+        not check the amount > 0 condition by default. If you want to
+        check if a position exists with an amount greater than 0, you
+        can use the amount_gt parameter. If you want to check if a
+        position exists with an amount greater than or equal to a
+        certain amount, you can use the amount_gte parameter. If you
+        want to check if a position exists with an amount less than a
+        certain amount, you can use the amount_lt parameter. If you want
+        to check if a position exists with an amount less than or equal
+        to a certain amount, you can use the amount_lte parameter.
+
+        It is not recommended to use this method directly because it can
+        have adverse effects on the algorithm. It is recommended to use
+        the has_position method instead.
+
+        param symbol: The symbol of the asset
+        param market: The market of the asset
+        param identifier: The identifier of the portfolio
+        param amount_gt: The amount of the asset must be greater than this
+        param amount_gte: The amount of the asset must be greater than
+        or equal to this
+        param amount_lt: The amount of the asset must be less than this
+        param amount_lte: The amount of the asset must be less than
+        or equal to this
+
+        return: True if a position exists, False otherwise
+        """
+        query_params = {}
+
+        if market is not None:
+            query_params["market"] = market
+
+        if identifier is not None:
+            query_params["identifier"] = identifier
+
+        if amount_gt is not None:
+            query_params["amount_gt"] = amount_gt
+
+        if amount_gte is not None:
+            query_params["amount_gte"] = amount_gte
+
+        if amount_lt is not None:
+            query_params["amount_lt"] = amount_lt
+
+        if amount_lte is not None:
+            query_params["amount_lte"] = amount_lte
+
+        query_params["symbol"] = symbol
+        return self.position_service.exists(query_params)
+
+    def get_position_percentage_of_portfolio_by_net_size(
+        self, symbol, market=None, identifier=None
+    ) -> float:
+        """
+        Returns the percentage of the portfolio that is allocated to a
+        position. This is calculated by dividing the cost of the position
+        by the total net size of the portfolio.
+
+        The total net size of the portfolio is the initial balance of the
+        portfolio plus the all the net gains of your trades.
+        """
+        query_params = {}
+
+        if market is not None:
+            query_params["market"] = market
+
+        if identifier is not None:
+            query_params["identifier"] = identifier
+
+        portfolios = self.portfolio_service.get_all(query_params)
+
+        if not portfolios:
+            raise OperationalException("No portfolio found.")
+
+        portfolio = portfolios[0]
+        position = self.position_service.find(
+            {"portfolio": portfolio.id, "symbol": symbol}
+        )
+        net_size = portfolio.get_net_size()
+        return (position.cost / net_size) * 100
+
+    def close_position(
+        self,
+        position=None,
+        symbol=None,
+        portfolio=None,
+        precision=None,
+        price=None
+    ) -> Order:
+        """
+        Function to close a position. This function will close a position
+        by creating a market order to sell the position. If the precision
+        parameter is specified, the amount of the order will be rounded
+        down to the specified precision.
+
+        Args:
+            position (Optional): The position to close
+            symbol (Optional): The symbol of the asset
+            portfolio (Optional): The portfolio where the position is located
+            precision (Optional): The precision of the amount
+            price (Optional[Float]): The price with which the position needs
+                to be closed.
+
+        Returns:
+            Order: The order created to close the position
+        """
+        query_params = {}
+
+        if position is None and (symbol is None and portfolio is None):
+            raise OperationalException(
+                "Either position or symbol and portfolio parameters must "
+                "be specified to close a position."
+            )
+
+        if position is not None:
+            query_params["id"] = position.id
+            query_params["symbol"] = position.symbol
+
+        if symbol is not None:
+            query_params["symbol"] = symbol
+
+        if portfolio is not None:
+            query_params["portfolio"] = portfolio.id
+
+        position = self.position_service.find(query_params)
+        portfolio = self.portfolio_service.get(position.portfolio_id)
+
+        if position.get_amount() == 0:
+            logger.warning("Cannot close position. Amount is 0.")
+            return None
+
+        if position.get_symbol() == portfolio.get_trading_symbol():
+            raise OperationalException(
+                "Cannot close position. The position is the same as the "
+                "trading symbol of the portfolio."
+            )
+
+        for order in self.order_service \
+                .get_all(
+                    {
+                        "position": position.id,
+                        "status": OrderStatus.OPEN.value
+                    }
+                ):
+            self._blotter.cancel_order(order.id, self)
+
+        target_symbol = position.get_symbol()
+        symbol = f"{target_symbol.upper()}/{portfolio.trading_symbol.upper()}"
+
+        if price is None:
+            ticker = self.data_provider_service.get_ticker_data(
+                symbol=symbol,
+                market=portfolio.market,
+                date=self.config[INDEX_DATETIME]
+            )
+            price = ticker["bid"]
+
+        logger.info(
+            f"Closing position {position.symbol} "
+            f"with amount {position.get_amount()} "
+            f"at price {price}"
+        )
+        return self.create_limit_order(
+            target_symbol=position.symbol,
+            amount=position.get_amount(),
+            order_side=OrderSide.SELL.value,
+            price=price,
+            precision=precision,
+        )
+
+    def get_allocated(self, market=None, identifier=None) -> float:
+
+        if self.portfolio_configuration_service.count() > 1 \
+                and identifier is None and market is None:
+            raise OperationalException(
+                "Multiple portfolios found. Please specify a "
+                "portfolio identifier."
+            )
+
+        if market is not None and identifier is not None:
+            portfolio_configurations = self.portfolio_configuration_service \
+                .get_all()
+
+        else:
+            query_params = {"market": market, "identifier": identifier}
+            portfolio_configuration = self.portfolio_configuration_service \
+                .find(query_params)
+
+            if not portfolio_configuration:
+                raise OperationalException("No portfolio found.")
+
+            portfolio_configurations = [portfolio_configuration]
+
+        if len(portfolio_configurations) == 0:
+            raise OperationalException("No portfolio found.")
+
+        portfolios = []
+
+        for portfolio_configuration in portfolio_configurations:
+            portfolio = self.portfolio_service.find(
+                {"identifier": portfolio_configuration.identifier}
+            )
+            portfolio.configuration = portfolio_configuration
+            portfolios.append(portfolio)
+
+        allocated = 0
+
+        for portfolio in portfolios:
+            positions = self.position_service.get_all(
+                {"portfolio": portfolio.id}
+            )
+
+            for position in positions:
+                if portfolio.trading_symbol == position.symbol:
+                    continue
+
+                symbol = f"{position.symbol.upper()}/" \
+                         f"{portfolio.trading_symbol.upper()}"
+                current_date = self.config[INDEX_DATETIME]
+                ticker = self.data_provider_service.get_ticker_data(
+                    symbol=symbol, market=portfolio.market, date=current_date
+                )
+                allocated = allocated + \
+                    (position.get_amount() * ticker["bid"])
+
+        return allocated
+
+    def get_unfilled(self, market=None, identifier=None) -> float:
+
+        if self.portfolio_configuration_service.count() > 1 \
+                and identifier is None and market is None:
+            raise OperationalException(
+                "Multiple portfolios found. Please specify a "
+                "portfolio identifier."
+            )
+
+        if market is not None and identifier is not None:
+            portfolio_configurations = self.portfolio_configuration_service \
+                .get_all()
+
+        else:
+            query_params = {
+                "market": market,
+                "identifier": identifier
+            }
+            portfolio_configurations = [self.portfolio_configuration_service
+                                        .find(query_params)]
+
+        portfolios = []
+
+        for portfolio_configuration in portfolio_configurations:
+            portfolio = self.portfolio_service.find(
+                {"identifier": portfolio_configuration.identifier}
+            )
+            portfolios.append(portfolio)
+
+        unfilled = 0
+
+        for portfolio in portfolios:
+            orders = self.order_service.get_all(
+                {"status": OrderStatus.OPEN.value, "portfolio": portfolio.id}
+            )
+            unfilled = unfilled + sum(
+                [order.get_amount() * order.get_price() for order in orders]
+            )
+
+        return unfilled
+
+    def get_portfolio_configurations(self):
+        return self.portfolio_configuration_service.get_all()
+
+    def has_open_buy_orders(self, target_symbol, identifier=None, market=None):
+        query_params = {}
+
+        if identifier is not None:
+            portfolio = self.portfolio_service.find(
+                {"identifier": identifier}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if market is not None:
+            portfolio = self.portfolio_service.find(
+                {"market": market}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        query_params["target_symbol"] = target_symbol
+        query_params["order_side"] = OrderSide.BUY.value
+        query_params["status"] = OrderStatus.OPEN.value
+        return self.order_service.exists(query_params)
+
+    def get_sell_orders(self, target_symbol, identifier=None, market=None):
+        query_params = {}
+
+        if identifier is not None:
+            portfolio = self.portfolio_service.find(
+                {"identifier": identifier}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if market is not None:
+            portfolio = self.portfolio_service.find(
+                {"market": market}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        query_params["target_symbol"] = target_symbol
+        query_params["order_side"] = OrderSide.SELL.value
+        return self.order_service.get_all(query_params)
+
+    def get_open_orders(
+        self, target_symbol=None, identifier=None, market=None
+    ) -> List[Order]:
+        """
+        Function to get all open orders. This function will return all
+        open orders that match the specified query parameters.
+
+        Args:
+            target_symbol (str): the symbol of the asset
+            identifier (str): the identifier of the portfolio
+            market (str): the market of the asset
+
+        Returns:
+            List[Order]: A list of open orders that match the query parameters
+        """
+        query_params = {}
+
+        if identifier is not None:
+            portfolio = self.portfolio_service.find(
+                {"identifier": identifier}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if market is not None:
+            portfolio = self.portfolio_service.find(
+                {"market": market}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if target_symbol is not None:
+            query_params["target_symbol"] = target_symbol
+
+        query_params["status"] = OrderStatus.OPEN.value
+        return self.order_service.get_all(query_params)
+
+    def get_closed_orders(
+        self, target_symbol=None, identifier=None, market=None, order_side=None
+    ) -> List[Order]:
+        """
+        Function to get all closed orders. This function will return all
+        closed orders that match the specified query parameters.
+
+        Args:
+            target_symbol (str): the symbol of the asset
+            identifier (str): the identifier of the portfolio
+            market (str): the market of the asset
+            order_side (str): the side of the order
+
+        Returns:
+            List[Order]: A list of closed orders that
+                match the query parameters
+        """
+        query_params = {}
+
+        if identifier is not None:
+            portfolio = self.portfolio_service.find(
+                {"identifier": identifier}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if order_side is not None:
+            query_params["order_side"] = order_side
+
+        if market is not None:
+            portfolio = self.portfolio_service.find(
+                {"market": market}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if target_symbol is not None:
+            query_params["target_symbol"] = target_symbol
+
+        query_params["status"] = OrderStatus.CLOSED.value
+        return self.order_service.get_all(query_params)
+
+    def has_open_sell_orders(self, target_symbol, identifier=None,
+                             market=None):
+        query_params = {}
+
+        if identifier is not None:
+            portfolio = self.portfolio_service.find(
+                {"identifier": identifier}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if market is not None:
+            portfolio = self.portfolio_service.find(
+                {"market": market}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        query_params["target_symbol"] = target_symbol
+        query_params["order_side"] = OrderSide.SELL.value
+        query_params["status"] = OrderStatus.OPEN.value
+        return self.order_service.exists(query_params)
+
+    def has_open_orders(
+        self, target_symbol=None, identifier=None, market=None
+    ):
+        query_params = {}
+
+        if identifier is not None:
+            portfolio = self.portfolio_service.find(
+                {"identifier": identifier}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if market is not None:
+            portfolio = self.portfolio_service.find(
+                {"market": market}
+            )
+            query_params["portfolio"] = portfolio.id
+
+        if target_symbol is not None:
+            query_params["target_symbol"] = target_symbol
+
+        query_params["status"] = OrderStatus.OPEN.value
+        return self.order_service.exists(query_params)
+
+    def get_trade(
+        self,
+        target_symbol=None,
+        trading_symbol=None,
+        market=None,
+        portfolio=None,
+        status=None,
+        order_id=None
+    ) -> Trade:
+        """
+        Function to retrieve a trade. This function will return the first
+        trade that matches the specified query parameters.
+
+        Args:
+            market: The market of the asset
+            portfolio: The portfolio of the asset
+            status: The status of the trade
+            order_id: The order id of the trade
+            target_symbol: The symbol of the asset
+            trading_symbol: The trading symbol of the asset
+
+        Returns:
+            Trade: A instance of a trade that matches the query parameters
+        """
+        query_params = {}
+
+        if market is not None:
+            query_params["market"] = market
+
+        if portfolio is not None:
+            query_params["portfolio"] = portfolio
+
+        if status is not None:
+            query_params["status"] = status
+
+        if order_id is not None:
+            query_params["order_id"] = order_id
+
+        if target_symbol is not None:
+            query_params["target_symbol"] = target_symbol
+
+        if trading_symbol is not None:
+            query_params["trading_symbol"] = trading_symbol
+
+        return self.trade_service.find(query_params)
+
+    def get_trades(
+        self,
+        target_symbol=None,
+        trading_symbol=None,
+        market=None,
+        portfolio=None,
+        status=None,
+    ) -> List[Trade]:
+        """
+        Function to get all trades. This function will return all trades
+        that match the specified query parameters. If the market parameter
+        is specified, the trades with the specified market will be returned.
+
+        Args:
+            market: The market of the asset
+            portfolio: The portfolio of the asset
+            status: The status of the trade
+            target_symbol: The symbol of the asset
+            trading_symbol: The trading symbol of the asset
+
+        Returns:
+            List[Trade]: A list of trades that match the query parameters
+        """
+
+        query_params = {}
+
+        if market is not None:
+            query_params["market"] = market
+
+        if portfolio is not None:
+            query_params["portfolio"] = portfolio
+
+        if status is not None:
+            query_params["status"] = status
+
+        if target_symbol is not None:
+            query_params["target_symbol"] = target_symbol
+
+        if trading_symbol is not None:
+            query_params["trading_symbol"] = trading_symbol
+
+        return self.trade_service.get_all({"market": market})
+
+    def get_closed_trades(self) -> List[Trade]:
+        """
+        Function to get all closed trades. This function will return all
+        closed trades of the algorithm.
+
+        Returns:
+            List[Trade]: A list of closed trades
+        """
+        return self.trade_service.get_all({"status": TradeStatus.CLOSED.value})
+
+    def count_trades(
+        self,
+        target_symbol=None,
+        trading_symbol=None,
+        market=None,
+        portfolio=None
+    ) -> int:
+        """
+        Function to count trades. This function will return the number of
+        trades that match the specified query parameters.
+
+        Args:
+            target_symbol: The symbol of the asset
+            trading_symbol: The trading symbol of the asset
+            market: The market of the asset
+            portfolio: The portfolio of the asset
+
+        Returns:
+            int: The number of trades that match the query parameters
+        """
+
+        query_params = {}
+
+        if market is not None:
+            query_params["market"] = market
+
+        if portfolio is not None:
+            query_params["portfolio"] = portfolio
+
+        if target_symbol is not None:
+            query_params["target_symbol"] = target_symbol
+
+        if trading_symbol is not None:
+            query_params["trading_symbol"] = trading_symbol
+
+        return self.trade_service.count(query_params)
+
+    def get_pending_trades(
+            self, target_symbol=None, market=None
+    ) -> List[Trade]:
+        """
+        Function to get all pending trades. This function will return all
+        pending trades that match the specified query parameters. If the
+        target_symbol parameter is specified, the pending trades with the
+        specified target symbol will be returned. If the market parameter
+        is specified, the pending trades with the specified market will be
+        returned.
+
+        Args:
+            target_symbol: The symbol of the asset
+            market: The market of the asset
+
+        Returns:
+            List[Trade]: A list of pending trades that match
+                the query parameters
+        """
+        return self.trade_service.get_all(
+            {
+                "status": TradeStatus.CREATED.value,
+                "target_symbol": target_symbol,
+                "market": market
+            }
+        )
+
+    def get_open_trades(self, target_symbol=None, market=None) -> List[Trade]:
+        """
+        Function to get all open trades. This function will return all
+        open trades that match the specified query parameters. If the
+        target_symbol parameter is specified, the open trades with the
+        specified target symbol will be returned. If the market parameter
+        is specified, the open trades with the specified market will be
+        returned.
+
+        Args:
+            target_symbol: The symbol of the asset
+            market: The market of the asset
+
+        Returns:
+            List[Trade]: A list of open trades that match the query parameters
+        """
+        return self.trade_service.get_all(
+            {
+                "status": TradeStatus.OPEN.value,
+                "target_symbol": target_symbol,
+                "market": market
+            }
+        )
+
+    def add_stop_loss(
+        self,
+        trade: Trade = None,
+        percentage: float = None,
+        trailing: bool = False,
+        sell_percentage: float = 100,
+        created_at: datetime = None,
+        order: Order = None,
+        mirror_on_exchange: bool = False,
+    ) -> Union[TradeStopLoss, None]:
+        """
+        Function to add a stop loss to a trade or a pending buy order.
+
+        v9.0 (#431) — you may now pass ``order=`` to attach a stop-loss
+        rule to a BUY order that has not been filled yet. The rule
+        will be materialized onto each trade created as the order
+        fills (one trade per fill event). This is the recommended
+        pattern since BUY orders no longer create trades eagerly.
+
+        Example of fixed stop loss:
+            * You buy BTC at $40,000.
+            * You set a SL of 5% → SL level at $38,000 (40,000 - 5%).
+            * BTC price increases to $42,000 → SL level remains at $38,000.
+            * BTC price drops to $38,000 → SL level reached, trade closes.
+
+        Example of trailing stop loss:
+            * You buy BTC at $40,000.
+            * You set a TSL of 5%, setting the sell price at $38,000.
+            * BTC price increases to $42,000 → New TSL level
+                at $39,900 (42,000 - 5%).
+            * BTC price drops to $39,900 → SL level reached, trade closes.
+
+        Args:
+            trade (Trade): An already-open trade to attach the rule to.
+                Mutually exclusive with ``order``.
+            percentage (float): float representing the percentage
+                of the open price that the stop loss should
+                be set at. This must be a positive
+                number, e.g. 5 for 5%, or 10 for 10%.
+            trailing (bool): Whether the stop loss should be trailing
+                or fixed.
+            sell_percentage (float): float representing the
+                percentage of the trade that should be sold if the
+                stop loss is triggered
+            created_at: datetime: The date and time when the stop loss
+                was created. If not specified, the current date and time
+                will be used.
+            order (Order): A pending BUY order to attach the rule to.
+                The rule will be queued on the order and applied to
+                each trade created at fill time. Mutually exclusive
+                with ``trade``.
+
+        Returns:
+            TradeStopLoss when attached to a trade, ``None`` when
+            queued on an unfilled order.
+        """
+        if percentage is None:
+            raise OperationalException(
+                "add_stop_loss requires a 'percentage' argument."
+            )
+
+        if trade is None and order is None:
+            raise OperationalException(
+                "add_stop_loss requires either a 'trade' or an 'order' "
+                "argument."
+            )
+
+        if trade is not None and order is not None:
+            raise OperationalException(
+                "add_stop_loss accepts either 'trade' or 'order', "
+                "not both."
+            )
+
+        if order is not None:
+            stored = self.order_service.get(order.id)
+            # Preserve original updated_at so backtest fill checks
+            # (which filter OHLCV by Datetime >= updated_at) still
+            # match historical bars after a metadata-only save (#434).
+            prev_updated_at = stored.updated_at
+            stored.add_pending_stop_loss(
+                percentage=percentage,
+                trailing=trailing,
+                sell_percentage=sell_percentage,
+                mirror_on_exchange=mirror_on_exchange,
+            )
+            # SQLAlchemy doesn't observe in-place mutations of the
+            # JSON metadata dict — sync the persisted column manually
+            # so pending rules survive a reload at fill time (#434).
+            if hasattr(stored, "metadata_json"):
+                import json as _json
+                stored.metadata_json = _json.dumps(stored.metadata)
+            stored.updated_at = prev_updated_at
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(stored, "updated_at")
+            self.order_service.repository.save(stored)
+            return None
+
+        return self.trade_service.add_stop_loss(
+            trade,
+            percentage=percentage,
+            trailing=trailing,
+            sell_percentage=sell_percentage,
+            created_at=created_at,
+            mirror_on_exchange=mirror_on_exchange,
+        )
+
+    def add_take_profit(
+        self,
+        trade: Trade = None,
+        percentage: float = None,
+        trailing: bool = False,
+        sell_percentage: float = 100,
+        created_at: datetime = None,
+        order: Order = None,
+        mirror_on_exchange: bool = False,
+    ) -> Union[TradeTakeProfit, None]:
+        """
+        Function to add a take profit to a trade or a pending buy order.
+
+        v9.0 (#431) — you may now pass ``order=`` to attach a
+        take-profit rule to a BUY order that has not been filled yet.
+        The rule will be materialized onto each trade created as the
+        order fills (one trade per fill event).
+
+        Example of take profit:
+            * You buy BTC at $40,000.
+            * You set a TP of 5% → TP level at $42,000 (40,000 + 5%).
+            * BTC rises to $42,000 → TP level reached, trade
+                closes, securing profit.
+
+        Example of trailing take profit:
+            * You buy BTC at $40,000
+            * You set a TTP of 5%, setting the sell price at $42,000.
+            * BTC rises to $42,000 → TTP level stays at $42,000.
+            * BTC rises to $45,000 → New TTP level at $42,750.
+            * BTC drops to $42,750 → Trade closes, securing profit.
+
+        Args:
+            trade (Trade): An already-open trade to attach the rule to.
+                Mutually exclusive with ``order``.
+            percentage (float): float representing the percentage
+                of the open price that the take profit should
+                be set at. This must be a positive
+                number, e.g. 5 for 5%, or 10 for 10%.
+            trailing (bool): Whether the take profit should be trailing
+                or fixed.
+            sell_percentage (float): float representing the
+                percentage of the trade that should be sold if the
+                take profit is triggered
+            created_at: datetime: The date and time when the take profit
+                was created. If not specified, the current date and time
+                will be used.
+            order (Order): A pending BUY order to attach the rule to.
+                The rule will be queued on the order and applied to
+                each trade created at fill time. Mutually exclusive
+                with ``trade``.
+
+        Returns:
+            TradeTakeProfit when attached to a trade, ``None`` when
+            queued on an unfilled order.
+        """
+        if percentage is None:
+            raise OperationalException(
+                "add_take_profit requires a 'percentage' argument."
+            )
+
+        if trade is None and order is None:
+            raise OperationalException(
+                "add_take_profit requires either a 'trade' or an 'order' "
+                "argument."
+            )
+
+        if trade is not None and order is not None:
+            raise OperationalException(
+                "add_take_profit accepts either 'trade' or 'order', "
+                "not both."
+            )
+
+        if order is not None:
+            stored = self.order_service.get(order.id)
+            prev_updated_at = stored.updated_at
+            stored.add_pending_take_profit(
+                percentage=percentage,
+                trailing=trailing,
+                sell_percentage=sell_percentage,
+                mirror_on_exchange=mirror_on_exchange,
+            )
+            if hasattr(stored, "metadata_json"):
+                import json as _json
+                stored.metadata_json = _json.dumps(stored.metadata)
+            stored.updated_at = prev_updated_at
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(stored, "updated_at")
+            self.order_service.repository.save(stored)
+            return None
+
+        return self.trade_service.add_take_profit(
+            trade,
+            percentage=percentage,
+            trailing=trailing,
+            sell_percentage=sell_percentage,
+            created_at=created_at,
+            mirror_on_exchange=mirror_on_exchange,
+        )
+
+    def close_trade(self, trade, precision=None) -> None:
+        """
+        Function to close a trade. This function will close a trade by
+        creating a market order to sell the position. If the precision
+        parameter is specified, the amount of the order will be rounded
+        down to the specified precision.
+
+        Args:
+            trade: Trade - The trade to close
+            precision: int - The precision of the amount
+
+        Returns:
+            None
+        """
+        trade = self.trade_service.get(trade.id)
+
+        if TradeStatus.CLOSED.equals(trade.status):
+            raise OperationalException("Trade already closed.")
+
+        if trade.available_amount <= 0:
+            raise OperationalException("Trade has no amount to close.")
+
+        self.order_service.cancel_mirror_orders_for_trade(trade.id)
+
+        position_id = trade.orders[0].position_id
+        portfolio = self.portfolio_service.find({"position": position_id})
+        position = self.position_service.find(
+            {"portfolio": portfolio.id, "symbol": trade.target_symbol}
+        )
+        amount = trade.available_amount
+
+        if precision is not None:
+            amount = RoundingService.round_down(amount, precision)
+
+        if position.get_amount() < amount:
+            logger.warning(
+                f"Order amount {amount} is larger then amount "
+                f"of available {position.symbol} "
+                f"position: {position.get_amount()}, "
+                f"changing order amount to size of position"
+            )
+            amount = position.get_amount()
+
+        ticker = self.data_provider_service.get_ticker_data(
+            symbol=trade.symbol,
+            market=portfolio.market,
+            date=self.config[INDEX_DATETIME]
+        )
+        logger.info(f"Closing trade {trade.id} {trade.symbol}")
+        self.create_limit_order(
+            target_symbol=trade.target_symbol,
+            amount=amount,
+            order_side=OrderSide.SELL,
+            price=ticker["bid"],
+        )
+
+    def get_number_of_positions(self):
+        """
+        Returns the number of positions that have a positive amount.
+
+        Returns:
+            int: The number of positions
+        """
+        return self.position_service.count({"amount_gt": 0})
+
+    def has_trading_symbol_position_available(
+        self,
+        amount_gt=None,
+        amount_gte=None,
+        percentage_of_portfolio=None,
+        market=None
+    ):
+        """
+        Checks if there is a position available for the trading symbol of the
+        portfolio. If the amount_gt or amount_gte parameters are specified,
+        the amount of the position must be greater than the specified amount.
+        If the percentage_of_portfolio parameter is specified, the amount of
+        the position must be greater than the net_size of the
+        portfolio.
+
+        Parameters:
+            amount_gt: The amount of the position must be greater than this
+              amount.
+        :param amount_gte: The amount of the position must be greater than
+        or equal to this amount.
+        :param percentage_of_portfolio: The amount of the position must be
+        greater than the net_size of the portfolio.
+        :param market: The market of the portfolio.
+        :return: True if there is a trading symbol position available with the
+        specified parameters, False otherwise.
+        """
+        portfolio = self.portfolio_service.find({"market": market})
+        position = self.position_service.find(
+            {"portfolio": portfolio.id, "symbol": portfolio.trading_symbol}
+        )
+
+        if amount_gt is not None:
+            return position.get_amount() > amount_gt
+
+        if amount_gte is not None:
+            return position.get_amount() >= amount_gte
+
+        if percentage_of_portfolio is not None:
+            net_size = portfolio.get_net_size()
+            return position.get_amount() >= net_size \
+                * percentage_of_portfolio / 100
+
+        return position.get_amount() > 0
+
+    def get_pending_orders(
+        self, order_side=None, target_symbol=None, portfolio_id=None
+    ):
+        """
+        Function to get all pending orders of the algorithm. If the
+        portfolio_id parameter is specified, the function will return
+        all pending orders of the portfolio with the specified id.
+        """
+        query_params = {}
+
+        if portfolio_id:
+            query_params["portfolio"] = portfolio_id
+
+        if target_symbol:
+            query_params["target_symbol"] = target_symbol
+
+        if order_side:
+            query_params["order_side"] = order_side
+
+        return self.order_service.get_all({"status": OrderStatus.OPEN.value})
+
+    def get_unfilled_buy_value(self):
+        """
+        Returns the total value of all unfilled buy orders.
+        """
+        pending_orders = self.get_pending_orders(
+            order_side=OrderSide.BUY.value
+        )
+
+        return sum(
+            [order.get_remaining() * order.get_price()
+             for order in pending_orders]
+        )
+
+    def get_unfilled_sell_value(self):
+        """
+        Returns the total value of all unfilled buy orders.
+        """
+        pending_orders = self.get_pending_orders(
+            order_side=OrderSide.SELL.value
+        )
+
+        return sum(
+            [order.get_remaining() * order.get_price()
+             for order in pending_orders]
+        )
+
+    def get_market_credential(self, market) -> MarketCredential:
+        """
+        Function to get the market credential for a given market.
+
+        Args:
+            market: The market to get the credential for
+
+        Returns:
+            MarketCredential: The market credential for the given market
+        """
+        return self.market_credential_service.get(market)
+
+    def get_market_credentials(self) -> List[MarketCredential]:
+        """
+        Function to get all market credentials.
+
+        Returns:
+            List[MarketCredential]: A list of all market credentials
+        """
+        return self.market_credential_service.get_all()
+
+    def get_trading_symbol(self, portfolio_id=None):
+        """
+        Function to get the trading symbol of a portfolio. If the
+        portfolio_id parameter is specified, the function will return
+        the trading symbol of the portfolio with the specified id.
+
+        Args:
+            portfolio_id: The id of the portfolio to get the trading symbol for
+
+        Returns:
+            str: The trading symbol of the portfolio
+        """
+        if portfolio_id is None:
+            if self.portfolio_service.count() > 1:
+                raise OperationalException(
+                    "Multiple portfolios found. Please specify a "
+                    "portfolio identifier."
+                )
+            portfolio = self.portfolio_service.get_all()[0]
+        else:
+            portfolio = self.portfolio_service.get(portfolio_id)
+
+        return portfolio.trading_symbol
+
+    def get_take_profits(
+        self, triggered: bool = None
+    ) -> List[TradeTakeProfit]:
+        """
+        Function to get all take profits. If the triggered parameter
+        is specified, the function will return all take profits that
+        match the triggered status.
+
+        Args:
+            triggered (bool): The triggered status of the take profits
+
+        Returns:
+            List[TradeTakeProfit]: A list of take profits
+        """
+        query_params = {}
+
+        if triggered is not None:
+            query_params["triggered"] = triggered
+
+        return self.trade_take_profit_service.get_all(query_params)
+
+    def get_stop_losses(
+        self, triggered: bool = None
+    ) -> List[TradeStopLoss]:
+        """
+        Function to get all stop losses. If the triggered parameter
+        is specified, the function will return all stop losses that
+        match the triggered status.
+
+        Args:
+            triggered (bool): The triggered status of the stop losses
+
+        Returns:
+            List[TradeStopLoss]: A list of stop losses
+        """
+        query_params = {}
+
+        if triggered is not None:
+            query_params["triggered"] = triggered
+
+        return self.trade_stop_loss_service.get_all(query_params)
+
+    def _get_url_provider_cache_key(self, url, headers):
+        # Delegates to the canonical helper so the in-memory provider
+        # dict and the on-disk cache filename stay in lockstep — see
+        # ``url_cache_key`` for rationale.
+        from investing_algorithm_framework.infrastructure \
+            .data_providers.base_url import url_cache_key
+        return url_cache_key(url, headers)
+
+    def fetch_csv(
+        self,
+        url,
+        date_column=None,
+        date_format=None,
+        cache=True,
+        refresh_interval=None,
+        headers=None,
+        pre_process=None,
+        post_process=None,
+    ):
+        """
+        Fetch CSV data from a remote URL on demand.
+
+        This is a convenience method for dynamically loading external
+        CSV data during strategy execution without pre-declaring it
+        as a DataSource.
+
+        Args:
+            url (str): URL to fetch the CSV data from.
+            date_column (str, optional): Name of the date column to
+                parse.
+            date_format (str, optional): strftime format for parsing
+                dates.
+            cache (bool): Cache fetched data locally (default: True).
+            refresh_interval (str, optional): Re-fetch interval
+                (e.g., "1d", "1h").
+            headers (dict, optional): HTTP headers to send with the
+                request. Header values are redacted (replaced
+                with "***") in ``DataSource.to_dict``, so
+                secrets do not leak into diagnostic payloads.
+            pre_process (callable, optional): Transform raw CSV text
+                before parsing.
+            post_process (callable, optional): Transform the parsed
+                DataFrame.
+
+        Returns:
+            polars.DataFrame: The parsed CSV data.
+
+        Example::
+
+            def run_strategy(self, context, data):
+                earnings = context.fetch_csv(
+                    url="https://example.com/earnings.csv",
+                    date_column="report_date",
+                )
+                latest = earnings["eps"].iloc[-1]
+        """
+        from investing_algorithm_framework.infrastructure \
+            import CSVURLDataProvider
+
+        if not hasattr(self, '_csv_url_providers'):
+            self._csv_url_providers = {}
+
+        provider_key = self._get_url_provider_cache_key(url, headers)
+
+        if provider_key not in self._csv_url_providers:
+            provider = CSVURLDataProvider(
+                url=url,
+                date_column=date_column,
+                date_format=date_format,
+                cache=cache,
+                refresh_interval=refresh_interval,
+                headers=headers,
+                pre_process=pre_process,
+                post_process=post_process,
+            )
+            provider.config = self.configuration_service.get_config()
+            self._csv_url_providers[provider_key] = provider
+
+        return self._csv_url_providers[provider_key].get_data()
+
+    def fetch_json(
+        self,
+        url,
+        date_column=None,
+        date_format=None,
+        cache=True,
+        refresh_interval=None,
+        headers=None,
+        pre_process=None,
+        post_process=None,
+    ):
+        """
+        Fetch JSON data from a remote URL on demand.
+
+        This is a convenience method for dynamically loading external
+        JSON data during strategy execution without pre-declaring it
+        as a DataSource.
+
+        The JSON data must be either an array of objects or an object
+        of arrays.
+
+        Args:
+            url (str): URL to fetch the JSON data from.
+            date_column (str, optional): Name of the date column to
+                parse.
+            date_format (str, optional): strftime format for parsing
+                dates.
+            cache (bool): Cache fetched data locally (default: True).
+            refresh_interval (str, optional): Re-fetch interval
+                (e.g., "1d", "1h").
+            headers (dict, optional): HTTP headers to send with the
+                request. Header values are redacted (replaced
+                with "***") in ``DataSource.to_dict``, so
+                secrets do not leak into diagnostic payloads.
+            pre_process (callable, optional): Transform raw JSON text
+                before parsing.
+            post_process (callable, optional): Transform the parsed
+                DataFrame.
+
+        Returns:
+            polars.DataFrame: The parsed JSON data.
+
+        Example::
+
+            def run_strategy(self, context, data):
+                earnings = context.fetch_json(
+                    url="https://api.example.com/earnings",
+                    date_column="report_date",
+                )
+        """
+        from investing_algorithm_framework.infrastructure \
+            import JSONURLDataProvider
+
+        if not hasattr(self, '_json_url_providers'):
+            self._json_url_providers = {}
+
+        provider_key = self._get_url_provider_cache_key(url, headers)
+
+        if provider_key not in self._json_url_providers:
+            provider = JSONURLDataProvider(
+                url=url,
+                date_column=date_column,
+                date_format=date_format,
+                cache=cache,
+                refresh_interval=refresh_interval,
+                headers=headers,
+                pre_process=pre_process,
+                post_process=post_process,
+            )
+            provider.config = self.configuration_service.get_config()
+            self._json_url_providers[provider_key] = provider
+
+        return self._json_url_providers[provider_key].get_data()
+
+    def fetch_parquet(
+        self,
+        url,
+        date_column=None,
+        date_format=None,
+        cache=True,
+        refresh_interval=None,
+        headers=None,
+        post_process=None,
+    ):
+        """
+        Fetch Parquet data from a remote URL on demand.
+
+        This is a convenience method for dynamically loading external
+        Parquet data during strategy execution without pre-declaring
+        it as a DataSource.
+
+        Args:
+            url (str): URL to fetch the Parquet file from.
+            date_column (str, optional): Name of the date column to
+                parse.
+            date_format (str, optional): strftime format for parsing
+                dates.
+            cache (bool): Cache fetched data locally (default: True).
+            refresh_interval (str, optional): Re-fetch interval
+                (e.g., "1d", "1h").
+            headers (dict, optional): HTTP headers to send with the
+                request. Header values are redacted (replaced
+                with "***") in ``DataSource.to_dict``, so
+                secrets do not leak into diagnostic payloads.
+            post_process (callable, optional): Transform the parsed
+                DataFrame.
+
+        Returns:
+            polars.DataFrame: The parsed Parquet data.
+
+        Example::
+
+            def run_strategy(self, context, data):
+                features = context.fetch_parquet(
+                    url="https://storage.example.com/features.parquet",
+                )
+        """
+        from investing_algorithm_framework.infrastructure \
+            import ParquetURLDataProvider
+
+        if not hasattr(self, '_parquet_url_providers'):
+            self._parquet_url_providers = {}
+
+        provider_key = self._get_url_provider_cache_key(url, headers)
+
+        if provider_key not in self._parquet_url_providers:
+            provider = ParquetURLDataProvider(
+                url=url,
+                date_column=date_column,
+                date_format=date_format,
+                cache=cache,
+                refresh_interval=refresh_interval,
+                headers=headers,
+                post_process=post_process,
+            )
+            provider.config = self.configuration_service.get_config()
+            self._parquet_url_providers[provider_key] = provider
+
+        return self._parquet_url_providers[provider_key].get_data()
+
+    def batch_order(self, orders, market=None):
+        """
+        Place multiple orders at once through the blotter.
+
+        Each order dict supports the same parameters as
+        ``create_limit_order`` and ``create_market_order``.
+
+        Args:
+            orders (list[dict]): List of order dicts. Each dict should
+                contain at minimum ``target_symbol``, ``order_side``,
+                and either ``amount`` or ``percentage_of_portfolio``.
+                Include ``price`` for limit orders.
+                Include ``order_type`` to specify MARKET orders
+                (default is LIMIT).
+            market (str, optional): Default market for all orders.
+                Can be overridden per order.
+
+        Returns:
+            list[Order]: The created orders.
+
+        Example::
+
+            context.batch_order([
+                {
+                    "target_symbol": "BTC",
+                    "order_side": OrderSide.BUY,
+                    "percentage_of_portfolio": 5.0,
+                    "price": 45000,
+                },
+                {
+                    "target_symbol": "ETH",
+                    "order_side": OrderSide.BUY,
+                    "percentage_of_portfolio": 3.0,
+                    "price": 3000,
+                },
+            ])
+        """
+        # Add default market to each order if not set
+        for order_data in orders:
+            if "market" not in order_data and market is not None:
+                order_data["market"] = market
+
+        return self._blotter.batch_order(orders, self)
+
+    def get_transactions(self):
+        """
+        Get all recorded transactions from the blotter.
+
+        Returns a list of Transaction objects representing all
+        fills/executions that have been processed through the blotter.
+
+        Returns:
+            list[Transaction]: Recorded transactions.
+        """
+        return self._blotter.get_transactions()
+
+    def record(self, **kwargs):
+        """
+        Record arbitrary key-value pairs at the current backtest timestamp.
+
+        This method allows you to store any custom indicator, metric, or
+        variable during a backtest. Each key creates a time series of
+        values that can be retrieved after the backtest completes via
+        ``BacktestRun.recorded_values``.
+
+        The values are stored as a list of ``(datetime, value)`` tuples
+        per key, allowing you to track any indicator over time.
+
+        This method only records during backtesting. In live mode it is
+        a no-op.
+
+        Args:
+            **kwargs: Arbitrary key-value pairs to record. Keys are
+                strings, values can be any type (float, int, str,
+                dict, list, etc.).
+
+        Example::
+
+            def on_run(self, context, data):
+                context.record(
+                    rsi=compute_rsi(data),
+                    sma_20=compute_sma(data, 20),
+                    signal_strength=0.85,
+                )
+        """
+        is_backtest = self.configuration_service.config.get(
+            BACKTESTING_FLAG, False
+        )
+
+        if not is_backtest:
+            return
+
+        current_datetime = self.configuration_service.config.get(
+            INDEX_DATETIME
+        )
+
+        for key, value in kwargs.items():
+            if key not in self._recorded_values:
+                self._recorded_values[key] = []
+            self._recorded_values[key].append((current_datetime, value))
+
+    def get_recorded_values(self):
+        """
+        Get all recorded values from the context.
+
+        Returns:
+            dict: A dictionary mapping keys to lists of
+                ``(datetime, value)`` tuples.
+        """
+        return self._recorded_values
+
+    def clear_recorded_values(self):
+        """
+        Clear all recorded values from the context.
+        """
+        self._recorded_values = {}

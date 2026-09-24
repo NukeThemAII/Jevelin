@@ -1,0 +1,134 @@
+"""Sample trading strategy.
+
+A strategy is *declarative*: declare your data sources and implement
+``generate_signals`` (event-driven backtest / paper / live) and/or
+``generate_signal_series`` (vector backtest) to yield ``Signal`` /
+``SignalSeries`` objects. The framework handles order routing, position
+sizing, stop-loss and take-profit on top of those signals.
+
+This same strategy class can be run on both the vector-backtest engine
+and the event-driven engine (and live), which guarantees that what you
+backtest is what you deploy — implement whichever method(s) match the
+engine(s) you plan to use.
+"""
+from typing import Any, Dict, Iterable
+
+import pandas as pd
+from pyindicators import sma, crossover, crossunder
+
+from investing_algorithm_framework import (
+    TradingStrategy,
+    DataSource,
+    DataType,
+    TimeUnit,
+    PositionSize,
+    Signal,
+    SignalSeries,
+    SignalSide,
+    StopLossRule,
+    TakeProfitRule,
+    signals_from_column,
+    signal_series_from_column,
+)
+
+
+class MyTradingStrategy(TradingStrategy):
+    """Simple SMA-crossover strategy on BTC/EUR (1h)."""
+
+    time_unit = TimeUnit.HOUR
+    interval = 1
+    symbols = ["BTC"]
+
+    # SMA periods, exposed as class attributes so they're easy to
+    # override from a parameter grid search.
+    fast_period = 20
+    slow_period = 50
+
+    data_sources = [
+        DataSource(
+            identifier="btc_eur_ohlcv_1h",
+            data_type=DataType.OHLCV,
+            symbol="BTC/EUR",
+            time_frame="1h",
+            market="BITVAVO",
+            window_size=200,
+            pandas=True,
+        ),
+    ]
+
+    # Risk management — applied automatically by the framework after a
+    # buy order is filled.
+    position_sizes = [
+        PositionSize(symbol="BTC", percentage_of_portfolio=100),
+    ]
+    stop_losses = [
+        StopLossRule(
+            symbol="BTC",
+            percentage_threshold=5.0,
+            sell_percentage=100,
+            trailing=True,
+        ),
+    ]
+    take_profits = [
+        TakeProfitRule(
+            symbol="BTC",
+            percentage_threshold=10.0,
+            sell_percentage=100,
+        ),
+    ]
+
+    def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = sma(
+            df,
+            period=self.fast_period,
+            source_column="Close",
+            result_column="sma_fast",
+        )
+        df = sma(
+            df,
+            period=self.slow_period,
+            source_column="Close",
+            result_column="sma_slow",
+        )
+        return df
+
+    def generate_signals(
+        self, context, data: Dict[str, Any]
+    ) -> Iterable[Signal]:
+        """Event mode (event-driven backtest / paper / live): one bar,
+        zero-or-one decision per side."""
+        df = self._add_indicators(data["btc_eur_ohlcv_1h"])
+        df = crossover(
+            df, "sma_fast", "sma_slow", result_column="cross_up"
+        )
+        df = crossunder(
+            df, "sma_fast", "sma_slow", result_column="cross_down"
+        )
+        yield from signals_from_column(
+            df, "cross_up", side=SignalSide.OPEN_LONG,
+            symbol="BTC", source="sma_cross",
+        )
+        yield from signals_from_column(
+            df, "cross_down", side=SignalSide.CLOSE_LONG,
+            symbol="BTC", source="sma_cross",
+        )
+
+    def generate_signal_series(
+        self, data: Dict[str, Any]
+    ) -> Iterable[SignalSeries]:
+        """Vector mode: declare intent over the whole backtest window."""
+        df = self._add_indicators(data["btc_eur_ohlcv_1h"])
+        df = crossover(
+            df, "sma_fast", "sma_slow", result_column="cross_up"
+        )
+        df = crossunder(
+            df, "sma_fast", "sma_slow", result_column="cross_down"
+        )
+        yield signal_series_from_column(
+            df, "cross_up", side=SignalSide.OPEN_LONG,
+            symbol="BTC", source="sma_cross",
+        )
+        yield signal_series_from_column(
+            df, "cross_down", side=SignalSide.CLOSE_LONG,
+            symbol="BTC", source="sma_cross",
+        )

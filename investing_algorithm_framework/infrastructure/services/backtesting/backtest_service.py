@@ -1,0 +1,3743 @@
+import gc
+import json
+import logging
+import multiprocessing
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Callable, Dict, List, Literal, Optional, Set, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import polars as pl
+
+from investing_algorithm_framework.infrastructure.data_providers.ccxt import \
+    CCXTOHLCVDataProvider
+from investing_algorithm_framework.domain import BacktestRun, \
+    OperationalException, BacktestDateRange, BacktestWindow, Backtest, \
+    combine_backtests, \
+    generate_backtest_summary_metrics, DataSource, Study, EngineSlot, \
+    PortfolioConfiguration, tqdm, SnapshotInterval, \
+    save_backtests_to_directory, TimeFrame, resolve_backtest_path, \
+    BUNDLE_EXT, Universe, build_strategy_universe_map, stamp_backtests, \
+    BacktestIndex
+from investing_algorithm_framework.services.data_providers import \
+    DataProviderService, fill_missing_timeseries_data, \
+    get_missing_timeseries_data_entries
+from investing_algorithm_framework.services.metrics import \
+    create_backtest_metrics
+from investing_algorithm_framework.services.portfolios import \
+    PortfolioConfigurationService
+from .schedule_generation import generate_backtest_schedule
+from .event_workers import initialize_event_worker, run_event_worker
+from .vector_backtest_service import VectorBacktestService
+from .vector_resources import (
+    BacktestResourceError, MemoryGuard, bounded_process_map,
+)
+from .vector_session_index import (
+    compact_rows, make_index, mark_filtered, persist_index, validated_filter,
+)
+
+
+logger = logging.getLogger(__name__)
+
+# Module-level globals used by worker processes. Set via _init_worker
+# which is called once per worker by ProcessPoolExecutor's initializer.
+_worker_data_provider_service = None
+_worker_progress_counter = None
+
+
+def _init_worker(data_provider_service, progress_counter=None):
+    """Initializer for ProcessPoolExecutor workers.
+
+    Stores the data_provider_service and a shared progress counter in
+    module-level globals so each worker inherits them once at startup
+    rather than pickling them per task. This dramatically reduces
+    overhead on Windows/WSL (spawn start method).
+
+    The spawning scheduler sets numerical-library thread limits before
+    the child imports numpy / polars. Initializer-only limits would be
+    too late for libraries that create their thread pools during import.
+    """
+    # Pin math library thread pools to 1 thread per worker.
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "POLARS_MAX_THREADS",
+    ):
+        os.environ.setdefault(var, "1")
+
+    global _worker_data_provider_service, _worker_progress_counter
+    _worker_data_provider_service = data_provider_service
+    _worker_progress_counter = progress_counter
+
+
+def _print_progress(message: str, show_progress: bool = False):
+    """
+    Print progress message with forced flush.
+
+    This ensures output is immediately visible, especially important
+    in Jupyter notebooks and long-running processes.
+
+    Args:
+        message: The message to print.
+        show_progress: Whether to actually print the message.
+    """
+    if show_progress:
+        print(message, flush=True)
+
+
+def _fill_missing_data_for_data_sources(
+    data_sources: List[DataSource],
+    backtest_date_range: BacktestDateRange,
+    data_provider_service: DataProviderService,
+    show_progress: bool = False
+):
+    """
+    Fill missing time series data entries for all data sources before
+    running a backtest. This ensures that the data providers have
+    complete data for the requested backtest date range.
+
+    Args:
+        data_sources (List[DataSource]): The data sources to check and
+            fill missing data for.
+        backtest_date_range (BacktestDateRange): The date range for the
+            backtest.
+        data_provider_service (DataProviderService): The data provider
+            service to use for getting data.
+        show_progress (bool): Whether to show progress messages.
+
+    Returns:
+        None
+    """
+    if data_sources is None or len(data_sources) == 0:
+        return
+
+    # Get unique data sources
+    unique_data_sources = set(data_sources)
+
+    for data_source in unique_data_sources:
+        try:
+            # Get the data provider for this data source
+            data_provider = data_provider_service.data_provider_index\
+                .data_providers_lookup.get(data_source)
+
+            if data_provider is None:
+                continue
+
+            # Get the data from the data provider
+            if hasattr(data_provider, 'data') and \
+                    data_provider.data is not None:
+                data = data_provider.data
+
+                # Calculate the required start date considering warmup_window
+                if data_source.warmup_window is not None:
+                    required_start_date = backtest_date_range.start_date - \
+                        timedelta(
+                            minutes=TimeFrame.from_value(
+                                data_source.time_frame
+                            ).amount_of_minutes * data_source.warmup_window
+                        )
+                else:
+                    required_start_date = backtest_date_range.start_date
+
+                required_end_date = backtest_date_range.end_date
+
+                # Get the frequency string based on time_frame
+                time_frame = TimeFrame.from_value(data_source.time_frame)
+                freq_minutes = time_frame.amount_of_minutes
+                freq = f"{freq_minutes}min" if freq_minutes < 60 else \
+                    f"{freq_minutes // 60}h" if freq_minutes < 1440 else "D"
+
+                # Check for missing dates
+                missing_dates = get_missing_timeseries_data_entries(
+                    data,
+                    start=required_start_date,
+                    end=required_end_date,
+                    freq=freq
+                )
+
+                if len(missing_dates) > 0:
+                    if show_progress:
+                        _print_progress(
+                            f"Filling {len(missing_dates)} missing dates for "
+                            f"{data_source.identifier or data_source.symbol}",
+                            show_progress
+                        )
+
+                    # Fill the missing data (never write back to
+                    # the source file during backtest preparation)
+                    filled_data = fill_missing_timeseries_data(
+                        data,
+                        missing_dates=missing_dates,
+                        save_to_file=False,
+                    )
+
+                    # Update the data provider's data
+                    data_provider.data = filled_data
+
+        except Exception as e:
+            logger.warning(
+                f"Could not fill missing data for data source "
+                f"{data_source.identifier or data_source.symbol}: {e}"
+            )
+
+
+class BacktestService:
+    """
+    Service that facilitates backtests for algorithm objects.
+    """
+
+    def __init__(
+        self,
+        data_provider_service: DataProviderService,
+        order_service,
+        portfolio_service,
+        portfolio_snapshot_service,
+        position_repository,
+        trade_service,
+        configuration_service,
+        portfolio_configuration_service,
+    ):
+        super().__init__()
+        self._order_service = order_service
+        self._trade_service = trade_service
+        self._portfolio_service = portfolio_service
+        self._portfolio_snapshot_service = portfolio_snapshot_service
+        self._position_repository = position_repository
+        self._configuration_service = configuration_service
+        self._portfolio_configuration_service: PortfolioConfigurationService \
+            = portfolio_configuration_service
+        self._data_provider_service = data_provider_service
+
+    def _validate_algorithm_ids(
+        self,
+        algorithms: List = None,
+        strategies: List = None
+    ):
+        """
+        Validate that all strategies have an algorithm id and that they
+        are unique.
+
+        Args:
+            algorithms (List[Algorithm], optional): The list of algorithms
+                to validate.
+            strategies (List[TradingStrategy], optional): The list of
+                strategies to validate.
+
+        Raises:
+            OperationalException: If any strategy does not have an
+                algorithm id.
+        """
+        algorithm_ids = set()
+
+        if algorithms is not None:
+            for algorithm in algorithms:
+
+                if not hasattr(algorithm, 'algorithm_id') or \
+                        algorithm.algorithm_id is None:
+                    raise OperationalException(
+                        "All algorithms must have an algorithm_id set "
+                        "before backtesting. Please set a unique "
+                        "algorithm_id for each algorithm."
+                    )
+                if algorithm.algorithm_id in algorithm_ids:
+                    raise OperationalException(
+                        f"Duplicate algorithm_id found: "
+                        f"{algorithm.algorithm_id}. "
+                        "Please ensure all algorithms have unique "
+                        "algorithm_ids."
+                    )
+                algorithm_ids.add(algorithm.algorithm_id)
+
+        else:
+
+            for strategy in strategies:
+                if not hasattr(strategy, 'algorithm_id') or \
+                        strategy.algorithm_id is None:
+                    raise OperationalException(
+                        "All strategies must have an algorithm_id set "
+                        "before backtesting. Please set a unique "
+                        "algorithm_id for each strategy."
+                    )
+                if strategy.algorithm_id in algorithm_ids:
+                    raise OperationalException(
+                        f"Duplicate algorithm_id found: "
+                        f"{strategy.algorithm_id}. "
+                        "Please ensure all strategies have unique "
+                        "algorithm_ids."
+                    )
+
+                algorithm_ids.add(strategy.algorithm_id)
+
+    @staticmethod
+    def _validate_v9_checkpoints(checkpoints: object) -> None:
+        if not isinstance(checkpoints, dict):
+            raise OperationalException(
+                "Invalid v9 checkpoints.json: expected a window mapping."
+            )
+        for window_id, algorithm_ids in checkpoints.items():
+            if (
+                not isinstance(window_id, str)
+                or not isinstance(algorithm_ids, list)
+                or not all(
+                    isinstance(algorithm_id, str)
+                    for algorithm_id in algorithm_ids
+                )
+            ):
+                raise OperationalException(
+                    "Invalid v9 checkpoints.json: each window must map "
+                    "to a list of algorithm IDs."
+                )
+
+    @staticmethod
+    def create_checkpoint(
+        backtests,
+        backtest_date_range,
+        storage_directory,
+        show_progress: bool = False,
+        mode: str = "append"
+    ):
+        """
+        Create or update a checkpoint file.
+
+        Args:
+            backtests: List of backtests to create checkpoints for.
+            storage_directory: Directory to store the checkpoints.
+            backtest_date_range: The backtest date range to create
+                checkpoints for.
+            show_progress: Whether to print progress information.
+            mode: The mode to use when creating the checkpoint file.
+                Can be "append" or "overwrite".
+
+        Returns:
+            None
+        """
+
+        if len(backtests) == 0:
+            if show_progress:
+                print("No checkpoints to create")
+            return
+
+        checkpoint_file = os.path.join(
+            storage_directory, "checkpoints.json"
+        )
+        checkpoints = {}
+
+        if not os.path.exists(checkpoint_file):
+
+            if show_progress:
+                print(
+                    "No existing checkpoint file found, "
+                    "creating new checkpoint file ..."
+                )
+            checkpoints = {}
+        else:
+            # Load existing checkpoint file
+            with open(checkpoint_file, "r") as f:
+                checkpoints = json.load(f)
+            BacktestService._validate_v9_checkpoints(checkpoints)
+
+        backtest_range_key = (f"{backtest_date_range.start_date.isoformat()}_"
+                              f"{backtest_date_range.end_date.isoformat()}")
+        start_date = backtest_date_range.start_date.strftime("%Y-%m-%d")
+        end_date = backtest_date_range.end_date.strftime("%Y-%m-%d")
+        algorithm_ids = [bt.algorithm_id for bt in backtests]
+
+        if mode == "append" and backtest_range_key in checkpoints:
+            existing_ids = set(checkpoints[backtest_range_key])
+            existing_ids.update(algorithm_ids)
+            checkpoints[backtest_range_key] = sorted(existing_ids)
+        else:
+            checkpoints[backtest_range_key] = algorithm_ids
+
+        if show_progress:
+            print(
+                "Updated checkpoints for backtest "
+                f"range: {start_date} to {end_date}"
+            )
+            print(f"Saving {len(algorithm_ids)} checkpoints ...")
+
+        with open(checkpoint_file, "w") as f:
+            json.dump(checkpoints, f, indent=4)
+
+    @staticmethod
+    def get_checkpoints(
+        algorithm_ids: List[str],
+        backtest_date_range: BacktestDateRange,
+        storage_directory: str,
+        show_progress: bool = False
+    ) -> tuple[list[str], list[Backtest], list[str]]:
+        """
+        Get the checkpoint file. If it does not exist, an empty dict
+        will be returned.
+
+        Args:
+            algorithm_ids: The list of algorithm IDs to get checkpoints for.
+            backtest_date_range: The backtest date range to get checkpoints
+                for.
+            storage_directory: The directory where checkpoints are stored.
+            show_progress: Whether to print progress information.
+
+        Returns:
+            Tuple[List[str], List[Backtest], List[str]]: A tuple
+                containing a list of checkpointed algorithm IDs,
+                a list of backtests and a list of missing checkpointed
+                algorithm IDs.
+        """
+        checkpoint_file = os.path.join(
+            storage_directory, "checkpoints.json"
+        )
+
+        start_date = backtest_date_range.start_date.strftime("%Y-%m-%d")
+        end_date = backtest_date_range.end_date.strftime("%Y-%m-%d")
+        start_date_key = backtest_date_range.start_date.isoformat()
+        end_date_key = backtest_date_range.end_date.isoformat()
+
+        if show_progress:
+            print(
+                "Loading checkpoints for backtest "
+                f"range: {start_date} to {end_date}"
+            )
+
+        if not os.path.exists(checkpoint_file):
+            if show_progress:
+                print(
+                    "Found 0 checkpoints for backtest "
+                    f"range {start_date} to {end_date}."
+                )
+
+            return [], [], algorithm_ids
+
+        with open(checkpoint_file, "r") as f:
+            checkpoints = json.load(f)
+        BacktestService._validate_v9_checkpoints(checkpoints)
+
+        backtest_range_key = f"{start_date_key}_{end_date_key}"
+        checkpointed = list(checkpoints.get(backtest_range_key, []))
+
+        # Determine which algorithms are missing, by comparing witch
+        # algorithm id's are present in the checkpoints and which are not
+        if len(checkpointed) != 0:
+            missing_checkpointed = set(checkpointed) - set(algorithm_ids)
+        else:
+            missing_checkpointed = algorithm_ids
+
+        if show_progress:
+            print(
+                f"Found {len(checkpointed)} checkpoints "
+                f"for backtest range {start_date} to {end_date}."
+            )
+
+        backtests = []
+
+        if len(checkpointed) != 0:
+            # Load checkpoints
+            if show_progress:
+                for checkpoint in tqdm(
+                    checkpointed, colour="green", desc="Loading checkpoints"
+                ):
+                    backtests.append(
+                        Backtest.open(
+                            os.path.join(storage_directory, checkpoint),
+                            backtest_date_ranges=[backtest_date_range]
+                        )
+                    )
+            else:
+                for checkpoint in checkpointed:
+                    backtests.append(
+                        Backtest.open(
+                            os.path.join(storage_directory, checkpoint),
+                            backtest_date_ranges=[backtest_date_range]
+                        )
+                    )
+
+        return checkpointed, backtests, list(missing_checkpointed)
+
+    @staticmethod
+    def validate_strategy_for_vector_backtest(strategy):
+        """
+        Validate if the strategy is suitable for backtesting.
+
+        Args:
+            strategy: The strategy to validate.
+
+        Raises:
+            OperationalException: If the strategy has neither a vector
+                override nor signal cards with a preparation hook.
+        """
+        from investing_algorithm_framework.app.strategy import (
+            TradingStrategy,
+        )
+
+        own_method = type(strategy).generate_signal_series
+        base_method = TradingStrategy.generate_signal_series
+        card_defaults = (
+            bool(strategy.signal_cards)
+            and type(strategy).prepare_signal_data
+            is not TradingStrategy.prepare_signal_data
+        )
+        if own_method is base_method and not card_defaults:
+            raise OperationalException(
+                "Strategy must define a vectorized signal generator "
+                "(generate_signal_series), or configure signal_cards and "
+                "prepare_signal_data. See docs/migration-v8-to-v9.md "
+                "§10."
+            )
+
+    def generate_schedule(
+        self,
+        strategies,
+        tasks,
+        start_date,
+        end_date
+    ) -> Dict[datetime, Dict[str, List[str]]]:
+        """
+        Generates a dict-based schedule keyed by ``datetime``.
+
+        Each entry contains:
+
+        * ``strategy_ids``  — strategies that fire at this tick.
+        * ``task_ids``      — tasks that fire at this tick.
+        * ``scheduled_function_calls`` — list of
+          ``(strategy_id, function_name)`` tuples for the
+          v9.0 ``ScheduledFunction`` API.
+
+        The return type is intentionally a plain mapping of
+        ``datetime`` → ``dict`` so downstream consumers (including the
+        polars-based OHLCV pipeline) keep their existing semantics. Use
+        ``Schedule.materialize_polars(start, end)`` on an individual
+        schedule if you need a vectorised polars-native fire-times series.
+
+        Delegates to the shared implementation in
+        ``schedule_generation.py`` — kept in sync with
+        ``EventBacktestService.generate_schedule`` since both engines
+        drive the same event loop.
+        """
+        return generate_backtest_schedule(
+            strategies, tasks, start_date, end_date
+        )
+
+    def _get_initial_unallocated(self) -> float:
+        """
+        Get the initial unallocated amount for the backtest.
+
+        Returns:
+            float: The initial unallocated amount.
+        """
+        portfolios = self._portfolio_service.get_all()
+        initial_unallocated = 0.0
+
+        for portfolio in portfolios:
+            initial_unallocated += portfolio.initial_balance
+
+        return initial_unallocated
+
+    def create_backtest(
+        self,
+        algorithm,
+        number_of_runs,
+        backtest_date_range: BacktestDateRange,
+        risk_free_rate,
+        strategy_directory_path=None
+    ) -> Backtest:
+        """
+        Create a backtest for the given algorithm.
+
+        It will store all results and metrics in a Backtest object through
+        the BacktestResults and BacktestMetrics objects. Optionally,
+        it will also store the strategy related paths and backtest
+        data file paths.
+
+        Args:
+            algorithm: The algorithm to create the backtest report for
+            number_of_runs: The number of runs
+            backtest_date_range: The backtest date range of the backtest
+            risk_free_rate: The risk-free rate to use for the backtest metrics
+            strategy_directory_path (optional, str): The path to the
+                strategy directory
+
+        Returns:
+            Backtest: The backtest containing the results and metrics.
+        """
+
+        # Get the first portfolio
+        portfolio = self._portfolio_service.get_all()[0]
+
+        run = BacktestRun(
+            backtest_window=BacktestWindow(train_range=backtest_date_range),
+            initial_unallocated=self._get_initial_unallocated(),
+            created_at=datetime.now(tz=timezone.utc),
+            portfolio_snapshots=self._portfolio_snapshot_service.get_all(
+                {"portfolio_id": portfolio.id}
+            ),
+            number_of_runs=number_of_runs,
+            trades=self._trade_service.get_all(
+                {"portfolio": portfolio.id}
+            ),
+            orders=self._order_service.get_all(
+                {"portfolio": portfolio.id}
+            ),
+            positions=self._position_repository.get_all(
+                {"portfolio": portfolio.id}
+            ),
+        )
+        backtest_metrics = create_backtest_metrics(
+            run, risk_free_rate=risk_free_rate
+        )
+        run.backtest_metrics = backtest_metrics
+        bt = Backtest(
+            algorithm_id=algorithm.id,
+            parameters=algorithm.get_parameters()
+            if hasattr(algorithm, 'get_parameters') else {},
+            tag=algorithm.metadata.get('tag') if hasattr(
+                algorithm, 'metadata') and algorithm.metadata
+            else None,
+        )
+        _event_study = Study(name="default")
+        _event_slot = _event_study.get_engine("event")
+        _event_slot.runs = [run]
+        _event_slot.summary = generate_backtest_summary_metrics(
+            [backtest_metrics]
+        )
+        bt._studies["default"] = _event_study
+        return bt
+
+    def backtest_exists(
+        self,
+        strategy,
+        backtest_date_range: BacktestDateRange,
+        storage_directory: str
+    ) -> bool:
+        """
+        Check if a backtest already exists for the given strategy
+        and backtest date range.
+
+        Args:
+            strategy: The strategy to check.
+            backtest_date_range: The backtest date range to check.
+            storage_directory: The directory where backtests are stored.
+
+        Returns:
+            bool: True if the backtest exists, False otherwise.
+        """
+        algorithm_id = strategy.algorithm_id
+        backtest_directory = resolve_backtest_path(
+            storage_directory, algorithm_id
+        )
+
+        if backtest_directory is not None:
+            backtest = Backtest.open(backtest_directory)
+            backtest_date_ranges = backtest.get_backtest_date_ranges()
+
+            for backtest_date_range_ref in backtest_date_ranges:
+
+                if backtest_date_range_ref.start_date \
+                        == backtest_date_range.start_date and \
+                        backtest_date_range_ref.end_date \
+                        == backtest_date_range.end_date:
+                    return True
+
+        return False
+
+    def load_backtest_by_strategy_and_backtest_date_range(
+        self,
+        strategy,
+        backtest_date_range: BacktestDateRange,
+        storage_directory: str
+    ) -> Backtest:
+        """
+        Load a backtest for the given strategy and backtest date range.
+        If the backtest does not exist, an exception will be raised.
+        For the given backtest, only the run and metrics corresponding
+        to the backtest date range will be returned.
+
+        Args:
+            strategy: The strategy to load the backtest for.
+            backtest_date_range: The backtest date range to load.
+            storage_directory: The directory where backtests are stored.
+
+        Returns:
+            Backtest: instance of the loaded backtest with only
+                the given run and metrics corresponding to the
+                backtest date range.
+        """
+        strategy_id = strategy.id
+        backtest_directory = os.path.join(storage_directory, strategy_id)
+
+        if os.path.exists(backtest_directory):
+            backtest = Backtest.open(backtest_directory)
+            run = backtest.get_backtest_run(backtest_date_range)
+            metadata = backtest.get_metadata()
+            engine = (
+                "event"
+                if run in backtest.get_runs("event")
+                else "vector"
+            )
+            result = Backtest(
+                algorithm_id=backtest.algorithm_id,
+                metadata=metadata,
+            )
+            _loaded_study = Study(name="default")
+            _loaded_study.get_engine(engine).runs = [run]
+            result._studies["default"] = _loaded_study
+            return result
+        else:
+            raise OperationalException("Backtest does not exist.")
+
+    def initialize_data_sources_backtest(
+        self,
+        data_sources: List[DataSource],
+        backtest_date_range: BacktestDateRange,
+        show_progress: bool = False,
+        fill_missing_data: bool = False,
+        save_filled_data_points: bool = False,
+    ):
+        """
+        Function to initialize the data sources for the app in backtest mode.
+        This method should be called before running the algorithm in backtest
+        mode. It initializes all data sources so that they are
+        ready to be used.
+
+        Args:
+            data_sources (List[DataSource]): The data sources to initialize.
+            backtest_date_range (BacktestDateRange): The date range for the
+                backtest. This should be an instance of BacktestDateRange.
+            show_progress (bool): Whether to show a progress bar when
+                preparing the backtest data for each data provider.
+            fill_missing_data (bool): If True, missing time series data
+                entries will be filled automatically before preparing the
+                backtest data.
+            save_filled_data_points (bool): Persist synthetic filled candles
+                for CCXT OHLCV providers; other providers are unchanged.
+
+        Returns:
+            None
+        """
+        if data_sources is None or len(data_sources) == 0:
+            logger.info("No data sources were configured")
+            return
+
+        # Initialize all data sources
+        self._data_provider_service.index_backtest_data_providers(
+            data_sources, backtest_date_range, show_progress=show_progress
+        )
+        identifiers = ', '.join(ds.get_identifier() for ds in data_sources)
+        logger.info(
+            f"Data sources initialized ({len(data_sources)}): {identifiers}"
+        )
+
+        description = "Preparing backtest data for all data sources"
+        data_providers = self._data_provider_service\
+            .data_provider_index.get_all()
+
+        if show_progress:
+            data_providers = tqdm(
+                data_providers, desc=description, colour="green"
+            )
+
+        # Prepare the backtest data for each data provider
+        # Fill missing data is handled inside prepare_backtest_data
+        for _, data_provider in data_providers:
+            preparation_options = {}
+            if save_filled_data_points and isinstance(
+                data_provider, CCXTOHLCVDataProvider
+            ):
+                preparation_options["save_filled_data_points"] = True
+            data_provider.prepare_backtest_data(
+                backtest_start_date=backtest_date_range.start_date,
+                backtest_end_date=backtest_date_range.end_date,
+                fill_missing_data=fill_missing_data,
+                show_progress=show_progress,
+                **preparation_options,
+            )
+
+    def run_vector_backtests(
+        self,
+        strategies: List,
+        study: Study = None,
+        snapshot_interval: SnapshotInterval = SnapshotInterval.DAILY,
+        skip_data_sources_initialization: bool = False,
+        show_progress: bool = False,
+        continue_on_error: bool = False,
+        window_filter_function: Optional[
+            Callable[[List[Backtest], BacktestDateRange], List[Backtest]]
+        ] = None,
+        final_filter_function: Optional[
+            Callable[[List[Backtest]], List[Backtest]]
+        ] = None,
+        backtest_storage_directory: Optional[Union[str, Path]] = None,
+        use_checkpoints: bool = True,
+        force_rerun: bool = False,
+        on_checkpoint_match: Literal["skip", "rerun", "warn"] = "skip",
+        batch_size: int = 50,
+        checkpoint_batch_size: int = 25,
+        n_workers: Optional[int] = None,
+        dynamic_position_sizing: bool = False,
+        fill_missing_data: bool = True,
+        iterative_summary_update: bool = False,
+        result_mode: Literal["list", "index"] = "list",
+        memory_budget_mb: Optional[int] = None,
+        min_available_memory_mb: Optional[int] = None,
+        max_tasks_per_child: Optional[int] = 16,
+        window_metrics_filter_function: Optional[
+            Callable[[BacktestIndex, BacktestDateRange], BacktestIndex]
+        ] = None,
+        final_metrics_filter_function: Optional[
+            Callable[[BacktestIndex], BacktestIndex]
+        ] = None,
+        save_filled_data_points: bool = False,
+        signal_storage_directory=None,
+        execution_backend='python',
+        hard_memory_limit_mb=None,
+    ) -> Union[List[Backtest], BacktestIndex]:
+        """
+        OPTIMIZED version: Run vectorized backtests with optional
+        checkpointing, batching, and reduced I/O.
+
+        Optimizations:
+        - Checkpoint cache loaded once at start (reduces file I/O by 80-90%)
+        - Batch processing of strategies (reduces memory usage by 60-70%)
+        - Batch saving of backtests (reduces disk writes by 70-80%)
+        - Batch checkpoint updates (reduces checkpoint file writes)
+        - More aggressive memory cleanup
+        - Optional parallel processing (2-8x speedup on multi-core CPUs)
+
+        For 10,000 backtests:
+        - Sequential: 40-60% faster than original
+        - Parallel (8 cores): 3-5x faster than original
+
+        Args:
+            strategies: List of strategies to backtest.
+            study: Study object containing backtest configuration.
+            snapshot_interval: Interval for portfolio snapshots.
+            skip_data_sources_initialization: Whether to skip data
+                source initialization.
+            show_progress: Whether to show progress bars.
+            continue_on_error: Whether to continue on errors.
+            window_filter_function: Filter function applied after each
+                date range.
+            final_filter_function: Filter function applied at the end.
+            backtest_storage_directory: Directory to store backtests.
+            use_checkpoints: Whether to use checkpointing to resume interrupted
+                backtests. If True, completed backtests will be saved to disk
+                and skipped on subsequent runs. If False, all backtests will
+                run every time (default: True).
+            batch_size: Number of strategies to process in
+                each batch (default: 50).
+            checkpoint_batch_size: Number of backtests before batch
+                save/checkpoint (default: 25).
+            n_workers: Number of parallel workers (default: None = sequential,
+                -1 = use all CPU cores, N = use N workers).
+                Recommended: os.cpu_count() - 1 to leave one core free.
+            dynamic_position_sizing: If True, position sizes are recalculated
+                at each trade based on current portfolio value (similar to
+                event-based backtesting). If False (default), position sizes
+                are calculated once at the start based on initial portfolio
+                value.
+            fill_missing_data: If True (default), missing time series data
+                entries will be filled automatically before running the
+                backtest. This ensures data continuity and prevents errors
+                when the data source has gaps.
+            iterative_summary_update: If True, update backtest_summary
+                after each window to enable window_filter_function to
+                access up-to-date summary metrics (default: False).
+            result_mode: "list" retains full results; "index" persists
+                individual results and returns a scalar BacktestIndex.
+            memory_budget_mb: Optional soft process-tree RSS budget in MiB.
+            min_available_memory_mb: Optional available-memory reserve in
+                MiB, accounting for standard Linux cgroup limits.
+            max_tasks_per_child: Maximum tasks per worker before recycling.
+                Pool generations conservatively enforce this upper bound.
+            window_metrics_filter_function: Index-mode callback receiving
+                (index, date_range) and returning a subset index.
+            final_metrics_filter_function: Index-mode final subset filter.
+
+        Returns:
+            List[Backtest] or BacktestIndex according to result_mode.
+        """
+
+        if result_mode not in ("list", "index"):
+            raise OperationalException(
+                "result_mode must be 'list' or 'index'."
+            )
+        for name, value in (
+            ("batch_size", batch_size),
+            ("checkpoint_batch_size", checkpoint_batch_size),
+            ("memory_budget_mb", memory_budget_mb),
+            ("min_available_memory_mb", min_available_memory_mb),
+            ("max_tasks_per_child", max_tasks_per_child),
+        ):
+            optional = name not in ("batch_size", "checkpoint_batch_size")
+            if value is None and optional:
+                continue
+            if type(value) is not int or value <= 0:
+                raise OperationalException(
+                    f"{name} must be a positive integer."
+                )
+        if n_workers is not None and (
+            type(n_workers) is not int or n_workers < -1
+        ):
+            raise OperationalException(
+                "n_workers must be None, 0, -1, or a positive integer."
+            )
+        if n_workers == -1:
+            n_workers = min(max(multiprocessing.cpu_count() - 1, 1), 8)
+        if result_mode == "index":
+            if backtest_storage_directory is None:
+                raise OperationalException(
+                    "Index results require a backtest_storage_directory."
+                )
+            if window_filter_function or final_filter_function:
+                raise OperationalException(
+                    "Index results require metrics filters, not full-object "
+                    "window_filter_function/final_filter_function."
+                )
+        elif window_metrics_filter_function or final_metrics_filter_function:
+            raise OperationalException(
+                "Metrics filters require result_mode='index'."
+            )
+        for callback in (
+            window_metrics_filter_function, final_metrics_filter_function,
+        ):
+            if callback is not None and not callable(callback):
+                raise OperationalException("Metrics filters must be callable.")
+        from .vector_resources import require_hard_memory_limit
+        require_hard_memory_limit(hard_memory_limit_mb)
+        memory_guard = MemoryGuard(
+            memory_budget_mb, min_available_memory_mb
+        )
+        memory_guard.require()
+
+        if use_checkpoints and backtest_storage_directory is None:
+            raise OperationalException(
+                "When using checkpoints, a backtest_storage_directory must "
+                "be provided"
+            )
+
+        if study is None:
+            raise OperationalException(
+                "A Study object must be provided"
+            )
+
+        # Collect all data sources
+        data_sources = []
+
+        for strategy in strategies:
+            data_sources.extend(strategy.data_sources)
+
+        # --- Derive everything needed from the Study object -----------
+        risk_free_rate = study.risk_free_rate
+        if risk_free_rate is None:
+            if show_progress:
+                _print_progress(
+                    "Retrieving risk free rate for metrics "
+                    "calculation ...",
+                    show_progress
+                )
+            risk_free_rate = self._get_risk_free_rate()
+            if show_progress:
+                _print_progress(
+                    f"Retrieved risk free rate of: {risk_free_rate}",
+                    show_progress
+                )
+
+        # Portfolio configuration from study
+        initial_capital = study.initial_capital
+        # Study.execution_config.trading_costs is the backtest-side
+        # replacement for the removed per-strategy trading_costs; falls
+        # back to a matching pre-registered configuration's own
+        # trading_costs (if any) when the Study doesn't specify any.
+        _study_trading_costs = (
+            study.execution_config.get_trading_costs()
+            if study.execution_config is not None else []
+        )
+        if study.universe is not None:
+            matching_configuration = next((
+                configuration
+                for configuration
+                in self._portfolio_configuration_service.get_all()
+                if configuration.market == study.universe.market
+                and configuration.trading_symbol
+                == study.universe.trading_symbol
+            ), None)
+            portfolio_configuration = PortfolioConfiguration(
+                identifier="backtest_portfolio",
+                market=study.universe.market or "BACKTEST",
+                trading_symbol=study.universe.trading_symbol or "USDT",
+                initial_balance=initial_capital if initial_capital is not None
+                else getattr(
+                    matching_configuration, "initial_balance", 1000.0
+                ),
+                fee_percentage=getattr(
+                    matching_configuration, "fee_percentage", 0.0
+                ),
+                slippage_percentage=getattr(
+                    matching_configuration, "slippage_percentage", 0.0
+                ),
+                position_mode=getattr(
+                    matching_configuration, "position_mode", "netting"
+                ),
+                trading_costs=_study_trading_costs or getattr(
+                    matching_configuration, "trading_costs", None
+                ),
+            )
+        else:
+            _pcs = self._portfolio_configuration_service.get_all()
+            portfolio_configuration = _pcs[0] if _pcs else None
+            if portfolio_configuration is None:
+                raise OperationalException(
+                    "Study.universe must be set or a "
+                    "PortfolioConfiguration must exist."
+                )
+            if _study_trading_costs:
+                portfolio_configuration.trading_costs = (
+                    _study_trading_costs
+                )
+
+        # Date ranges from study windows, per study.window_part
+        # ("train" / "test" / "both", default "test").
+        backtest_date_ranges = study.resolve_backtest_date_ranges()
+        if not backtest_date_ranges:
+            raise OperationalException(
+                "Study must have at least one backtest_window "
+                "with a train_range or test_range set."
+            )
+
+        # Stamping fields derived from the study
+        stamp_required = bool(
+            (study.name and study.name != "default")
+            or study.description
+            or study.universe is not None
+            or study.backtest_windows
+            or study.initial_capital is not None
+        )
+        study_name = study.name
+        study_description = study.description
+        # Stamped on every checkpoint save (not just a final post-hoc
+        # pass over survivors) so a strategy eliminated mid-sweep by a
+        # progressive ``window_filter_function`` still has the full
+        # window list on disk — it never reaches the final survivor
+        # list that ``_apply_study_to_backtests`` (app.py) restamps.
+        study_backtest_windows = list(study.backtest_windows or [])
+        # Same rationale as ``study_backtest_windows`` above — without
+        # this, a mid-sweep checkpoint save writes a study with
+        # ``initial_capital=None`` that a survivor list never corrects.
+        study_initial_capital = study.initial_capital
+        universe_map = build_strategy_universe_map(
+            strategies,
+            [study.universe] if study.universe else [],
+        )
+
+        # Inject universe symbols/market into strategies that don't set them
+        for s in strategies:
+            matched = universe_map.get(s.algorithm_id)
+            if matched is None:
+                continue
+            if not s.symbols and matched.symbols:
+                s.symbols = list(matched.symbols)
+            if not getattr(s, "market", None) and matched.market:
+                s.market = matched.market
+
+        anchor_algorithm_id = None
+        # ------------------------------------------------------------------
+
+        # Load checkpoint cache only if checkpointing is enabled
+        checkpoint_cache = {}
+
+        if use_checkpoints and backtest_storage_directory is not None:
+            checkpoint_cache = self._load_checkpoint_cache(
+                backtest_storage_directory
+            )
+
+        # Create session cache to track backtests run in this session
+        # This ensures we only load backtests from this run, not pre-existing
+        # ones in the storage directory
+        session_cache = None
+        if backtest_storage_directory is not None:
+            session_cache = self._create_session_cache()
+
+        # Handle multiple date ranges with batching
+        active_strategies = strategies.copy()
+
+        # Sort and deduplicate date ranges
+        unique_date_ranges = set(backtest_date_ranges)
+        backtest_date_ranges = sorted(
+            unique_date_ranges, key=lambda x: x.start_date
+        )
+
+        # Track all backtests across date ranges (for combining later)
+        # {algorithm_id: [Backtest, Backtest, ...]}
+        backtests_by_algorithm = {}
+        index_rows_by_algorithm = {}
+        evaluated_ranges = set()
+
+        # Validate algorithm IDs
+        self._validate_algorithm_ids(strategies)
+
+        for backtest_date_range in tqdm(
+            backtest_date_ranges,
+            colour="green",
+            desc="Running backtests for all date ranges",
+            disable=not show_progress
+        ):
+            if not active_strategies:
+                break
+            evaluated_ranges.add((
+                backtest_date_range.start_date, backtest_date_range.end_date
+            ))
+            memory_guard.require()
+            if not skip_data_sources_initialization:
+                self.initialize_data_sources_backtest(
+                    data_sources,
+                    backtest_date_range,
+                    show_progress=show_progress,
+                    fill_missing_data=fill_missing_data,
+                    save_filled_data_points=save_filled_data_points,
+                )
+            memory_guard.require()
+
+            start_date = backtest_date_range.start_date.strftime('%Y-%m-%d')
+            end_date = backtest_date_range.end_date.strftime('%Y-%m-%d')
+            active_algorithm_ids = [s.algorithm_id for s in active_strategies]
+
+            # Only check for checkpoints if use_checkpoints is True
+            matched_ids = []
+            if use_checkpoints and force_rerun is not True:
+                _print_progress(
+                    "Using checkpoints to skip completed backtests ...",
+                    show_progress
+                )
+                strategies_to_run, matched_ids = \
+                    self._select_items_to_rerun(
+                        active_strategies,
+                        active_algorithm_ids,
+                        checkpoint_cache,
+                        backtest_date_range,
+                        force_rerun=force_rerun,
+                        on_checkpoint_match=on_checkpoint_match,
+                    )
+
+                # Add matched (skipped) ids to session cache so they end
+                # up in the final result set even though they weren't
+                # rerun in this session.
+                if session_cache is not None:
+                    for algo_id in matched_ids:
+                        backtest_path = resolve_backtest_path(
+                            backtest_storage_directory, algo_id
+                        )
+                        if backtest_path is None:
+                            backtest_path = os.path.join(
+                                backtest_storage_directory,
+                                f"{algo_id}{BUNDLE_EXT}",
+                            )
+                        session_cache["backtests"][algo_id] = backtest_path
+
+                if matched_ids and on_checkpoint_match == "warn":
+                    logger.info(
+                        "Skipping %d strategies with matching checkpoint "
+                        "for %s to %s.",
+                        len(matched_ids), start_date, end_date,
+                    )
+
+                if show_progress:
+                    _print_progress(
+                        f"Active strategies: {len(active_algorithm_ids)}, "
+                        f"matched: {len(matched_ids)}, "
+                        f"running {len(strategies_to_run)} backtests",
+                        show_progress
+                    )
+            else:
+                # Run all strategies when checkpoints are disabled
+                strategies_to_run = active_strategies
+
+            all_backtests = []
+            batch_buffer = []
+            completed_algorithm_ids = set()
+
+            def consume(batch_result):
+                if not batch_result:
+                    return
+                if stamp_required:
+                    stamp_backtests(
+                        batch_result,
+                        study_name=study_name,
+                        study_description=study_description,
+                        universe_map=universe_map,
+                        anchor_algorithm_id=anchor_algorithm_id,
+                        backtest_windows=study_backtest_windows,
+                        initial_capital=study_initial_capital,
+                    )
+                if result_mode == "list":
+                    all_backtests.extend(batch_result)
+                # Checkpoint each completed task before another admission.
+                # Merge may attach old windows, so never buffer index objects.
+                if (backtest_storage_directory is not None
+                        and result_mode == "index"):
+                    self._batch_save_and_checkpoint(
+                        batch_result, backtest_date_range,
+                        backtest_storage_directory, checkpoint_cache,
+                        session_cache=session_cache,
+                        write_index=False,
+                    )
+                    for backtest in batch_result:
+                        index_rows_by_algorithm[backtest.algorithm_id] = (
+                            compact_rows(
+                                backtest, backtest_storage_directory,
+                                study_name, backtest_date_range,
+                                evaluated_ranges,
+                            )
+                        )
+                    self._save_session_cache(
+                        session_cache, backtest_storage_directory
+                    )
+                elif backtest_storage_directory is not None:
+                    batch_buffer.extend(batch_result)
+                    self._save_batch_if_full(
+                        batch_buffer, checkpoint_batch_size,
+                        backtest_date_range, backtest_storage_directory,
+                        checkpoint_cache, session_cache,
+                    )
+                completed_algorithm_ids.update(
+                    backtest.algorithm_id for backtest in batch_result
+                )
+                pbar.update(len(batch_result))
+
+            with tqdm(
+                total=len(strategies_to_run), colour="green",
+                desc=f"Running backtests for {start_date} to {end_date}",
+                disable=not show_progress,
+            ) as pbar:
+                def task_arguments():
+                    task_size = (
+                        batch_size
+                        if (not n_workers and result_mode == "list"
+                            and not memory_guard.enabled) else 1
+                    )
+                    for offset in range(0, len(strategies_to_run), task_size):
+                        yield (
+                            strategies_to_run[offset:offset + task_size],
+                            backtest_date_range,
+                            portfolio_configuration, snapshot_interval,
+                            risk_free_rate, continue_on_error,
+                            None if n_workers else self._data_provider_service,
+                            False, dynamic_position_sizing,
+                            None, signal_storage_directory, execution_backend,
+                        )
+
+                if n_workers and strategies_to_run:
+                    bounded_process_map(
+                        self._run_batch_backtest_worker, task_arguments(),
+                        consume, initializer=_init_worker,
+                        initargs=(self._data_provider_service.copy(),),
+                        n_workers=n_workers,
+                        max_tasks_per_child=max_tasks_per_child,
+                        guard=memory_guard,
+                    )
+                else:
+                    for worker_args in task_arguments():
+                        memory_guard.require()
+                        batch_result = self._run_batch_backtest_worker(
+                            worker_args
+                        )
+                        consume(batch_result)
+                        del batch_result
+                        memory_guard.require()
+                if (result_mode == "list"
+                        and backtest_storage_directory is not None):
+                    self._save_remaining_batch(
+                        batch_buffer, backtest_date_range,
+                        backtest_storage_directory, checkpoint_cache,
+                        session_cache,
+                    )
+                pbar.update(len(strategies_to_run) - pbar.n)
+            del consume
+
+            if result_mode == "index":
+                for algorithm_id in matched_ids:
+                    memory_guard.require()
+                    backtest = Backtest.open(
+                        session_cache["backtests"][algorithm_id]
+                    )
+                    backtest.regenerate_summaries()
+                    index_rows_by_algorithm[algorithm_id] = compact_rows(
+                        backtest, backtest_storage_directory, study_name,
+                        backtest_date_range, evaluated_ranges,
+                    )
+                    del backtest
+                index = make_index(
+                    backtest_storage_directory,
+                    [
+                        row for algorithm_id in active_algorithm_ids
+                        if algorithm_id in completed_algorithm_ids
+                        or algorithm_id in matched_ids
+                        for row in index_rows_by_algorithm.get(
+                            algorithm_id, []
+                        )
+                    ],
+                )
+                if window_metrics_filter_function is not None:
+                    _print_progress(
+                        "Applying window metrics filter function ...",
+                        show_progress,
+                    )
+                    index = validated_filter(
+                        index, window_metrics_filter_function,
+                        backtest_date_range,
+                    )
+                    surviving_ids = set(index.df["algorithm_id"])
+                    mark_filtered(
+                        backtest_storage_directory, active_algorithm_ids,
+                        surviving_ids, backtest_date_range, memory_guard,
+                    )
+                    active_strategies = [
+                        strategy for strategy in active_strategies
+                        if strategy.algorithm_id in surviving_ids
+                    ]
+                    index_rows_by_algorithm = {
+                        algorithm_id: group.to_dict("records")
+                        for algorithm_id, group in index.df.groupby(
+                            "algorithm_id", sort=False
+                        )
+                    }
+                    session_cache["backtests"] = {
+                        key: value
+                        for key, value in session_cache["backtests"].items()
+                        if key in surviving_ids
+                    }
+                self._save_session_cache(
+                    session_cache, backtest_storage_directory
+                )
+                persist_index(index)
+                del all_backtests, index
+                batch_buffer.clear()
+                gc.collect()
+                memory_guard.require()
+                continue
+
+            # Store backtests in memory when no storage directory provided
+            # This must happen regardless of whether strategies_to_run
+            # was empty or not
+            if backtest_storage_directory is None:
+                for backtest in all_backtests:
+                    if backtest.algorithm_id not in backtests_by_algorithm:
+                        backtests_by_algorithm[backtest.algorithm_id] = []
+                    backtests_by_algorithm[backtest.algorithm_id]\
+                        .append(backtest)
+
+            # Load checkpointed backtests that were SKIPPED (not run in this
+            # iteration) if needed for filtering. Only load backtests that
+            # were checkpointed from a previous session, not ones that were
+            # just run and checkpointed in this session.
+            if use_checkpoints and (window_filter_function is not None
+                                    or final_filter_function is not None):
+                # Get IDs of strategies that were actually run in this
+                # iteration
+                run_algorithm_ids = set(s.algorithm_id
+                                        for s in strategies_to_run)
+                # Only load backtests that were SKIPPED
+                # (checkpointed, not run)
+                skipped_algorithm_ids = [
+                    algo_id for algo_id in active_algorithm_ids
+                    if algo_id not in run_algorithm_ids
+                ]
+
+                if len(skipped_algorithm_ids) > 0:
+                    checkpointed_backtests = self._load_backtests_from_cache(
+                        checkpoint_cache,
+                        backtest_date_range,
+                        backtest_storage_directory,
+                        skipped_algorithm_ids
+                    )
+                    all_backtests.extend(checkpointed_backtests)
+
+            # Iteratively update each engine's summary after each
+            # window so ``window_filter_function`` sees up-to-date
+            # per-engine summary metrics. v9.0 regenerates the vector
+            # and event summaries independently from their respective
+            # run lists; the cross-engine "backtest_summary" rollup
+            # from v8 no longer exists.
+            if iterative_summary_update:
+                for backtest in all_backtests:
+                    backtest.regenerate_summaries()
+
+            # Apply window filter function
+            if window_filter_function is not None:
+                if show_progress:
+                    _print_progress(
+                        "Applying window filter function ...",
+                        show_progress
+                    )
+                filtered_backtests = window_filter_function(
+                    all_backtests, backtest_date_range
+                )
+                active_strategies = [
+                    s for s in active_strategies
+                    if s.algorithm_id in [b.algorithm_id
+                                          for b in filtered_backtests]
+                ]
+
+                # Update tracking based on whether we're using
+                # storage or memory
+                if backtest_storage_directory is None:
+                    # Update backtests_by_algorithm after filtering
+                    # Remove algorithms that were filtered out
+                    filtered_algorithm_ids = set(b.algorithm_id
+                                                 for b in filtered_backtests)
+                    algorithms_to_remove = [
+                        alg_id for alg_id in backtests_by_algorithm.keys()
+                        if alg_id not in filtered_algorithm_ids
+                    ]
+                    for alg_id in algorithms_to_remove:
+                        del backtests_by_algorithm[alg_id]
+                else:
+                    # When using storage, mark filtered-out backtests
+                    # with metadata flag instead of deleting them
+                    filtered_algorithm_ids = set(
+                        b.algorithm_id for b in filtered_backtests)
+                    algorithms_to_mark = [
+                        alg_id for alg_id in active_algorithm_ids
+                        if alg_id not in filtered_algorithm_ids
+                    ]
+
+                    # Update session cache to only include filtered backtests
+                    if session_cache is not None:
+                        session_cache["backtests"] = {
+                            k: v for k, v in session_cache["backtests"].items()
+                            if k in filtered_algorithm_ids
+                        }
+
+                    # Clear filtered_out flag for backtests that passed
+                    # the filter (they may have been filtered out before)
+                    for alg_id in filtered_algorithm_ids:
+                        backtest_dir = resolve_backtest_path(
+                            backtest_storage_directory, alg_id
+                        )
+                        if backtest_dir is not None:
+                            try:
+                                backtest = Backtest.open(backtest_dir)
+                                if backtest.metadata is not None and \
+                                        backtest.metadata.get(
+                                            'filtered_out', False
+                                        ):
+                                    # Clear the filtered_out flag
+                                    backtest.metadata['filtered_out'] = False
+                                    if 'filtered_out_at_date_range' in \
+                                            backtest.metadata:
+                                        del backtest.metadata[
+                                            'filtered_out_at_date_range'
+                                        ]
+                                    backtest.save(backtest_dir)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not clear filtered_out flag "
+                                    f"for backtest {alg_id}: {e}"
+                                )
+
+                    # Mark filtered-out backtests with metadata flag
+                    # This preserves them in storage for future runs
+                    for alg_id in algorithms_to_mark:
+                        backtest_dir = resolve_backtest_path(
+                            backtest_storage_directory, alg_id
+                        )
+                        if backtest_dir is not None:
+                            try:
+                                # Load the backtest
+                                backtest = Backtest.open(backtest_dir)
+                                start_date = backtest_date_range.start_date
+                                end_date = backtest_date_range.end_date
+                                date_key = (
+                                    f"{start_date.isoformat()}_"
+                                    f"{end_date.isoformat()}"
+                                )
+                                # Mark as filtered out in metadata
+                                if backtest.metadata is None:
+                                    backtest.metadata = {}
+                                backtest.metadata['filtered_out'] = True
+                                backtest.metadata[
+                                    'filtered_out_at_date_range'
+                                ] = (
+                                    backtest_date_range.name
+                                    if backtest_date_range.name
+                                    else date_key
+                                )
+
+                                # Save the updated backtest
+                                backtest.save(backtest_dir)
+
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not mark backtest {alg_id} "
+                                    f"as filtered: {e}"
+                                )
+
+            # Clear memory
+            del all_backtests
+            batch_buffer.clear()
+            gc.collect()
+
+        # Combine backtests with the same algorithm_id across date ranges
+        if show_progress:
+            _print_progress(
+                "Combining backtests across date ranges ...",
+                show_progress
+            )
+
+        # After window filtering, active_strategies contains only algorithms
+        # that passed all window filters. Use these for final processing.
+        active_algorithm_ids_final = set(
+            s.algorithm_id for s in active_strategies
+        )
+
+        if result_mode == "index":
+            if window_metrics_filter_function is None:
+                index_rows_by_algorithm = {
+                    strategy.algorithm_id: index_rows_by_algorithm.get(
+                        strategy.algorithm_id, [],
+                    ) for strategy in active_strategies
+                }
+            index = make_index(
+                backtest_storage_directory,
+                [
+                    row
+                    for algorithm_id, rows
+                    in index_rows_by_algorithm.items()
+                    if algorithm_id in active_algorithm_ids_final
+                    for row in rows
+                ],
+            )
+            if final_metrics_filter_function is not None:
+                index = validated_filter(
+                    index, final_metrics_filter_function
+                )
+                mark_filtered(
+                    backtest_storage_directory, active_algorithm_ids_final,
+                    set(index.df["algorithm_id"]), backtest_date_ranges[-1],
+                    memory_guard,
+                )
+            survivor_ids = set(index.df["algorithm_id"])
+            session_cache["backtests"] = {
+                key: value for key, value in session_cache["backtests"].items()
+                if key in survivor_ids
+            }
+            self._save_session_cache(
+                session_cache, backtest_storage_directory
+            )
+            persist_index(index)
+            memory_guard.require()
+            return index
+
+        loaded_from_storage = False
+        if backtest_storage_directory is not None:
+            # Save session cache to disk before final loading
+            if session_cache is not None:
+                self._save_session_cache(
+                    session_cache, backtest_storage_directory
+                )
+
+            # Load ONLY from session cache - this ensures we only get
+            # backtests from this run, not pre-existing ones in the directory
+            all_backtests = self._load_backtests_from_session(
+                session_cache,
+                active_algorithm_ids_final,
+                show_progress=show_progress,
+                memory_guard=memory_guard,
+            )
+
+            if show_progress and session_cache is not None:
+                total_in_session = len(session_cache.get("backtests", {}))
+                loaded_count = len(all_backtests)
+                if total_in_session > loaded_count:
+                    _print_progress(
+                        f"Loaded {loaded_count} backtests from session "
+                        f"({total_in_session - loaded_count} filtered out)",
+                        show_progress
+                    )
+
+            loaded_from_storage = True
+        else:
+            # Combine from memory
+            combined_backtests = []
+            for algorithm_id, backtests_list in backtests_by_algorithm.items():
+                if len(backtests_list) == 1:
+                    combined_backtests.append(backtests_list[0])
+                else:
+                    # Combine multiple backtests for the same algorithm
+                    combined = combine_backtests(backtests_list)
+                    combined_backtests.append(combined)
+
+            all_backtests = combined_backtests
+
+        # Generate summary metrics (per engine, independently)
+        for backtest in tqdm(
+            all_backtests,
+            colour="green",
+            desc="Generating backtest summary metrics",
+            disable=not show_progress
+        ):
+            memory_guard.require()
+            backtest.regenerate_summaries()
+
+        # Apply final filter function
+        if final_filter_function is not None:
+            if show_progress:
+                _print_progress(
+                    "Applying final filter function ...",
+                    show_progress
+                )
+            all_backtests = final_filter_function(all_backtests)
+
+        # Only save if we didn't load from storage (avoid duplicate saves)
+        # When loaded from storage, backtests are already properly
+        # saved during execution
+        if backtest_storage_directory is not None and not loaded_from_storage:
+            # Save final combined backtests
+            save_backtests_to_directory(
+                backtests=all_backtests,
+                directory_path=backtest_storage_directory,
+                show_progress=show_progress
+            )
+
+        # Cleanup session file at the end
+        if backtest_storage_directory is not None:
+            session_file = os.path.join(
+                backtest_storage_directory, "backtest_session.json"
+            )
+            if os.path.exists(session_file):
+                os.remove(session_file)
+
+        return all_backtests
+
+    def _load_checkpoint_cache(
+        self, storage_directory: str
+    ) -> Dict[str, Set[str]]:
+        """Load the v9 checkpoint file into an O(1) membership cache."""
+        checkpoint_file = os.path.join(storage_directory, "checkpoints.json")
+        if not os.path.exists(checkpoint_file):
+            return {}
+
+        with open(checkpoint_file, "r") as f:
+            persisted = json.load(f)
+        self._validate_v9_checkpoints(persisted)
+
+        cache: Dict[str, Set[str]] = {}
+        for window_id, algorithm_ids in persisted.items():
+            cache[window_id] = set(algorithm_ids)
+        return cache
+
+    def _get_checkpointed_from_cache(
+        self,
+        cache: Dict,
+        date_range: BacktestDateRange
+    ) -> List[str]:
+        """Get checkpointed algorithm IDs from the in-memory v9 cache."""
+        key = (f"{date_range.start_date.isoformat()}_"
+               f"{date_range.end_date.isoformat()}")
+        return list(cache.get(key, set()))
+
+    @staticmethod
+    def _checkpoint_key_for(date_range: BacktestDateRange) -> str:
+        return (f"{date_range.start_date.isoformat()}_"
+                f"{date_range.end_date.isoformat()}")
+
+    @staticmethod
+    def _select_items_to_rerun(
+        active_items: List,
+        active_algorithm_ids: List[str],
+        checkpoint_cache: Dict,
+        date_range: BacktestDateRange,
+        force_rerun: bool = False,
+        on_checkpoint_match: Literal["skip", "rerun", "warn"] = "skip",
+    ) -> Tuple[List, List[str]]:
+        """
+        Decide which strategies/algorithms to (re)run for ``date_range``.
+
+        Returns a tuple ``(items_to_run, matched_ids)``:
+
+        - ``items_to_run`` is the filtered list of strategies/algorithms
+          the engine should actually execute.
+        - ``matched_ids`` are algorithm_ids with a checkpoint for the
+          requested date range.
+        """
+        if force_rerun:
+            return list(active_items), []
+
+        key = BacktestService._checkpoint_key_for(date_range)
+        checkpointed_ids = checkpoint_cache.get(key, set())
+
+        matched_ids: List[str] = []
+        items_to_run: List = []
+
+        # zip-by-id mapping
+        active_by_id = {
+            algo_id: item for algo_id, item
+            in zip(active_algorithm_ids, active_items)
+        }
+
+        for algo_id, item in active_by_id.items():
+            if algo_id not in checkpointed_ids:
+                items_to_run.append(item)
+                continue
+
+            matched_ids.append(algo_id)
+            if on_checkpoint_match == "rerun":
+                items_to_run.append(item)
+            # "skip" and "warn" both don't rerun on match
+
+        return items_to_run, matched_ids
+
+    def _batch_save_and_checkpoint(
+        self,
+        backtests: List[Backtest],
+        date_range: BacktestDateRange,
+        storage_directory: str,
+        checkpoint_cache: Dict,
+        show_progress: bool = False,
+        session_cache: Dict = None,
+        write_index: bool = True,
+    ):
+        """Save a batch and checkpoint algorithm IDs for the window."""
+        if len(backtests) == 0:
+            return
+
+        # When iterating across multiple date ranges, a bundle for the
+        # same ``algorithm_id`` may already exist on disk from a previous
+        # iteration. ``save_bundle`` keys solely on ``algorithm_id``, so
+        # a naive save would overwrite the prior bundle and lose its
+        # backtest_runs. Merge with the existing bundle so all date
+        # ranges' runs end up in the single per-algorithm bundle.
+        backtests_to_save: List[Backtest] = []
+        for bt in backtests:
+            existing_path = resolve_backtest_path(
+                storage_directory, bt.algorithm_id
+            )
+            if existing_path is None:
+                backtests_to_save.append(bt)
+                continue
+
+            existing = Backtest.open(existing_path)
+
+            # Study-aware merge semantics (applies to any number of
+            # studies already in the bundle):
+            #
+            # 1. Overwrite: if the on-disk study already has a run
+            #    for the same date range, replace it with the new run.
+            # 2. Keep: runs in the on-disk study whose date ranges are
+            #    *not* covered by the new batch are preserved as-is.
+            # 3. Append: runs in the new batch whose date ranges are
+            #    entirely new are appended.
+            # 4. After any change: recalculate engine summary metrics
+            #    for the affected study.
+            #
+            # Non-target studies (disjoint study slots) are always
+            # preserved by ``save_bundle(merge=True)`` via
+            # ``_merge_v5_envelopes`` Rule 1 — no explicit copy needed.
+            _bt_ds = bt.get_study()
+            new_study_name = _bt_ds.name if _bt_ds else "default"
+
+            existing_target = existing.get_study(new_study_name)
+            if existing_target is None:
+                # Brand-new study slot — just save bt as-is.
+                # _merge_v5_envelopes adds it alongside existing studies.
+                backtests_to_save.append(bt)
+                continue
+
+            # Study already exists on this bundle: apply rules 1-4.
+            bt_target = bt.get_study(new_study_name)
+            for _eng in ("vector", "event"):
+                _ex_slot = existing_target.engine_results.get(_eng)
+                if _ex_slot is None:
+                    continue
+                new_slot = bt_target.engine_results.get(_eng) \
+                    if bt_target is not None else None
+                # An event run must not replace a vector run on the same dates.
+                new_ranges = {
+                    (run.backtest_start_date, run.backtest_end_date)
+                    for run in (new_slot.runs if new_slot is not None else [])
+                }
+                # Surviving runs: on-disk runs whose date range is NOT
+                # in the new batch (rules 2 + 3 — keep non-overlapping).
+                surviving = [
+                    r for r in (_ex_slot.runs or [])
+                    if (r.backtest_start_date, r.backtest_end_date)
+                    not in new_ranges
+                ]
+                if not surviving:
+                    continue
+                # Prepend survivors so the combined list stays
+                # chronological (old windows before new windows).
+                if bt_target is not None:
+                    _bt_slot = bt_target.engine_results.get(_eng)
+                    if _bt_slot is not None:
+                        _bt_slot.runs = surviving + _bt_slot.runs
+                    else:
+                        bt_target.engine_results[_eng] = EngineSlot(
+                            runs=surviving
+                        )
+
+            # Rule 4: recalculate summary metrics for every engine
+            # in the target study now that runs have been merged.
+            bt.regenerate_summaries()
+            bt.regenerate_summaries_by_universe()
+            backtests_to_save.append(bt)
+
+        # Save backtests to disk
+        save_backtests_to_directory(
+            backtests=backtests_to_save,
+            directory_path=storage_directory,
+            show_progress=show_progress,
+            workers=1,
+            write_index=write_index,
+        )
+
+        # Update checkpoint cache
+        key = self._checkpoint_key_for(date_range)
+        checkpointed_ids = checkpoint_cache.setdefault(key, set())
+        checkpointed_ids.update(
+            backtest.algorithm_id for backtest in backtests
+        )
+
+        # Write checkpoint file with forced flush to disk
+        checkpoint_file = os.path.join(storage_directory, "checkpoints.json")
+        staging_file = checkpoint_file + ".pending"
+        persisted = {
+            window_id: sorted(algorithm_ids)
+            for window_id, algorithm_ids in checkpoint_cache.items()
+        }
+        try:
+            with open(staging_file, "w") as f:
+                json.dump(persisted, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(staging_file, checkpoint_file)
+        finally:
+            if os.path.exists(staging_file):
+                os.remove(staging_file)
+
+        # Update session cache if provided
+        if session_cache is not None:
+            self._update_session_cache(
+                backtests, storage_directory, session_cache
+            )
+
+    def _create_session_cache(self) -> Dict:
+        """
+        Create a new session cache to track backtests run in this session.
+
+        Returns:
+            Dict: Empty session cache structure
+        """
+        return {
+            "session_id": datetime.now(timezone.utc).isoformat(),
+            "backtests": {}  # algorithm_id -> backtest_path
+        }
+
+    def _update_session_cache(
+        self,
+        backtests: List[Backtest],
+        storage_directory: str,
+        session_cache: Dict
+    ):
+        """
+        Update session cache with newly saved backtests.
+
+        Args:
+            backtests: List of backtests that were saved
+            storage_directory: Directory where backtests are stored
+            session_cache: Session cache to update
+        """
+        for backtest in backtests:
+            algorithm_id = backtest.algorithm_id
+            # Use the actual on-disk path (bundle preferred, legacy
+            # directory as fallback) so subsequent reload operations
+            # find the file regardless of save format.
+            resolved = resolve_backtest_path(
+                storage_directory, algorithm_id
+            )
+            if resolved is None:
+                resolved = os.path.join(
+                    storage_directory, f"{algorithm_id}{BUNDLE_EXT}"
+                )
+            session_cache["backtests"][algorithm_id] = resolved
+
+    def _save_session_cache(
+        self,
+        session_cache: Dict,
+        storage_directory: str
+    ):
+        """
+        Save session cache to disk.
+
+        Args:
+            session_cache: Session cache to save
+            storage_directory: Directory to save the session file
+        """
+        # Ensure the storage directory exists
+        os.makedirs(storage_directory, exist_ok=True)
+
+        session_file = os.path.join(
+            storage_directory, "backtest_session.json"
+        )
+        staging_file = session_file + ".pending"
+        try:
+            with open(staging_file, "w") as f:
+                json.dump(session_cache, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(staging_file, session_file)
+        finally:
+            if os.path.exists(staging_file):
+                os.remove(staging_file)
+
+    def _load_backtests_from_session(
+        self,
+        session_cache: Dict,
+        active_algorithm_ids: set = None,
+        show_progress: bool = False,
+        memory_guard: Optional[MemoryGuard] = None,
+    ) -> List[Backtest]:
+        """
+        Load backtests from the current session cache.
+
+        This method efficiently loads only the backtests that were run
+        in the current session, avoiding loading pre-existing backtests
+        from the storage directory.
+
+        Args:
+            session_cache: Session cache containing backtest paths
+            active_algorithm_ids: Optional set of algorithm IDs to filter by
+                (e.g., those that passed window filters)
+            show_progress: Whether to show progress bar
+
+        Returns:
+            List[Backtest]: List of backtests from the current session
+        """
+        backtests = []
+        backtest_paths = session_cache.get("backtests", {})
+
+        # Filter by active_algorithm_ids if provided
+        if active_algorithm_ids is not None:
+            paths_to_load = {
+                alg_id: path for alg_id, path in backtest_paths.items()
+                if alg_id in active_algorithm_ids
+            }
+        else:
+            paths_to_load = backtest_paths
+
+        items = list(paths_to_load.items())
+
+        for algorithm_id, backtest_path in tqdm(
+            items,
+            colour="green",
+            desc="Loading session backtests",
+            disable=not show_progress
+        ):
+            if memory_guard is not None:
+                memory_guard.require()
+            try:
+                if os.path.exists(backtest_path):
+                    backtest = Backtest.open(backtest_path)
+                    backtests.append(backtest)
+                else:
+                    logger.warning(
+                        f"Backtest path does not exist: {backtest_path}"
+                    )
+            except (MemoryError, BacktestResourceError):
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"Could not load backtest {algorithm_id} "
+                    f"from {backtest_path}: {e}"
+                )
+            if memory_guard is not None:
+                memory_guard.require()
+
+        return backtests
+
+    def _load_backtests_from_cache(
+        self,
+        checkpoint_cache: Dict,
+        date_range: BacktestDateRange,
+        storage_directory: str,
+        algorithm_ids: List[str]
+    ) -> List[Backtest]:
+        """Load specific backtests from disk based on checkpoint cache."""
+        checkpointed_ids = self._get_checkpointed_from_cache(
+            checkpoint_cache, date_range
+        )
+        backtests = []
+
+        for algo_id in checkpointed_ids:
+            if algo_id in algorithm_ids:
+                try:
+                    backtest_dir = resolve_backtest_path(
+                        storage_directory, algo_id
+                    )
+                    if backtest_dir is not None:
+                        backtest = Backtest.open(
+                            backtest_dir,
+                            backtest_date_ranges=[date_range]
+                        )
+                        backtests.append(backtest)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not load backtest for {algo_id}: {e}"
+                    )
+
+        return backtests
+
+    def _process_strategy_batch(
+        self,
+        strategies: List,
+        backtest_date_range: BacktestDateRange,
+        initial_amount: float,
+        snapshot_interval: SnapshotInterval,
+        risk_free_rate: float,
+        market: Optional[str],
+        trading_symbol: Optional[str],
+        continue_on_error: bool,
+        show_progress: bool = False
+    ) -> List[Backtest]:
+        """
+        Process a batch of strategies sequentially.
+
+        Args:
+            strategies: List of strategies to process
+            backtest_date_range: Date range for backtesting
+            initial_amount: Initial portfolio amount
+            snapshot_interval: Interval for portfolio snapshots
+            risk_free_rate: Risk-free rate for metrics
+            market: Optional market filter
+            trading_symbol: Optional trading symbol
+            continue_on_error: Whether to continue on errors
+            show_progress: Whether to show individual progress
+
+        Returns:
+            List of completed backtests
+        """
+        backtests = []
+
+        for strategy in strategies:
+            try:
+                backtest = self.run_vector_backtest(
+                    backtest_date_range=backtest_date_range,
+                    initial_amount=initial_amount,
+                    strategy=strategy,
+                    snapshot_interval=snapshot_interval,
+                    risk_free_rate=risk_free_rate,
+                    skip_data_sources_initialization=True,
+                    market=market,
+                    trading_symbol=trading_symbol,
+                    continue_on_error=continue_on_error,
+                    backtest_storage_directory=None,
+                    show_progress=show_progress,
+                )
+                backtests.append(backtest)
+
+            except Exception as e:
+                if continue_on_error:
+                    logger.error(
+                        f"Error in backtest for {strategy.algorithm_id}: {e}"
+                    )
+                    continue
+                else:
+                    raise
+
+        return backtests
+
+    def _save_batch_if_full(
+        self,
+        batch_buffer: List[Backtest],
+        checkpoint_batch_size: int,
+        backtest_date_range: BacktestDateRange,
+        backtest_storage_directory: str,
+        checkpoint_cache: Dict,
+        session_cache: Dict = None,
+    ) -> bool:
+        """
+        Save batch if buffer is full and clear memory.
+
+        Args:
+            batch_buffer: List of backtests to potentially save.
+            checkpoint_batch_size: Threshold for saving.
+            backtest_date_range: The backtest date range.
+            backtest_storage_directory: Directory to save to.
+            checkpoint_cache: Checkpoint cache to update.
+            session_cache: Session cache to track backtests from this run.
+        Returns:
+            True if batch was saved, False otherwise
+        """
+        if len(batch_buffer) >= checkpoint_batch_size:
+            self._batch_save_and_checkpoint(
+                batch_buffer,
+                backtest_date_range,
+                backtest_storage_directory,
+                checkpoint_cache,
+                show_progress=False,
+                session_cache=session_cache,
+            )
+            batch_buffer.clear()
+            gc.collect()
+            return True
+        return False
+
+    def _save_remaining_batch(
+        self,
+        batch_buffer: List[Backtest],
+        backtest_date_range: BacktestDateRange,
+        backtest_storage_directory: str,
+        checkpoint_cache: Dict,
+        session_cache: Dict = None,
+    ):
+        """
+        Save any remaining backtests in the buffer.
+
+        Args:
+            batch_buffer: List of backtests to save.
+            backtest_date_range: The backtest date range.
+            backtest_storage_directory: Directory to save to.
+            checkpoint_cache: Checkpoint cache to update.
+            session_cache: Session cache to track backtests from this run.
+        """
+        if len(batch_buffer) > 0:
+            self._batch_save_and_checkpoint(
+                batch_buffer,
+                backtest_date_range,
+                backtest_storage_directory,
+                checkpoint_cache,
+                show_progress=False,
+                session_cache=session_cache,
+            )
+            batch_buffer.clear()
+            gc.collect()
+
+    @staticmethod
+    def _run_batch_backtest_worker(args):
+        """
+        Static worker function for parallel BATCH backtest execution.
+
+        Each worker processes a batch of strategies, reusing the same
+        data providers and initialization. This is MUCH more efficient
+        than spawning a worker for each individual backtest because:
+        - Reduces process creation overhead by 99%
+        - Shares data provider initialization across batch
+        - Better memory efficiency and cache locality
+        - Optimal for 1,000+ backtests
+
+        Args:
+            args: Tuple containing (
+                strategy_batch,
+                backtest_date_range,
+                portfolio_configuration,
+                snapshot_interval,
+                risk_free_rate,
+                continue_on_error,
+                data_provider_service,
+                show_progress,
+                dynamic_position_sizing,
+                progress_counter (optional),
+            )
+
+        Returns:
+            List[Backtest]: List of completed backtest results
+        """
+        signal_storage_directory = None
+        execution_backend = 'python'
+        if len(args) == 12:
+            signal_storage_directory, execution_backend = args[-2:]
+            args = args[:10]
+        # Support both old (9-element) and new (10-element) tuple
+        if len(args) == 10:
+            (
+                strategy_batch,
+                backtest_date_range,
+                portfolio_configuration,
+                snapshot_interval,
+                risk_free_rate,
+                continue_on_error,
+                data_provider_service,
+                show_progress,
+                dynamic_position_sizing,
+                progress_counter,
+            ) = args
+        else:
+            (
+                strategy_batch,
+                backtest_date_range,
+                portfolio_configuration,
+                snapshot_interval,
+                risk_free_rate,
+                continue_on_error,
+                data_provider_service,
+                show_progress,
+                dynamic_position_sizing,
+            ) = args
+            progress_counter = None
+
+        # Use the worker-global data provider if none was passed
+        # directly (parallel mode passes None and relies on the
+        # initializer to set the global once per worker process).
+        if data_provider_service is None:
+            data_provider_service = _worker_data_provider_service
+
+        # In parallel mode the progress counter is inherited via the
+        # worker initializer (multiprocessing.Value, shared memory).
+        # Fall back to the per-task argument for backward compatibility.
+        if progress_counter is None:
+            progress_counter = _worker_progress_counter
+
+        vector_backtest_service = VectorBacktestService(
+            data_provider_service=data_provider_service
+        )
+
+        batch_results = []
+        start_date = backtest_date_range.start_date.strftime('%Y-%m-%d')
+        end_date = backtest_date_range.end_date.strftime('%Y-%m-%d')
+        if show_progress:
+            strategy_batch = tqdm(
+                strategy_batch,
+                colour="green",
+                desc=f"Running backtests for {start_date} to {end_date}",
+                disable=not show_progress
+            )
+
+        for strategy in strategy_batch:
+            try:
+                from investing_algorithm_framework.services.backtest_store \
+                    import StoreError
+                from investing_algorithm_framework.services.backtest_store \
+                    .recording import recording_session
+                with recording_session(
+                    signal_storage_directory, 'vector',
+                    {'algorithm_id': str(strategy.algorithm_id),
+                     'start': backtest_date_range.start_date.isoformat(),
+                     'end': backtest_date_range.end_date.isoformat()},
+                ) as recorder:
+                    backtest_run = vector_backtest_service.run(
+                        strategy=strategy,
+                        backtest_date_range=backtest_date_range,
+                        portfolio_configuration=portfolio_configuration,
+                        risk_free_rate=risk_free_rate,
+                        dynamic_position_sizing=dynamic_position_sizing,
+                        execution_backend=execution_backend,
+                        signal_recorder=recorder,
+                    )
+                backtest = Backtest(
+                    algorithm_id=strategy.algorithm_id,
+                    metadata=strategy.metadata if hasattr(
+                        strategy, 'metadata') else None,
+                    parameters=strategy.get_parameters()
+                    if hasattr(strategy, 'get_parameters') else {},
+                    tag=strategy.metadata.get('tag') if hasattr(
+                        strategy, 'metadata') and strategy.metadata
+                    else None,
+                )
+                _worker_study = Study(name="default")
+                _worker_slot = _worker_study.get_engine("vector")
+                _worker_slot.runs = [backtest_run]
+                _worker_slot.summary = (
+                    generate_backtest_summary_metrics(
+                        [backtest_run.backtest_metrics]
+                    ) if backtest_run.backtest_metrics else None
+                )
+                backtest._studies["default"] = _worker_study
+                batch_results.append(backtest)
+
+                # Increment shared progress counter so the
+                # main process can track per-strategy progress.
+                # ``multiprocessing.Value`` lives in shared memory; the
+                # lock makes ``+= 1`` atomic across workers.
+                if progress_counter is not None:
+                    with progress_counter.get_lock():
+                        progress_counter.value += 1
+
+            except (MemoryError, BacktestResourceError, StoreError):
+                raise
+            except Exception as e:
+                if continue_on_error:
+                    logger.error(
+                        "Worker error for strategy "
+                        f"{strategy.algorithm_id}: {e}"
+                    )
+                    # Still increment counter for failed strategies
+                    # so progress total stays accurate
+                    if progress_counter is not None:
+                        with progress_counter.get_lock():
+                            progress_counter.value += 1
+                    continue
+                else:
+                    raise
+
+        return batch_results
+
+    def run_vector_backtest(
+        self,
+        strategy,
+        backtest_date_range: BacktestDateRange = None,
+        backtest_date_ranges: List[BacktestDateRange] = None,
+        portfolio_configuration: PortfolioConfiguration = None,
+        snapshot_interval: SnapshotInterval = SnapshotInterval.DAILY,
+        metadata: Optional[Dict[str, str]] = None,
+        tag: Optional[str] = None,
+        risk_free_rate: Optional[float] = None,
+        skip_data_sources_initialization: bool = False,
+        initial_amount: float = None,
+        market: str = None,
+        trading_symbol: str = None,
+        continue_on_error: bool = False,
+        backtest_storage_directory: Optional[Union[str, Path]] = None,
+        use_checkpoints: bool = True,
+        show_progress: bool = False,
+        n_workers: Optional[int] = None,
+        batch_size: int = 50,
+        checkpoint_batch_size: int = 25,
+        dynamic_position_sizing: bool = False,
+        fill_missing_data: bool = True,
+    ) -> Backtest:
+        """
+        Run optimized vectorized backtest for a single strategy.
+
+        This method leverages the optimized run_vector_backtests
+        implementation, providing the same performance benefits (batching,
+        checkpointing, parallel processing) for single strategy backtests.
+
+        Args:
+            strategy: The strategy object to backtest.
+            backtest_date_range: Single backtest date range to use.
+            backtest_date_ranges: List of backtest date ranges to use.
+                The strategy will be backtested across all date ranges and
+                results will be combined.
+            portfolio_configuration: Portfolio configuration to use. If not
+                provided, will be created from initial_amount, market, and
+                trading_symbol parameters.
+            snapshot_interval: The snapshot interval to use for the backtest.
+            metadata: Metadata to attach to the backtest report.
+            risk_free_rate: The risk-free rate to use for the backtest.
+                If not provided, will be fetched automatically.
+            skip_data_sources_initialization: Whether to skip data source
+                initialization.
+            initial_amount: Initial amount to start the backtest with.
+                Only used if portfolio_configuration is not provided.
+            market: Market to use for the backtest. Only used if
+                portfolio_configuration is not provided.
+            trading_symbol: Trading symbol to use. Only used if
+                portfolio_configuration is not provided.
+            continue_on_error: Whether to continue if an error occurs.
+            backtest_storage_directory: Directory to save the backtest to.
+            use_checkpoints: Whether to use checkpointing to resume interrupted
+                backtests. If True, completed backtests will be saved to disk
+                and skipped on subsequent runs. If False, the backtest will
+                run every time (default: True).
+            show_progress: Whether to show progress bars.
+            n_workers: Number of parallel workers (None = sequential).
+            batch_size: Number of strategies to process in each batch.
+            checkpoint_batch_size: Number of backtests before batch save.
+            dynamic_position_sizing: If True, position sizes are recalculated
+                at each trade based on current portfolio value. If False
+                (default), position sizes are calculated once at the start.
+            fill_missing_data: If True (default), missing time series data
+                entries will be filled automatically before running the
+                backtest. This ensures data continuity and prevents errors
+                when the data source has gaps.
+
+        Returns:
+            Backtest: Instance of Backtest for the single strategy.
+        """
+        # Create portfolio configuration if not provided
+        if portfolio_configuration is None:
+
+            if initial_amount is None:
+                # Try to get from existing portfolio configurations
+                portfolio_configurations = \
+                    self._portfolio_configuration_service.get_all()
+
+                if portfolio_configurations \
+                        and len(portfolio_configurations) > 0:
+                    portfolio_configuration = portfolio_configurations[0]
+                else:
+                    raise OperationalException(
+                        "No portfolio configuration provided and no "
+                        "initial_amount specified. "
+                        "Please provide either a portfolio_configuration "
+                        "or initial_amount, "
+                        "market, and trading_symbol parameters."
+                    )
+            else:
+                portfolio_configuration = PortfolioConfiguration(
+                    identifier="backtest_portfolio",
+                    market=market or "BACKTEST",
+                    trading_symbol=trading_symbol or "USDT",
+                    initial_balance=initial_amount
+                )
+
+        # Build a Study from the resolved parameters so that
+        # run_vector_backtests receives a single Study object.
+        _all_date_ranges = []
+        if backtest_date_range is not None:
+            _all_date_ranges.append(backtest_date_range)
+        if backtest_date_ranges is not None:
+            _all_date_ranges.extend(backtest_date_ranges)
+
+        _rfr = risk_free_rate if risk_free_rate is not None \
+            else self._get_risk_free_rate()
+        run_study = Study(
+            name="default",
+            backtest_windows=[
+                BacktestWindow(train_range=dr) for dr in _all_date_ranges
+            ],
+            universe=Universe(
+                market=portfolio_configuration.market,
+                trading_symbol=portfolio_configuration.trading_symbol,
+            ),
+            initial_capital=portfolio_configuration.initial_balance,
+            risk_free_rate=_rfr,
+        )
+
+        # Use the optimized run_vector_backtests method
+        backtests = self.run_vector_backtests(
+            strategies=[strategy],
+            study=run_study,
+            snapshot_interval=snapshot_interval,
+            skip_data_sources_initialization=skip_data_sources_initialization,
+            show_progress=show_progress,
+            continue_on_error=continue_on_error,
+            backtest_storage_directory=backtest_storage_directory,
+            use_checkpoints=use_checkpoints,
+            batch_size=batch_size,
+            checkpoint_batch_size=checkpoint_batch_size,
+            n_workers=n_workers,
+            dynamic_position_sizing=dynamic_position_sizing,
+            fill_missing_data=fill_missing_data,
+        )
+
+        # Extract the single backtest result
+        if backtests and len(backtests) > 0:
+            backtest = backtests[0]
+
+            # Add metadata if provided
+            if metadata is not None:
+                backtest.metadata = metadata
+            elif backtest.metadata is None:
+                if (hasattr(strategy, 'metadata')
+                        and strategy.metadata is not None):
+                    backtest.metadata = strategy.metadata
+                else:
+                    backtest.metadata = {}
+
+            # Set tag: explicit param > strategy metadata > None
+            if tag is not None:
+                backtest.tag = tag
+            elif backtest.tag is None:
+                if (hasattr(strategy, 'metadata')
+                        and strategy.metadata
+                        and 'tag' in strategy.metadata):
+                    backtest.tag = strategy.metadata['tag']
+
+            return backtest
+        else:
+            # Return empty backtest if no results. v9.0 represents
+            # "empty vector backtest" as an empty vector_runs list;
+            # event_runs stays empty too.
+            return Backtest(
+                algorithm_id=strategy.algorithm_id,
+                metadata=metadata or {},
+            )
+
+    def _get_risk_free_rate(self) -> float:
+        """
+        Get the risk-free rate. Returns a sensible default of 0.027
+        (2.7%) to avoid external network calls during backtests.
+
+        Returns:
+            float: The risk-free rate.
+        """
+        logger.info(
+            "No risk free rate provided, defaulting to 0.027 "
+            "(2.7%%). Provide risk_free_rate to override."
+        )
+        return 0.027
+
+    def _reset_event_backtest_state(self):
+        """
+        Wipe all portfolio/order/trade/position state and recreate
+        fresh portfolios from their configurations.
+
+        This is called before every isolated (algorithm, window) event
+        backtest run so that each run starts from a clean, freshly
+        capitalized portfolio instead of accumulating orders/trades
+        from prior windows or other algorithms that share the same
+        underlying SQL database.
+
+        Also resets ``LAST_SNAPSHOT_DATETIME`` -- otherwise the event
+        loop's snapshot-cadence guard (see ``EventLoopService``) thinks
+        a snapshot was already taken from a previous algorithm's/
+        window's run and skips taking a fresh one for this run.
+        """
+        from investing_algorithm_framework.domain import \
+            BACKTESTING_INITIAL_AMOUNT, LAST_SNAPSHOT_DATETIME
+        from investing_algorithm_framework.infrastructure.database \
+            .sql_alchemy import Session, SQLBaseModel
+        from investing_algorithm_framework.infrastructure.repositories \
+            .event_memory import event_memory_active
+
+        if not event_memory_active():
+            with Session() as db:
+                for table in reversed(SQLBaseModel.metadata.sorted_tables):
+                    db.execute(table.delete())
+                db.commit()
+
+        initial_amount = self._configuration_service.config.get(
+            BACKTESTING_INITIAL_AMOUNT, None
+        )
+        for pc in self._portfolio_configuration_service.get_all():
+            self._portfolio_service.create_portfolio_from_configuration(
+                pc, initial_amount=initial_amount
+            )
+
+        self._configuration_service.add_value(LAST_SNAPSHOT_DATETIME, None)
+
+    def run_backtests(
+        self,
+        algorithms: List,
+        context,
+        trade_stop_loss_service,
+        trade_take_profit_service,
+        backtest_date_range: BacktestDateRange = None,
+        backtest_date_ranges: List[BacktestDateRange] = None,
+        risk_free_rate: Optional[float] = None,
+        skip_data_sources_initialization: bool = False,
+        show_progress: bool = False,
+        continue_on_error: bool = False,
+        window_filter_function: Optional[
+            Callable[[List[Backtest], BacktestDateRange], List[Backtest]]
+        ] = None,
+        final_filter_function: Optional[
+            Callable[[List[Backtest]], List[Backtest]]
+        ] = None,
+        backtest_storage_directory: Optional[Union[str, Path]] = None,
+        use_checkpoints: bool = False,
+        force_rerun: bool = False,
+        on_checkpoint_match: Literal["skip", "rerun", "warn"] = "skip",
+        batch_size: int = 50,
+        checkpoint_batch_size: int = 25,
+        fill_missing_data: bool = True,
+        iterative_summary_update: bool = False,
+        blotter=None,
+        result_mode: Literal["list", "index"] = "list",
+        n_workers: Optional[int] = None,
+        max_tasks_per_child: Optional[int] = 16,
+        study: Optional[Study] = None,
+        prepare_backtest: Optional[Callable[[Backtest], None]] = None,
+        memory_budget_mb: Optional[int] = None,
+        min_available_memory_mb: Optional[int] = None,
+        window_metrics_filter_function: Optional[
+            Callable[[BacktestIndex, BacktestDateRange], BacktestIndex]
+        ] = None,
+        final_metrics_filter_function: Optional[
+            Callable[[BacktestIndex], BacktestIndex]
+        ] = None,
+        save_filled_data_points: bool = False,
+        signal_storage_directory=None,
+        hard_memory_limit_mb=None,
+        event_fill_backend='python',
+        event_schedule_backend='python',
+        event_state_backend='sql',
+    ) -> Union[List[Backtest], BacktestIndex]:
+        """
+        Run event-driven backtests with checkpointing and bounded workers.
+
+        This method mirrors run_vector_backtests but for event-driven
+        backtesting where strategies' `on_run` methods are called at
+        each scheduled time step.
+
+        Args:
+            algorithms: List of algorithms to backtest.
+            context: The app context for the event loop service.
+            trade_stop_loss_service: Service for handling stop loss orders.
+            trade_take_profit_service: Service for handling take profit orders.
+            backtest_date_range: Single backtest date range to use.
+            backtest_date_ranges: List of backtest date ranges to use.
+            risk_free_rate: Risk-free rate for backtest metrics.
+            skip_data_sources_initialization: Whether to skip data
+                source initialization.
+            show_progress: Whether to show progress bars.
+            continue_on_error: Whether to continue on errors.
+            window_filter_function: Filter function applied after each
+                date range.
+            final_filter_function: Filter function applied at the end.
+            backtest_storage_directory: Directory to store backtests.
+            use_checkpoints: Whether to use checkpointing to resume
+                interrupted backtests.
+            batch_size: Number of algorithms to process in each batch.
+            checkpoint_batch_size: Number of backtests before batch
+                save/checkpoint.
+            fill_missing_data: If True (default), missing time series data
+                entries will be filled automatically before running the
+                backtest. This ensures data continuity and prevents errors
+                when the data source has gaps.
+            iterative_summary_update: If True, update backtest_summary
+                after each window to enable window_filter_function to
+                access up-to-date summary metrics (default: False).
+            n_workers: None or 0 for sequential execution; positive values
+                bound isolated spawned workers. -1 selects an automatic cap.
+            max_tasks_per_child: Pool generation task limit; None disables
+                recycling. Parallel execution requires index results.
+
+        Returns:
+            List[Backtest]: List of backtest results.
+        """
+        from .event_backtest_service import EventBacktestService
+        from investing_algorithm_framework.app.eventloop import \
+            EventLoopService
+        from investing_algorithm_framework.services import (
+            BacktestTradeOrderEvaluator,
+        )
+
+        if result_mode not in ("list", "index"):
+            raise OperationalException(
+                "result_mode must be 'list' or 'index'."
+            )
+        if n_workers is not None and (
+            type(n_workers) is not int or n_workers < -1
+        ):
+            raise OperationalException(
+                "n_workers must be None, 0, -1, or a positive integer."
+            )
+        if n_workers == -1:
+            n_workers = min(max(multiprocessing.cpu_count() - 1, 1), 8)
+        if (
+            max_tasks_per_child is not None
+            and (
+                type(max_tasks_per_child) is not int
+                or max_tasks_per_child <= 0
+            )
+        ):
+            raise OperationalException(
+                "max_tasks_per_child must be a positive integer or None."
+            )
+        if n_workers and result_mode != "index":
+            raise OperationalException(
+                "Parallel event backtests require index results."
+            )
+        if result_mode == "index":
+            if (
+                backtest_storage_directory is None
+                or study is None
+            ):
+                raise OperationalException(
+                    "Event index results require a storage directory and "
+                    "Study."
+                )
+            if (
+                window_filter_function is not None
+                or final_filter_function is not None
+            ):
+                raise OperationalException(
+                    "Index results require metrics filters, not "
+                    "full-object backtest filters."
+                )
+            self._validate_algorithm_ids(algorithms=algorithms)
+        elif (
+            window_metrics_filter_function is not None
+            or final_metrics_filter_function is not None
+        ):
+            raise OperationalException(
+                "Metrics filters require index results."
+            )
+        for name, value in (
+            ("batch_size", batch_size),
+            ("checkpoint_batch_size", checkpoint_batch_size),
+            ("memory_budget_mb", memory_budget_mb),
+            ("min_available_memory_mb", min_available_memory_mb),
+        ):
+            if value is None and name.endswith("_mb"):
+                continue
+            if type(value) is not int or value <= 0:
+                raise OperationalException(
+                    f"{name} must be a positive integer."
+                )
+        for callback in (
+            prepare_backtest, window_metrics_filter_function,
+            final_metrics_filter_function,
+        ):
+            if callback is not None and not callable(callback):
+                raise OperationalException(
+                    "Backtest callbacks must be callable."
+                )
+        from .vector_resources import require_hard_memory_limit
+        require_hard_memory_limit(hard_memory_limit_mb)
+        if event_fill_backend not in ('python', 'rust', 'auto'):
+            raise ValueError('event_fill_backend must be python, rust or auto')
+        if event_fill_backend == 'rust':
+            from investing_algorithm_framework.services.trade_order_evaluator \
+                .native import load_native_event_fills
+            load_native_event_fills()
+        if event_schedule_backend not in ('python', 'rust', 'auto'):
+            raise ValueError(
+                'event_schedule_backend must be python, rust or auto'
+            )
+        if event_schedule_backend == 'rust':
+            from investing_algorithm_framework.app.native_schedule import \
+                load_native_schedule
+            load_native_schedule()
+        if event_state_backend not in ('sql', 'memory', 'rust'):
+            raise ValueError('event_state_backend must be sql, memory or rust')
+        if event_state_backend == 'rust':
+            from investing_algorithm_framework.domain.native_event import \
+                load_native_event_accounting
+            load_native_event_accounting()
+        memory_guard = MemoryGuard(
+            memory_budget_mb, min_available_memory_mb,
+        )
+        memory_guard.require()
+        index_rows_by_algorithm = {}
+        evaluated_ranges = set()
+
+        if use_checkpoints and backtest_storage_directory is None:
+            raise OperationalException(
+                "When using checkpoints, a backtest_storage_directory must "
+                "be provided"
+            )
+
+        if backtest_date_range is None and backtest_date_ranges is None:
+            raise OperationalException(
+                "Either backtest_date_range or backtest_date_ranges "
+                "must be provided"
+            )
+
+        # Collect all data sources from all algorithms
+        data_sources = []
+        for algorithm in algorithms:
+            if hasattr(algorithm, 'data_sources') and algorithm.data_sources:
+                data_sources.extend(algorithm.data_sources)
+
+        # Get risk-free rate if not provided
+        if risk_free_rate is None:
+            if show_progress:
+                _print_progress(
+                    "Retrieving risk free rate for metrics calculation ...",
+                    show_progress
+                )
+            risk_free_rate = self._get_risk_free_rate()
+            if show_progress:
+                _print_progress(
+                    f"Retrieved risk free rate of: {risk_free_rate}",
+                    show_progress
+                )
+
+        # Load checkpoint cache only if checkpointing is enabled
+        checkpoint_cache = {}
+        if use_checkpoints and backtest_storage_directory is not None:
+            checkpoint_cache = self._load_checkpoint_cache(
+                backtest_storage_directory
+            )
+
+        # Create session cache to track backtests run in this session
+        session_cache = None
+        if backtest_storage_directory is not None:
+            session_cache = self._create_session_cache()
+
+        # Handle single date range case - convert to list
+        if backtest_date_range is not None:
+            backtest_date_ranges = [backtest_date_range]
+
+        # Sort and deduplicate date ranges
+        unique_date_ranges = set(backtest_date_ranges)
+        backtest_date_ranges = sorted(
+            unique_date_ranges, key=lambda x: x.start_date
+        )
+
+        # Track all backtests across date ranges
+        # Use id(algorithm) as key to handle multiple algorithms
+        # with the same algorithm_id (each algorithm object is unique)
+        backtests_by_algorithm = {}
+        algorithm_id_map = {}  # Maps id(alg) -> algorithm_id for final output
+        active_algorithms = algorithms.copy()
+
+        # Build algorithm_id_map for tracking
+        for alg in algorithms:
+            alg_id = alg.algorithm_id if (
+                hasattr(alg, 'algorithm_id')
+            ) else alg.id
+            algorithm_id_map[id(alg)] = alg_id
+
+        # Determine if this is a simple single backtest case
+        is_single_backtest = (
+            len(algorithms) == 1 and len(backtest_date_ranges) == 1
+        )
+
+        for backtest_date_range in tqdm(
+            backtest_date_ranges,
+            colour="green",
+            desc="Running event backtests for all date ranges",
+            disable=not show_progress or is_single_backtest
+        ):
+            if not active_algorithms:
+                break
+            evaluated_ranges.add((
+                backtest_date_range.start_date, backtest_date_range.end_date,
+            ))
+            memory_guard.require()
+            if not skip_data_sources_initialization:
+                self.initialize_data_sources_backtest(
+                    data_sources,
+                    backtest_date_range,
+                    show_progress=show_progress,
+                    fill_missing_data=fill_missing_data,
+                    save_filled_data_points=save_filled_data_points,
+                )
+            memory_guard.require()
+
+            active_algorithm_ids = []
+            for alg in active_algorithms:
+                alg_id = alg.algorithm_id if hasattr(
+                    alg, 'algorithm_id'
+                ) else alg.id
+                active_algorithm_ids.append(alg_id)
+
+            start_date = backtest_date_range.start_date.strftime('%Y-%m-%d')
+            end_date = backtest_date_range.end_date.strftime('%Y-%m-%d')
+
+            # Only check for checkpoints if use_checkpoints is True
+            matched_ids = []
+            if use_checkpoints and force_rerun is not True:
+                _print_progress(
+                    "Using checkpoints to "
+                    "skip completed backtests ...",
+                    show_progress
+                )
+                algorithms_to_run, matched_ids = \
+                    self._select_items_to_rerun(
+                        active_algorithms,
+                        active_algorithm_ids,
+                        checkpoint_cache,
+                        backtest_date_range,
+                        force_rerun=force_rerun,
+                        on_checkpoint_match=on_checkpoint_match,
+                    )
+
+                verified_matched_ids = []
+                for algorithm_id in matched_ids:
+                    backtest_path = resolve_backtest_path(
+                        backtest_storage_directory, algorithm_id
+                    )
+                    if backtest_path is not None:
+                        persisted = Backtest.open(backtest_path)
+                        persisted_study = persisted.get_study(study.name)
+                        persisted_runs = (
+                            persisted_study.get_runs("event")
+                            if persisted_study is not None else []
+                        )
+                        if any(
+                            run.backtest_start_date
+                            == backtest_date_range.start_date
+                            and run.backtest_end_date
+                            == backtest_date_range.end_date
+                            for run in persisted_runs
+                        ):
+                            verified_matched_ids.append(algorithm_id)
+                            continue
+                    algorithms_to_run.append(next(
+                        algorithm for algorithm in active_algorithms
+                        if algorithm_id_map[id(algorithm)] == algorithm_id
+                    ))
+                matched_ids = verified_matched_ids
+
+                # Add matched (skipped) ids to session cache
+                if session_cache is not None:
+                    for algo_id in matched_ids:
+                        backtest_path = resolve_backtest_path(
+                            backtest_storage_directory, algo_id
+                        )
+                        if backtest_path is None:
+                            backtest_path = os.path.join(
+                                backtest_storage_directory,
+                                f"{algo_id}{BUNDLE_EXT}",
+                            )
+                        session_cache["backtests"][algo_id] = backtest_path
+
+                if matched_ids and on_checkpoint_match == "warn":
+                    logger.info(
+                        "Skipping %d algorithms with matching checkpoint "
+                        "for %s to %s.",
+                        len(matched_ids), start_date, end_date,
+                    )
+
+                if show_progress:
+                    _print_progress(
+                        f"Active algorithms: {len(active_algorithm_ids)}, "
+                        f"matched: {len(matched_ids)}, "
+                        f"running {len(algorithms_to_run)} backtests",
+                        show_progress
+                    )
+            else:
+                algorithms_to_run = active_algorithms
+
+            all_backtests = []
+            batch_buffer = []
+            completed_algorithm_ids = set()
+
+            def save_event_result(backtest):
+                if prepare_backtest is not None:
+                    prepare_backtest(backtest)
+                algorithm_id = backtest.algorithm_id
+                self._batch_save_and_checkpoint(
+                    [backtest], backtest_date_range,
+                    backtest_storage_directory, checkpoint_cache,
+                    session_cache=session_cache,
+                    write_index=False,
+                )
+                index_rows_by_algorithm[algorithm_id] = compact_rows(
+                    backtest, backtest_storage_directory, study.name,
+                    backtest_date_range, evaluated_ranges, engine="event",
+                )
+                completed_algorithm_ids.add(algorithm_id)
+                self._save_session_cache(
+                    session_cache, backtest_storage_directory,
+                )
+
+            if n_workers and algorithms_to_run:
+                settings = {
+                    "config": dict(self._configuration_service.config),
+                    "portfolios": (
+                        self._portfolio_configuration_service.get_all()
+                    ),
+                    "blotter": blotter,
+                    "risk_free_rate": risk_free_rate,
+                    "continue_on_error": continue_on_error,
+                    "memory_budget_mb": memory_budget_mb,
+                    "min_available_memory_mb": min_available_memory_mb,
+                    "signal_storage_directory": signal_storage_directory,
+                    "event_fill_backend": event_fill_backend,
+                    "event_schedule_backend": event_schedule_backend,
+                    "event_state_backend": event_state_backend,
+                }
+                with TemporaryDirectory(prefix="iaf-event-results-") as \
+                        result_directory, tqdm(
+                    total=len(algorithms_to_run),
+                    desc="Running event backtests", colour="green",
+                    disable=not show_progress,
+                ) as progress:
+                    settings["result_directory"] = result_directory
+
+                    def consume_event_results(paths):
+                        for path in paths:
+                            try:
+                                save_event_result(Backtest.open(path))
+                            finally:
+                                Path(path).unlink(missing_ok=True)
+                        progress.update(1)
+
+                    bounded_process_map(
+                        run_event_worker,
+                        (
+                            (algorithm, backtest_date_range)
+                            for algorithm in algorithms_to_run
+                        ),
+                        consume_event_results,
+                        initializer=initialize_event_worker,
+                        initargs=(
+                            self._data_provider_service.data_provider_index,
+                            settings,
+                        ),
+                        n_workers=n_workers,
+                        max_tasks_per_child=max_tasks_per_child,
+                        guard=memory_guard,
+                    )
+                memory_guard.require()
+            elif algorithms_to_run:
+                # Process algorithms in batches
+                algorithm_batches = [
+                    algorithms_to_run[i:i + batch_size]
+                    for i in range(0, len(algorithms_to_run), batch_size)
+                ]
+
+                if show_progress and len(algorithm_batches) > 1:
+                    _print_progress(
+                        f"Processing {len(algorithms_to_run)} "
+                        f"algorithms in "
+                        f"{len(algorithm_batches)} batches "
+                        f"of ~{batch_size} each",
+                        show_progress
+                    )
+
+                for batch_idx, algorithm_batch in enumerate(tqdm(
+                    algorithm_batches,
+                    colour="green",
+                    desc="Processing algorithm batches",
+                    disable=not show_progress or len(algorithm_batches) == 1
+                )):
+                    for algorithm in algorithm_batch:
+                        memory_guard.require()
+                        algorithm_id = (
+                            algorithm.algorithm_id
+                            if hasattr(algorithm, 'algorithm_id')
+                            else algorithm.id
+                        )
+
+                        recorder = None
+                        from contextlib import ExitStack
+                        state_scope = ExitStack()
+                        from investing_algorithm_framework.services \
+                            .backtest_store import StoreError
+                        try:
+                            if event_state_backend in ('memory', 'rust'):
+                                from investing_algorithm_framework \
+                                    .infrastructure.repositories.event_memory \
+                                    import event_memory_scope
+                                state_scope.enter_context(event_memory_scope(
+                                    accounting_backend=(
+                                        'rust' if event_state_backend == 'rust'
+                                        else 'python'),
+                                ))
+                            # Reset portfolio/order/trade/position state
+                            # before every isolated (algorithm, window) run
+                            # so this run starts from a clean, freshly
+                            # capitalized portfolio instead of accumulating
+                            # trades from prior windows or other algorithms
+                            # sharing this run.
+                            self._reset_event_backtest_state()
+
+                            # Create event backtest service
+                            event_backtest_service = EventBacktestService(
+                                data_provider_service=(
+                                    self._data_provider_service
+                                ),
+                                order_service=self._order_service,
+                                portfolio_service=self._portfolio_service,
+                                portfolio_snapshot_service=(
+                                    self._portfolio_snapshot_service
+                                ),
+                                position_repository=self._position_repository,
+                                trade_service=self._trade_service,
+                                configuration_service=(
+                                    self._configuration_service
+                                ),
+                                portfolio_configuration_service=(
+                                    self._portfolio_configuration_service
+                                ),
+                            )
+
+                            # Create event loop service
+                            event_loop_service = EventLoopService(
+                                configuration_service=(
+                                    self._configuration_service
+                                ),
+                                portfolio_snapshot_service=(
+                                    self._portfolio_snapshot_service
+                                ),
+                                context=context,
+                                order_service=self._order_service,
+                                portfolio_service=self._portfolio_service,
+                                data_provider_service=(
+                                    self._data_provider_service
+                                ),
+                                trade_service=self._trade_service,
+                            )
+
+                            # Create trade order evaluator
+                            pc_list = (
+                                self._portfolio_configuration_service
+                                .get_all()
+                            )
+                            pc = pc_list[0] if pc_list else None
+                            trade_order_evaluator = (
+                                BacktestTradeOrderEvaluator(
+                                    trade_service=self._trade_service,
+                                    order_service=self._order_service,
+                                    trade_stop_loss_service=(
+                                        trade_stop_loss_service
+                                    ),
+                                    trade_take_profit_service=(
+                                        trade_take_profit_service
+                                    ),
+                                    configuration_service=(
+                                        self._configuration_service
+                                    ),
+                                    trading_costs=getattr(
+                                        pc, 'trading_costs', None
+                                    ),
+                                    portfolio_configuration=pc,
+                                    blotter=blotter,
+                                    context=context,
+                                    event_fill_backend=event_fill_backend,
+                                )
+                            )
+
+                            # Generate schedule
+                            schedule = (
+                                event_backtest_service.generate_schedule(
+                                    algorithm.strategies,
+                                    algorithm.tasks,
+                                    backtest_date_range.start_date,
+                                    backtest_date_range.end_date
+                                )
+                            )
+
+                            # Initialize and run
+                            event_loop_service.initialize(
+                                algorithm=algorithm,
+                                trade_order_evaluator=trade_order_evaluator
+                            )
+                            if signal_storage_directory is not None:
+                                from investing_algorithm_framework.services \
+                                    .backtest_store.recording import (
+                                        SignalRecorder,
+                                    )
+                                recorder = SignalRecorder(
+                                    signal_storage_directory, engine='event',
+                                    metadata={
+                                        'algorithm_id': str(algorithm_id),
+                                        'start': start_date,
+                                        'end': end_date,
+                                    },
+                                )
+                                event_loop_service.signal_log = recorder
+                            event_loop_service.start(
+                                schedule=schedule,
+                                event_schedule_backend=event_schedule_backend,
+                                show_progress=show_progress,
+                                resource_check=(
+                                    memory_guard.check_periodically
+                                    if memory_guard.enabled else None
+                                ),
+                                snapshot_batch_size=256,
+                            )
+
+                            # Create backtest
+                            backtest = (
+                                event_backtest_service.create_backtest(
+                                    algorithm=algorithm,
+                                    backtest_date_range=backtest_date_range,
+                                    number_of_runs=(
+                                        event_loop_service.total_number_of_runs
+                                    ),
+                                    risk_free_rate=risk_free_rate,
+                                )
+                            )
+
+                            if recorder is not None:
+                                recorder.commit()
+                                for completed_run in backtest.event_runs:
+                                    completed_run.metadata.update(
+                                        signal_history=recorder.reference()
+                                    )
+
+                            # Add metadata
+                            if (hasattr(algorithm, 'metadata')
+                                    and algorithm.metadata):
+                                backtest.metadata = algorithm.metadata
+                            else:
+                                backtest.metadata = {}
+
+                            del event_loop_service, event_backtest_service
+                            del trade_order_evaluator, schedule
+
+                        except (MemoryError, BacktestResourceError):
+                            raise
+                        except (StoreError, OSError):
+                            raise
+                        except Exception as e:
+                            if continue_on_error:
+                                logger.error(
+                                    f"Error in backtest for "
+                                    f"{algorithm_id}: {e}"
+                                )
+                                continue
+                            else:
+                                raise
+
+                        finally:
+                            try:
+                                if recorder is not None:
+                                    recorder.__exit__(None, None, None)
+                            finally:
+                                state_scope.close()
+
+                        # Stamping and persistence failures must never be
+                        # treated as skippable strategy errors.
+                        if result_mode == "index":
+                            save_event_result(backtest)
+                            del backtest
+                        else:
+                            if prepare_backtest is not None:
+                                prepare_backtest(backtest)
+                            backtest._algorithm_obj_id = id(algorithm)
+                            all_backtests.append(backtest)
+                            batch_buffer.append(backtest)
+                            if backtest_storage_directory is not None:
+                                self._save_batch_if_full(
+                                    batch_buffer, checkpoint_batch_size,
+                                    backtest_date_range,
+                                    backtest_storage_directory,
+                                    checkpoint_cache, session_cache,
+                                )
+                        memory_guard.require()
+
+                    # Periodic garbage collection
+                    if (batch_idx + 1) % 5 == 0:
+                        gc.collect()
+
+                # Save remaining batch
+                if backtest_storage_directory is not None:
+                    self._save_remaining_batch(
+                        batch_buffer,
+                        backtest_date_range,
+                        backtest_storage_directory,
+                        checkpoint_cache,
+                        session_cache,
+                    )
+
+            if result_mode == "index":
+                for algorithm_id in matched_ids:
+                    memory_guard.require()
+                    backtest = Backtest.open(
+                        session_cache["backtests"][algorithm_id]
+                    )
+                    index_rows_by_algorithm[algorithm_id] = compact_rows(
+                        backtest, backtest_storage_directory, study.name,
+                        backtest_date_range, evaluated_ranges, engine="event",
+                    )
+                    del backtest
+                current_ids = completed_algorithm_ids | set(matched_ids)
+                index = make_index(
+                    backtest_storage_directory,
+                    [
+                        row for algorithm_id in active_algorithm_ids
+                        if algorithm_id in current_ids
+                        for row in index_rows_by_algorithm.get(
+                            algorithm_id, []
+                        )
+                    ],
+                )
+                if window_metrics_filter_function is not None:
+                    _print_progress(
+                        "Applying window metrics filter function ...",
+                        show_progress,
+                    )
+                    index = validated_filter(
+                        index, window_metrics_filter_function,
+                        backtest_date_range,
+                    )
+                    surviving_ids = set(index.df["algorithm_id"])
+                    mark_filtered(
+                        backtest_storage_directory, active_algorithm_ids,
+                        surviving_ids, backtest_date_range, memory_guard,
+                    )
+                    active_algorithms = [
+                        alg for alg in active_algorithms
+                        if algorithm_id_map[id(alg)] in surviving_ids
+                    ]
+                    index_rows_by_algorithm = {
+                        key: group.to_dict("records")
+                        for key, group in index.df.groupby(
+                            "algorithm_id", sort=False,
+                        )
+                    }
+                    session_cache["backtests"] = {
+                        key: value
+                        for key, value in session_cache["backtests"].items()
+                        if key in surviving_ids
+                    }
+                self._save_session_cache(
+                    session_cache, backtest_storage_directory,
+                )
+                persist_index(index)
+                del index
+                gc.collect()
+                memory_guard.require()
+                continue
+
+            # Store backtests in memory when no storage directory provided
+            if backtest_storage_directory is None:
+                for backtest in all_backtests:
+                    # Use algorithm object id if available,
+                    # otherwise algorithm_id
+                    key = (getattr(backtest, '_algorithm_obj_id', None)
+                           or backtest.algorithm_id)
+                    if key not in backtests_by_algorithm:
+                        backtests_by_algorithm[key] = []
+                    backtests_by_algorithm[key].append(backtest)
+
+            # Load checkpointed backtests that were SKIPPED (not run in this
+            # iteration) if needed for filtering. Only load backtests that
+            # were checkpointed from a previous session, not ones that were
+            # just run and checkpointed in this session.
+            if use_checkpoints and (window_filter_function is not None
+                                    or final_filter_function is not None):
+                # Get IDs of algorithms that were actually run in this
+                # iteration
+                run_algorithm_ids = set(
+                    (alg.algorithm_id if hasattr(alg, 'algorithm_id')
+                     else alg.id)
+                    for alg in algorithms_to_run
+                )
+                # Only load backtests that were SKIPPED
+                # (checkpointed, not run)
+                skipped_algorithm_ids = [
+                    algo_id for algo_id in active_algorithm_ids
+                    if algo_id not in run_algorithm_ids
+                ]
+
+                if len(skipped_algorithm_ids) > 0:
+                    checkpointed_backtests = self._load_backtests_from_cache(
+                        checkpoint_cache,
+                        backtest_date_range,
+                        backtest_storage_directory,
+                        skipped_algorithm_ids
+                    )
+                    all_backtests.extend(checkpointed_backtests)
+
+            # Iteratively update each engine's summary after each
+            # window so ``window_filter_function`` sees up-to-date
+            # per-engine summary metrics.
+            if iterative_summary_update:
+                for backtest in all_backtests:
+                    backtest.regenerate_summaries()
+
+            # Apply window filter function
+            if window_filter_function is not None:
+                if show_progress:
+                    _print_progress(
+                        "Applying window filter function ...",
+                        show_progress
+                    )
+                filtered_backtests = window_filter_function(
+                    all_backtests, backtest_date_range
+                )
+                filtered_ids = set(b.algorithm_id for b in filtered_backtests)
+                active_algorithms = [
+                    alg for alg in active_algorithms
+                    if (alg.algorithm_id if hasattr(alg, 'algorithm_id')
+                        else alg.id) in filtered_ids
+                ]
+
+                # Update tracking
+                if backtest_storage_directory is None:
+                    algorithms_to_remove = [
+                        alg_id for alg_id in backtests_by_algorithm.keys()
+                        if alg_id not in filtered_ids
+                    ]
+                    for alg_id in algorithms_to_remove:
+                        del backtests_by_algorithm[alg_id]
+                else:
+                    # When using storage, update filtered_out metadata
+                    algorithms_to_mark = [
+                        alg_id for alg_id in active_algorithm_ids
+                        if alg_id not in filtered_ids
+                    ]
+
+                    # Update session cache to only include filtered backtests
+                    if session_cache is not None:
+                        session_cache["backtests"] = {
+                            k: v for k, v in session_cache["backtests"].items()
+                            if k in filtered_ids
+                        }
+
+                    # Clear filtered_out flag for backtests that passed
+                    # the filter (they may have been filtered out before)
+                    for alg_id in filtered_ids:
+                        backtest_dir = resolve_backtest_path(
+                            backtest_storage_directory, alg_id
+                        )
+                        if backtest_dir is not None:
+                            try:
+                                backtest = Backtest.open(backtest_dir)
+                                if backtest.metadata is not None and \
+                                        backtest.metadata.get(
+                                            'filtered_out', False
+                                        ):
+                                    backtest.metadata['filtered_out'] = False
+                                    if 'filtered_out_at_date_range' in \
+                                            backtest.metadata:
+                                        del backtest.metadata[
+                                            'filtered_out_at_date_range'
+                                        ]
+                                    backtest.save(backtest_dir)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not clear filtered_out flag "
+                                    f"for backtest {alg_id}: {e}"
+                                )
+
+                    # Mark filtered-out backtests with metadata flag
+                    for alg_id in algorithms_to_mark:
+                        backtest_dir = resolve_backtest_path(
+                            backtest_storage_directory, alg_id
+                        )
+                        if backtest_dir is not None:
+                            try:
+                                backtest = Backtest.open(backtest_dir)
+                                start_date = backtest_date_range.start_date
+                                end_date = backtest_date_range.end_date
+                                date_key = (
+                                    f"{start_date.isoformat()}_"
+                                    f"{end_date.isoformat()}"
+                                )
+                                if backtest.metadata is None:
+                                    backtest.metadata = {}
+                                backtest.metadata['filtered_out'] = True
+                                backtest.metadata[
+                                    'filtered_out_at_date_range'
+                                ] = (
+                                    backtest_date_range.name
+                                    if backtest_date_range.name
+                                    else date_key
+                                )
+                                backtest.save(backtest_dir)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not mark backtest {alg_id} "
+                                    f"as filtered: {e}"
+                                )
+
+            # Clear memory
+            del all_backtests
+            del batch_buffer
+            gc.collect()
+
+        # Combine backtests
+        if show_progress:
+            _print_progress(
+                "Combining backtests across date ranges ...",
+                show_progress
+            )
+
+        active_algorithm_ids_final = set()
+        for alg in active_algorithms:
+            alg_id = alg.algorithm_id if hasattr(alg, 'algorithm_id') \
+                else alg.id
+            active_algorithm_ids_final.add(alg_id)
+
+        if result_mode == "index":
+            if window_metrics_filter_function is None:
+                index_rows_by_algorithm = {
+                    algorithm_id_map[id(alg)]: index_rows_by_algorithm.get(
+                        algorithm_id_map[id(alg)], [],
+                    ) for alg in active_algorithms
+                }
+            index = make_index(
+                backtest_storage_directory,
+                [
+                    row
+                    for algorithm_id, rows
+                    in index_rows_by_algorithm.items()
+                    if algorithm_id in active_algorithm_ids_final
+                    for row in rows
+                ],
+            )
+            if final_metrics_filter_function is not None:
+                index = validated_filter(index, final_metrics_filter_function)
+                mark_filtered(
+                    backtest_storage_directory, active_algorithm_ids_final,
+                    set(index.df["algorithm_id"]), backtest_date_ranges[-1],
+                    memory_guard,
+                )
+            survivor_ids = set(index.df["algorithm_id"])
+            session_cache["backtests"] = {
+                key: value for key, value in session_cache["backtests"].items()
+                if key in survivor_ids
+            }
+            self._save_session_cache(
+                session_cache, backtest_storage_directory,
+            )
+            persist_index(index)
+            memory_guard.require()
+            return index
+
+        loaded_from_storage = False
+        if backtest_storage_directory is not None:
+            # Save session cache to disk before final loading
+            if session_cache is not None:
+                self._save_session_cache(
+                    session_cache, backtest_storage_directory
+                )
+
+            # Load ONLY from session cache - this ensures we only get
+            # backtests from this run, not pre-existing ones
+            all_backtests = self._load_backtests_from_session(
+                session_cache,
+                active_algorithm_ids_final,
+                show_progress=show_progress
+            )
+            loaded_from_storage = True
+        else:
+            combined_backtests = []
+            for algorithm_id, backtests_list in backtests_by_algorithm.items():
+                if len(backtests_list) == 1:
+                    combined_backtests.append(backtests_list[0])
+                else:
+                    combined = combine_backtests(backtests_list)
+                    combined_backtests.append(combined)
+            all_backtests = combined_backtests
+
+        # Generate summary metrics (per engine, independently)
+        for backtest in tqdm(
+            all_backtests,
+            colour="green",
+            desc="Generating backtest summary metrics",
+            disable=not show_progress
+        ):
+            backtest.regenerate_summaries()
+
+        # Apply final filter function
+        if final_filter_function is not None:
+            if show_progress:
+                _print_progress(
+                    "Applying final filter function ...",
+                    show_progress
+                )
+            all_backtests = final_filter_function(all_backtests)
+
+        # Save if not loaded from storage
+        if (backtest_storage_directory is not None
+                and not loaded_from_storage):
+            save_backtests_to_directory(
+                backtests=all_backtests,
+                directory_path=backtest_storage_directory,
+                show_progress=show_progress
+            )
+
+        # Cleanup session file at the end
+        if backtest_storage_directory is not None:
+            session_file = os.path.join(
+                backtest_storage_directory, "backtest_session.json"
+            )
+            if os.path.exists(session_file):
+                os.remove(session_file)
+
+        return all_backtests
+
+    def run_backtest(
+        self,
+        algorithm,
+        backtest_date_range: BacktestDateRange,
+        context,
+        trade_stop_loss_service,
+        trade_take_profit_service,
+        backtest_date_ranges: List[BacktestDateRange] = None,
+        risk_free_rate: Optional[float] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        skip_data_sources_initialization: bool = False,
+        backtest_storage_directory: Optional[Union[str, Path]] = None,
+        use_checkpoints: bool = False,
+        show_progress: bool = False,
+        initial_amount: float = None,
+        market: str = None,
+        trading_symbol: str = None,
+        fill_missing_data: bool = True,
+        blotter=None,
+    ) -> tuple:
+        """
+        Run an event-driven backtest for a single algorithm.
+
+        This method leverages the run_backtests implementation,
+        providing the same features (checkpointing, storage) for
+        single algorithm backtests.
+
+        Args:
+            algorithm: The algorithm to backtest.
+            backtest_date_range: Single backtest date range to use.
+            context: The app context for the event loop service.
+            trade_stop_loss_service: Service for handling stop loss orders.
+            trade_take_profit_service: Service for handling take profit orders.
+            backtest_date_ranges: List of backtest date ranges to use.
+                If provided, algorithm will be backtested across all date
+                ranges and results will be combined.
+            risk_free_rate: The risk-free rate for calculating metrics.
+            metadata: Metadata to attach to the backtest report.
+            skip_data_sources_initialization: Whether to skip data source
+                initialization.
+            backtest_storage_directory: Directory to save the backtest to.
+            use_checkpoints: Whether to use checkpointing.
+            show_progress: Whether to show progress bars.
+            initial_amount: Initial amount (for compatibility, not used here
+                as algorithm already has portfolio config).
+            market: Market (for compatibility).
+            trading_symbol: Trading symbol (for compatibility).
+            fill_missing_data: If True (default), missing time series data
+                entries will be filled automatically before running the
+                backtest. This ensures data continuity and prevents errors
+                when the data source has gaps.
+
+        Returns:
+            Tuple[Backtest, Dict]: A tuple containing:
+                - Backtest: Instance of Backtest containing the results.
+                - Dict: Empty dict (for compatibility with event loop history).
+        """
+        # Use run_backtests with single algorithm
+        backtests = self.run_backtests(
+            algorithms=[algorithm],
+            context=context,
+            trade_stop_loss_service=trade_stop_loss_service,
+            trade_take_profit_service=trade_take_profit_service,
+            backtest_date_range=backtest_date_range,
+            backtest_date_ranges=backtest_date_ranges,
+            risk_free_rate=risk_free_rate,
+            skip_data_sources_initialization=skip_data_sources_initialization,
+            show_progress=show_progress,
+            continue_on_error=False,
+            backtest_storage_directory=backtest_storage_directory,
+            use_checkpoints=use_checkpoints,
+            fill_missing_data=fill_missing_data,
+            blotter=blotter,
+        )
+
+        # Extract the single backtest result
+        if backtests and len(backtests) > 0:
+            backtest = backtests[0]
+
+            # Add metadata if provided
+            if metadata is not None:
+                backtest.metadata = metadata
+            elif backtest.metadata is None:
+                if hasattr(algorithm, 'metadata') and algorithm.metadata:
+                    backtest.metadata = algorithm.metadata
+                else:
+                    backtest.metadata = {}
+
+            return backtest, {}
+        else:
+            # Return empty backtest if no results. v9.0 represents
+            # "empty event backtest" as an empty event_runs list.
+            algorithm_id = (
+                algorithm.algorithm_id
+                if hasattr(algorithm, 'algorithm_id')
+                else algorithm.id
+            )
+            return Backtest(
+                algorithm_id=algorithm_id,
+                metadata=metadata or {},
+            ), {}
+
+    def create_ohlcv_permutation(
+        self,
+        data: Union[pd.DataFrame, pl.DataFrame],
+        start_index: int = 0,
+        seed: int | None = None,
+    ) -> Union[pd.DataFrame, pl.DataFrame]:
+        """
+        Create a permuted OHLCV dataset by shuffling relative price moves.
+
+        Args:
+            data: A single OHLCV DataFrame (pandas or polars)
+                with columns ['Open', 'High', 'Low', 'Close', 'Volume'].
+                For pandas: Datetime can be either
+                index or a 'Datetime' column. For polars: Datetime
+                must be a 'Datetime' column.
+            start_index: Index at which the permutation should begin
+                (bars before remain unchanged).
+            seed: Random seed for reproducibility.
+
+        Returns:
+            DataFrame of the same type (pandas or polars) with
+                permuted OHLCV values, preserving the datetime
+                structure (index vs column) of the input.
+        """
+
+        if start_index < 0:
+            raise OperationalException("start_index must be >= 0")
+
+        if seed is None:
+            seed = np.random.randint(0, 1_000_000)
+
+        np.random.seed(seed)
+        is_polars = isinstance(data, pl.DataFrame)
+
+        # Normalize input to pandas
+        if is_polars:
+            has_datetime_col = "Datetime" in data.columns
+            ohlcv_pd = data.to_pandas().copy()
+            if has_datetime_col:
+                time_index = pd.to_datetime(ohlcv_pd["Datetime"])
+            else:
+                time_index = np.arange(len(ohlcv_pd))
+        else:
+            has_datetime_col = "Datetime" in data.columns
+            if isinstance(data.index, pd.DatetimeIndex):
+                time_index = data.index
+            elif has_datetime_col:
+                time_index = pd.to_datetime(data["Datetime"])
+            else:
+                time_index = np.arange(len(data))
+            ohlcv_pd = data.copy()
+
+        # Prepare data
+        n_bars = len(ohlcv_pd)
+        perm_index = start_index + 1
+        perm_n = n_bars - perm_index
+
+        # Ensure all OHLCV values are positive before taking log
+        # Replace non-positive values with NaN and forward fill
+        ohlcv_cols = ["Open", "High", "Low", "Close"]
+        for col in ohlcv_cols:
+            ohlcv_pd.loc[ohlcv_pd[col] <= 0, col] = np.nan
+
+        # Forward fill NaN values to maintain data continuity
+        ohlcv_pd[ohlcv_cols] = ohlcv_pd[ohlcv_cols].ffill()
+
+        # If there are still NaN values at the start, backward fill
+        ohlcv_pd[ohlcv_cols] = ohlcv_pd[ohlcv_cols].bfill()
+
+        # If all values are still invalid, raise an error
+        if ohlcv_pd[ohlcv_cols].isna().any().any():
+            raise ValueError(
+                "OHLCV data contains invalid (zero or negative) values "
+                "that cannot be processed"
+            )
+
+        log_bars = np.log(ohlcv_pd[ohlcv_cols])
+
+        # Start bar
+        start_bar = log_bars.iloc[start_index].to_numpy()
+
+        # Relative series
+        rel_open = (log_bars["Open"] - log_bars["Close"].shift()).to_numpy()
+        rel_high = (log_bars["High"] - log_bars["Open"]).to_numpy()
+        rel_low = (log_bars["Low"] - log_bars["Open"]).to_numpy()
+        rel_close = (log_bars["Close"] - log_bars["Open"]).to_numpy()
+
+        # Shuffle independently
+        idx = np.arange(perm_n)
+        rel_high = rel_high[perm_index:][np.random.permutation(idx)]
+        rel_low = rel_low[perm_index:][np.random.permutation(idx)]
+        rel_close = rel_close[perm_index:][np.random.permutation(idx)]
+        rel_open = rel_open[perm_index:][np.random.permutation(idx)]
+
+        # Build permuted OHLC
+        perm_bars = np.zeros((n_bars, 4))
+        perm_bars[:start_index] = log_bars.iloc[:start_index].to_numpy()
+        perm_bars[start_index] = start_bar
+
+        for i in range(perm_index, n_bars):
+            k = i - perm_index
+            perm_bars[i, 0] = perm_bars[i - 1, 3] + rel_open[k]   # Open
+            perm_bars[i, 1] = perm_bars[i, 0] + rel_high[k]       # High
+            perm_bars[i, 2] = perm_bars[i, 0] + rel_low[k]        # Low
+            perm_bars[i, 3] = perm_bars[i, 0] + rel_close[k]      # Close
+
+        perm_bars = np.exp(perm_bars)
+
+        # Rebuild OHLCV
+        perm_df = pd.DataFrame(
+            perm_bars,
+            columns=["Open", "High", "Low", "Close"],
+        )
+        perm_df["Volume"] = ohlcv_pd["Volume"].values
+
+        # Restore datetime structure
+        if is_polars:
+            if has_datetime_col:
+                perm_df.insert(0, "Datetime", time_index)
+            return pl.from_pandas(perm_df)
+        else:
+            if isinstance(data.index, pd.DatetimeIndex):
+                perm_df.index = time_index
+                perm_df.index.name = data.index.name or "Datetime"
+            elif has_datetime_col:
+                perm_df.insert(0, "Datetime", time_index)
+            return perm_df

@@ -1,0 +1,346 @@
+from investing_algorithm_framework import BacktestRunConfiguration
+import os
+import sys
+import unittest
+from io import StringIO
+from tempfile import TemporaryDirectory
+from itertools import product
+import pandas as pd
+from datetime import datetime, timedelta, timezone
+from unittest import TestCase
+from typing import Dict, Any
+
+from pyindicators import ema, rsi, crossover, crossunder
+
+from investing_algorithm_framework import TradingStrategy, DataSource, \
+    TimeUnit, DataType, create_app, BacktestDateRange, PositionSize, \
+    RESOURCE_DIRECTORY, DATA_DIRECTORY, SnapshotInterval, BacktestIndex, \
+    generate_algorithm_id, Schedule, Study, \
+    Universe, BacktestWindow, BacktestEngine, SignalSide, \
+    signal_series_from_column
+
+
+class RSIEMACrossoverStrategy(TradingStrategy):
+    schedule = Schedule.every(2, TimeUnit.HOUR)
+    def __init__(
+        self,
+        algorithm_id,
+        symbols,
+        position_sizes,
+        schedule: Schedule,
+        market: str,
+        rsi_time_frame: str,
+        rsi_period: int,
+        rsi_overbought_threshold,
+        rsi_oversold_threshold,
+        ema_time_frame,
+        ema_short_period,
+        ema_long_period,
+        ema_cross_lookback_window: int = 10
+    ):
+        self.rsi_time_frame = rsi_time_frame
+        self.rsi_period = rsi_period
+        self.rsi_result_column = f"rsi_{self.rsi_period}"
+        self.rsi_overbought_threshold = rsi_overbought_threshold
+        self.rsi_oversold_threshold = rsi_oversold_threshold
+        self.ema_time_frame = ema_time_frame
+        self.ema_short_result_column = f"ema_{ema_short_period}"
+        self.ema_long_result_column = f"ema_{ema_long_period}"
+        self.ema_crossunder_result_column = "ema_crossunder"
+        self.ema_crossover_result_column = "ema_crossover"
+        self.ema_short_period = ema_short_period
+        self.ema_long_period = ema_long_period
+        self.ema_cross_lookback_window = ema_cross_lookback_window
+
+        # Create data sources BEFORE calling super().__init__()
+        data_sources = []
+        for symbol in symbols:
+            full_symbol = f"{symbol}/EUR"
+            data_sources.append(
+                DataSource(
+                    identifier=f"{symbol}_rsi_data",
+                    data_type=DataType.OHLCV,
+                    time_frame=self.rsi_time_frame,
+                    market=market,
+                    symbol=full_symbol,
+                    pandas=True,
+                    save=True
+                )
+            )
+            data_sources.append(
+                DataSource(
+                    identifier=f"{symbol}_ema_data",
+                    data_type=DataType.OHLCV,
+                    time_frame=self.ema_time_frame,
+                    market=market,
+                    symbol=full_symbol,
+                    pandas=True,
+                    save=True
+                )
+            )
+
+        super().__init__(
+            algorithm_id=algorithm_id,
+            data_sources=data_sources,
+            schedule=schedule,
+            symbols=symbols,
+            position_sizes=position_sizes
+        )
+
+    def prepare_indicators(
+        self,
+        rsi_data,
+        ema_data
+    ):
+        ema_data = ema(
+            ema_data,
+            period=self.ema_short_period,
+            source_column="Close",
+            result_column=self.ema_short_result_column
+        )
+        ema_data = ema(
+            ema_data,
+            period=self.ema_long_period,
+            source_column="Close",
+            result_column=self.ema_long_result_column
+        )
+        # Detect crossover (short EMA crosses above long EMA)
+        ema_data = crossover(
+            ema_data,
+            first_column=self.ema_short_result_column,
+            second_column=self.ema_long_result_column,
+            result_column=self.ema_crossover_result_column
+        )
+        # Detect crossunder (short EMA crosses below long EMA)
+        ema_data = crossunder(
+            ema_data,
+            first_column=self.ema_short_result_column,
+            second_column=self.ema_long_result_column,
+            result_column=self.ema_crossunder_result_column
+        )
+        rsi_data = rsi(
+            rsi_data,
+            period=self.rsi_period,
+            source_column="Close",
+            result_column=self.rsi_result_column
+        )
+
+        return ema_data, rsi_data
+
+    def generate_signal_series(self, data: Dict[str, Any]):
+        """
+        Generate buy/sell signal series based on the RSI + EMA crossover.
+        """
+        for symbol in self.symbols:
+            ema_data_identifier = f"{symbol}_ema_data"
+            rsi_data_identifier = f"{symbol}_rsi_data"
+            ema_data, rsi_data = self.prepare_indicators(
+                data[ema_data_identifier].copy(),
+                data[rsi_data_identifier].copy()
+            )
+
+            # crossover confirmed
+            ema_crossover_lookback = ema_data[
+                self.ema_crossover_result_column].rolling(
+                window=self.ema_cross_lookback_window
+            ).max().astype(bool)
+
+            # use only RSI column
+            rsi_oversold = rsi_data[self.rsi_result_column] \
+                < self.rsi_oversold_threshold
+
+            # Combine both conditions
+            buy_signal = rsi_oversold & ema_crossover_lookback
+            buy_signal = buy_signal.fillna(False).astype(bool)
+
+            # Confirmed by crossover between short-term EMA and long-term EMA
+            # within a given lookback window
+            ema_crossunder_lookback = ema_data[
+                self.ema_crossunder_result_column].rolling(
+                window=self.ema_cross_lookback_window
+            ).max().astype(bool)
+
+            # use only RSI column
+            rsi_overbought = rsi_data[self.rsi_result_column] \
+               >= self.rsi_overbought_threshold
+
+            # Combine both conditions
+            sell_signal = rsi_overbought & ema_crossunder_lookback
+            sell_signal = sell_signal.fillna(False).astype(bool)
+
+            buy_df = pd.DataFrame({"_buy_signal": buy_signal})
+            sell_df = pd.DataFrame({"_sell_signal": sell_signal})
+            yield signal_series_from_column(
+                buy_df, "_buy_signal",
+                side=SignalSide.OPEN_LONG, symbol=symbol,
+                source="test_fixture",
+            )
+            yield signal_series_from_column(
+                sell_df, "_sell_signal",
+                side=SignalSide.CLOSE_LONG, symbol=symbol,
+                source="test_fixture",
+            )
+
+class Test(TestCase):
+
+    @staticmethod
+    def filter_function_with_closed_trades(
+        backtests, backtest_date_range: BacktestDateRange
+    ):
+        """
+        Filter function that only keeps backtests with at least one closed trade.
+        """
+        return backtests.filter(
+            lambda row: row["window_number_of_trades_closed"] > 0,
+        )
+
+    @staticmethod
+    def filter_function_with_ranking(
+        backtests
+    ):
+        """
+        Filter function that only keeps backtests with at least one closed trade.
+        """
+        if backtests.df.empty:
+            return backtests
+        return BacktestIndex(
+            backtests.directory,
+            backtests.df.sort_values("summary.total_net_gain", ascending=False),
+        )
+
+    def test_run_with_show_output(self):
+        """
+        Test run_vector_backtests with a filter_function that filters
+        strategies based on whether they have closed trades.
+        """
+        storage = TemporaryDirectory()
+        self.addCleanup(storage.cleanup)
+        param_grid = {
+            "rsi_time_frame": ["2h"],
+            "rsi_period": [14],
+            "rsi_overbought_threshold": [70],
+            "rsi_oversold_threshold": [30],
+            "ema_time_frame": ["2h"],
+            "ema_short_period": [100],
+            "ema_long_period": [150, 200],
+            "ema_cross_lookback_window": [4]
+        }
+        param_options = param_grid
+        param_variations = [
+            dict(zip(param_options.keys(), values))
+            for values in product(*param_options.values())
+        ]
+
+        # RESOURCE_DIRECTORY should always point to the parent directory/resources
+        # Resource directory should point to /tests/resources
+        # Resource directory is two levels up from the current file
+        resource_directory = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), '..', 'resources'
+        )
+        config = {RESOURCE_DIRECTORY: resource_directory, DATA_DIRECTORY: "test_data/ohlcv"}
+        app = create_app(name="GoldenCrossStrategy", config=config)
+        app.add_market(market="BITVAVO", trading_symbol="EUR", initial_balance=400)
+        end_date = datetime(2024, 12, 2, tzinfo=timezone.utc)
+        start_date = end_date - timedelta(days=60)
+
+        # Split into multiple date ranges to test progressive filtering
+        mid_date = start_date + timedelta(days=30)
+        date_range_1 = BacktestDateRange(
+            start_date=start_date, end_date=end_date, name="Period 1"
+        )
+        date_range_2 = BacktestDateRange(
+            start_date=mid_date, end_date=end_date, name="Period 2"
+        )
+        strategies = []
+        for param_set in param_variations:
+            strategies.append(
+                RSIEMACrossoverStrategy(
+                    algorithm_id=generate_algorithm_id(params=param_set),
+                    schedule=Schedule.every(2, TimeUnit.HOUR),
+                    market="BITVAVO",
+                    rsi_time_frame=param_set["rsi_time_frame"],
+                    rsi_period=param_set["rsi_period"],
+                    rsi_overbought_threshold=param_set[
+                        "rsi_overbought_threshold"
+                    ],
+                    rsi_oversold_threshold=param_set[
+                        "rsi_oversold_threshold"
+                    ],
+                    ema_time_frame=param_set["ema_time_frame"],
+                    ema_short_period=param_set["ema_short_period"],
+                    ema_long_period=param_set["ema_long_period"],
+                    ema_cross_lookback_window=param_set[
+                        "ema_cross_lookback_window"
+                    ],
+                    symbols=["BTC"],
+                    position_sizes=[
+                        PositionSize(
+                            symbol="BTC", percentage_of_portfolio=20.0
+                        )
+                    ]
+                )
+            )
+
+        # Capture stdout to get all print statements
+        captured_output = StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured_output
+
+        study = Study(
+            universe=Universe(market="BITVAVO", trading_symbol="EUR"),
+            initial_capital=1000,
+            risk_free_rate=0.027,
+            backtest_windows=[
+                BacktestWindow(train_range=date_range_1),
+                BacktestWindow(train_range=date_range_2),
+            ],
+            engines=[BacktestEngine.VECTOR],
+        )
+
+        try:
+            backtests = app.run_backtests(
+                strategies=strategies,
+                study=study,
+                window_metrics_filter_function=(
+                    self.filter_function_with_closed_trades
+                ),
+                final_metrics_filter_function=self.filter_function_with_ranking,
+                run_configuration=BacktestRunConfiguration(
+                    snapshot_interval=SnapshotInterval.DAILY,
+                    use_checkpoints=True,
+                    backtest_storage_directory=storage.name,
+                    show_progress=True,
+                    n_workers=2,
+                ),
+            )
+        finally:
+            # Restore stdout
+            sys.stdout = old_stdout
+
+        # Get the captured output as a string
+        output = captured_output.getvalue()
+
+        # Verify that checkpointing message appears (either the checkpoint
+        # status message or new backtests running message)
+        self.assertTrue(
+            "Using checkpoints to skip completed backtests" in output or
+            "Active strategies:" in output or
+            "Running" in output
+        )
+
+        # Check for either the checkpoint status message (if checkpoints exist)
+        # or a message about running backtests (if no checkpoints)
+        has_checkpoint_message = "Active strategies:" in output
+        has_running_message = "Running" in output and "backtests" in output
+        self.assertTrue(
+            has_checkpoint_message or has_running_message,
+            f"Expected checkpoint or running message in output. Got: {output[:500]}"
+        )
+
+        self.assertTrue(
+            "Applying window metrics filter function" in output
+        )
+
+        self.assertTrue(
+            (backtests.directory / "backtest_session_index.parquet").is_file()
+        )

@@ -1,0 +1,181 @@
+class TradingCost:
+    """
+    A cost model for trading a specific symbol.
+
+    Defines the fee and slippage that apply when buying or selling
+    an asset during backtests. Per-symbol overrides are configured on
+    ``PortfolioConfiguration.trading_costs`` (live/paper trading, via
+    ``app.add_market(trading_costs=[...])``) or on
+    ``Study.execution_config`` (backtests, via
+    ``ExecutionConfig(trading_costs=[...])``) — a ``TradingCost`` with
+    ``symbol=None`` in either list applies as the default for any
+    symbol without its own entry. Market-wide defaults (one flat
+    fee/slippage pair for every symbol) are set directly on
+    ``PortfolioConfiguration`` via ``fee_percentage``/
+    ``slippage_percentage``.
+
+    Slippage can be specified either as a flat percentage
+    (``slippage_percentage``) or via a pluggable ``slippage_model``
+    (e.g. ``VolumeShareSlippage``, ``FixedBasisPointsSlippage``).
+    When both are provided, ``slippage_model`` takes precedence.
+
+    Attributes:
+        symbol (str): The target symbol this cost applies to
+            (e.g. "BTC"). Use ``None`` for market-level defaults.
+        fee_percentage (float): Fee as a percentage of trade value.
+            Default 0.0. Example: 0.1 means 0.1 % fee.
+        slippage_percentage (float): Slippage as a percentage of
+            price. Default 0.0. Buy fills higher, sell fills lower.
+        fee_fixed (float): Fixed fee per trade in the trading
+            currency. Default 0.0.
+        slippage_model: Optional pluggable ``SlippageModel`` instance.
+            When set, overrides ``slippage_percentage``.
+    """
+
+    def __init__(
+        self,
+        symbol=None,
+        fee_percentage=0.0,
+        slippage_percentage=0.0,
+        fee_fixed=0.0,
+        slippage_model=None,
+    ):
+        self.symbol = symbol.upper() if symbol else None
+        self.fee_percentage = fee_percentage
+        self.slippage_percentage = slippage_percentage
+        self.fee_fixed = fee_fixed
+        self.slippage_model = slippage_model
+
+    def get_buy_fill_price(self, price, amount=None, volume=None):
+        """Return the slippage-adjusted buy fill price."""
+        if self.slippage_model is not None:
+            return self.slippage_model.calculate_slippage(
+                price, "BUY", amount=amount, volume=volume,
+            )
+        return price * (1 + self.slippage_percentage / 100)
+
+    def get_sell_fill_price(self, price, amount=None, volume=None):
+        """Return the slippage-adjusted sell fill price."""
+        if self.slippage_model is not None:
+            return self.slippage_model.calculate_slippage(
+                price, "SELL", amount=amount, volume=volume,
+            )
+        return price * (1 - self.slippage_percentage / 100)
+
+    def get_max_fill_amount(self, order_amount, volume=None):
+        """Return the maximum fillable amount for this bar.
+
+        Delegates to the slippage model's ``max_fill_amount`` when
+        a model is configured; otherwise returns the full
+        ``order_amount`` (no volume limit).
+        """
+        if self.slippage_model is not None:
+            return self.slippage_model.max_fill_amount(
+                order_amount, volume=volume,
+            )
+        return order_amount
+
+    def get_fee(self, trade_value):
+        """Return the fee for a given trade value."""
+        return trade_value * self.fee_percentage / 100 + self.fee_fixed
+
+    def to_dict(self):
+        """Return a JSON-friendly dict snapshot of this cost model.
+
+        Used by :class:`ExecutionConfig` to persist the per-symbol
+        cost configuration into a backtest bundle. Any attached
+        :class:`SlippageModel` is nested via its own ``to_dict()``.
+        """
+        return {
+            "symbol": self.symbol,
+            "fee_percentage": self.fee_percentage,
+            "slippage_percentage": self.slippage_percentage,
+            "fee_fixed": self.fee_fixed,
+            "slippage_model": (
+                self.slippage_model.to_dict()
+                if self.slippage_model is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data):
+        """Reconstruct a :class:`TradingCost` from :meth:`to_dict`
+        output. Returns ``None`` for ``None`` input."""
+        if data is None:
+            return None
+        # Local import to avoid a circular import with the domain
+        # blotter module.
+        from investing_algorithm_framework.domain.blotter \
+            import SlippageModel
+
+        sm_raw = data.get("slippage_model")
+        slippage_model = (
+            SlippageModel.from_dict(sm_raw) if sm_raw is not None else None
+        )
+        return cls(
+            symbol=data.get("symbol"),
+            fee_percentage=data.get("fee_percentage", 0.0) or 0.0,
+            slippage_percentage=data.get("slippage_percentage", 0.0) or 0.0,
+            fee_fixed=data.get("fee_fixed", 0.0) or 0.0,
+            slippage_model=slippage_model,
+        )
+
+    @staticmethod
+    def resolve(symbol, trading_costs, portfolio_configuration=None):
+        """
+        Resolve the effective TradingCost for *symbol*.
+
+        Priority:
+            1. Symbol-specific TradingCost in *trading_costs* (from
+               ``PortfolioConfiguration.trading_costs`` or
+               ``Study.execution_config.trading_costs``)
+            2. A ``TradingCost(symbol=None, ...)`` default entry in
+               *trading_costs*, if any (applies to any symbol without
+               its own entry)
+            3. Market-level fee/slippage defaults from
+               PortfolioConfiguration
+            4. Zero-cost fallback
+
+        Args:
+            symbol: Target symbol (e.g. "BTC").
+            trading_costs: List[TradingCost] configured on the market
+                (``PortfolioConfiguration.trading_costs``) or on the
+                backtest Study (``Study.execution_config.trading_costs``).
+            portfolio_configuration: Optional PortfolioConfiguration
+                with market-level fee/slippage defaults.
+
+        Returns:
+            TradingCost instance to use.
+        """
+        if trading_costs:
+            symbol_upper = symbol.upper() if symbol else symbol
+            default_tc = None
+            for tc in trading_costs:
+                if tc.symbol == symbol_upper:
+                    return tc
+                if tc.symbol is None:
+                    default_tc = tc
+            if default_tc is not None:
+                return default_tc
+
+        # Fall back to market-level defaults
+        if portfolio_configuration is not None:
+            fee_pct = getattr(
+                portfolio_configuration, 'fee_percentage', 0.0
+            ) or 0.0
+            slip_pct = getattr(
+                portfolio_configuration, 'slippage_percentage', 0.0
+            ) or 0.0
+
+            if fee_pct or slip_pct:
+                return TradingCost(
+                    symbol=symbol,
+                    fee_percentage=fee_pct,
+                    slippage_percentage=slip_pct,
+                )
+
+        return _ZERO_COST
+
+
+# Singleton zero-cost instance (avoids allocations)
+_ZERO_COST = TradingCost()

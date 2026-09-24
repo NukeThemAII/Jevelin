@@ -1,0 +1,199 @@
+from investing_algorithm_framework.domain.models.base_model import BaseModel
+from .decision_trace import normalize_trace_metadata
+
+
+def _normalize_decision_traces(records):
+    normalized = []
+    for record in records or []:
+        if "decision_trace" in record or "score_card" in record:
+            normalized.append(normalize_trace_metadata(record))
+        else:
+            normalized.append(normalize_trace_metadata({
+                "decision_trace": record,
+            })["decision_trace"])
+    return normalized
+
+
+def _normalize_metadata_records(records):
+    return [
+        {**record, "metadata": normalize_trace_metadata(record["metadata"])}
+        if isinstance(record.get("metadata"), dict) else dict(record)
+        for record in records or []
+    ]
+
+
+def _normalize_signal_reports(reports):
+    normalized = []
+    for report in reports or []:
+        traces = _normalize_decision_traces(report.get(
+            "decision_traces", report.get("score_cards", []),
+        ))
+        normalized.append({
+            **report,
+            "signals": _normalize_metadata_records(report.get("signals")),
+            "decision_traces": traces,
+            "score_cards": traces,
+        })
+    return normalized
+
+
+class RunReport(BaseModel):
+    """Persisted outcome of a bounded invocation or continuous execution tick.
+
+    No-signal strategy executions are completed runs. Failed and skipped
+    executions carry explicit outcomes rather than reusing an earlier report.
+
+    Attributes:
+        id: Identifier assigned once the report is persisted. None
+            for a report that has not been saved yet.
+        status: "completed", "failed", or "skipped". Legacy reports default
+            to "completed".
+        error: Error text for a failed execution, otherwise None.
+        reason: Outcome reason, such as "algorithm_disabled" or
+            "execution_error".
+        algorithm_id: The id of the algorithm that produced this run,
+            so reports from multiple bots sharing one database can be
+            told apart.
+        environment: The environment the run executed in (e.g.
+            "prod", "test"), read from the app configuration.
+        is_paper: True when every portfolio configured for this run is
+            paper-traded, False otherwise (including mixed live/paper
+            setups) — lets a caller avoid ever mistaking fake paper
+            trades for real ones.
+        number_of_iterations: The bounded iteration count passed to
+            ``App.run()`` for this invocation.
+        started_at: When this invocation began.
+        completed_at: When this invocation finished, including failure/skip.
+        orders: Orders created during this run, most-recent last. Each
+            order dict already carries its own ``strategy_id``.
+            Includes new orders, orders whose status changed this run
+            (e.g. filled/canceled), and any order still pending at the
+            venue regardless of when it was created — a still-open
+            limit order keeps appearing in every report until it
+            finally resolves.
+        signals: Per-strategy, per-tick signal outcomes — every signal
+            the strategy emitted this run, whether it turned into an
+            order ("approved") or was dropped ("rejected", with the
+            reason from the phase pipeline that dropped it). Each
+            entry also carries a "decision_traces" list of any
+            ``DecisionTrace`` objects recorded via
+            ``TradingStrategy.record_decision_trace`` that tick,
+            independent of whether a signal was actually emitted —
+            useful for explaining why *no* signal fired.
+        positions: All current positions across configured portfolios.
+        portfolios: All current portfolios.
+        trades: All current trades across configured portfolios. Each
+            trade dict already carries its own ``strategy_id``.
+        decision_traces: Every ``DecisionTrace`` recorded this run via
+            ``TradingStrategy.record_decision_trace``, flattened across
+            all strategies/ticks into one top-level list — one entry
+            per recording, each carrying its own ``strategy_id``,
+            ``symbol``, ``summary``, and ``entries``. Present even for
+            a tick where no signal/order was produced at all, so a
+            caller can see *why* nothing happened.
+    """
+
+    def __init__(
+        self,
+        id=None,
+        algorithm_id=None,
+        environment=None,
+        is_paper=None,
+        number_of_iterations=None,
+        started_at=None,
+        completed_at=None,
+        orders=None,
+        signals=None,
+        positions=None,
+        portfolios=None,
+        trades=None,
+        score_cards=None,
+        decision_traces=None,
+        status="completed",
+        error=None,
+        reason=None,
+    ):
+        self.id = id
+        self.status = status
+        self.error = error
+        self.reason = reason
+        self.algorithm_id = algorithm_id
+        self.environment = environment
+        self.is_paper = is_paper
+        self.number_of_iterations = number_of_iterations
+        self.started_at = started_at
+        self.completed_at = completed_at
+        self.orders = _normalize_metadata_records(orders)
+        self.signals = _normalize_signal_reports(signals)
+        self.positions = positions if positions is not None else []
+        self.portfolios = portfolios if portfolios is not None else []
+        self.trades = _normalize_metadata_records(trades)
+        self.decision_traces = _normalize_decision_traces(
+            decision_traces if decision_traces is not None else score_cards
+        )
+
+    @property
+    def score_cards(self):
+        """Compatibility alias for :attr:`decision_traces`."""
+        return self.decision_traces
+
+    @score_cards.setter
+    def score_cards(self, value):
+        self.decision_traces = _normalize_decision_traces(value)
+
+    def to_dict(self):
+        def ensure_iso(value):
+            if hasattr(value, "isoformat"):
+                return value.isoformat()
+            return value
+
+        return {
+            "id": self.id,
+            "status": self.status or "completed",
+            "error": self.error,
+            "reason": self.reason,
+            "algorithm_id": self.algorithm_id,
+            "environment": self.environment,
+            "is_paper": self.is_paper,
+            "number_of_iterations": self.number_of_iterations,
+            "started_at": ensure_iso(self.started_at),
+            "completed_at": ensure_iso(self.completed_at),
+            "orders": _normalize_metadata_records(self.orders),
+            "signals": _normalize_signal_reports(self.signals),
+            "positions": self.positions,
+            "portfolios": self.portfolios,
+            "trades": _normalize_metadata_records(self.trades),
+            "decision_traces": _normalize_decision_traces(
+                self.decision_traces
+            ),
+            "score_cards": _normalize_decision_traces(self.decision_traces),
+        }
+
+    @staticmethod
+    def from_dict(data: dict):
+        return RunReport(
+            id=data.get("id"),
+            status=data.get("status", "completed"),
+            error=data.get("error"),
+            reason=data.get("reason"),
+            algorithm_id=data.get("algorithm_id"),
+            environment=data.get("environment"),
+            is_paper=data.get("is_paper"),
+            number_of_iterations=data.get("number_of_iterations"),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            orders=data.get("orders"),
+            signals=data.get("signals"),
+            positions=data.get("positions"),
+            portfolios=data.get("portfolios"),
+            trades=data.get("trades"),
+            score_cards=data.get("score_cards"),
+            decision_traces=data.get("decision_traces"),
+        )
+
+    def __repr__(self):
+        return self.repr(
+            id=self.id,
+            algorithm_id=self.algorithm_id,
+            completed_at=self.completed_at,
+        )

@@ -1,0 +1,235 @@
+import logging
+
+import polars as pl
+
+from investing_algorithm_framework.domain import INDEX_DATETIME, \
+    OrderStatus, OrderSide, Order, DataType, OrderType
+from .order_service import OrderService
+
+logger = logging.getLogger("investing_algorithm_framework")
+
+
+class OrderBacktestService(OrderService):
+
+    def __init__(
+        self,
+        order_repository,
+        trade_service,
+        position_service,
+        portfolio_repository,
+        portfolio_configuration_service,
+        portfolio_snapshot_service,
+        configuration_service,
+    ):
+        super().__init__(
+            configuration_service=configuration_service,
+            order_repository=order_repository,
+            position_service=position_service,
+            portfolio_repository=portfolio_repository,
+            portfolio_configuration_service=portfolio_configuration_service,
+            portfolio_snapshot_service=portfolio_snapshot_service,
+            trade_service=trade_service,
+        )
+        self.configuration_service = configuration_service
+
+    def create(self, data, execute=True, validate=True, sync=True) -> Order:
+        """
+        Override the create method to set the created_at and
+        updated_at attributes to the current backtest time.
+
+        Args:
+            data (dict): Dictionary containing the order data
+            execute (bool): Flag to execute the order
+            validate (bool): Flag to validate the order
+            sync (bool): Flag to sync the order
+
+        Returns:
+            Order: Created order object
+        """
+        config = self.configuration_service.get_config()
+        # Make sure the created_at is set to the current backtest time
+        data["created_at"] = config[INDEX_DATETIME]
+        data["updated_at"] = config[INDEX_DATETIME]
+        # Call super to have standard behavior
+        return super(OrderBacktestService, self)\
+            .create(data, execute, validate, sync)
+
+    def execute_order(self, order, portfolio):
+        order.status = OrderStatus.OPEN.value
+        order.remaining = order.get_amount()
+        order.filled = 0
+        order.updated_at = self.configuration_service.config[
+            INDEX_DATETIME
+        ]
+        return order
+
+    def update(self, object_id, data):
+        """
+        Override update so backtests always advance ``updated_at`` using
+        the simulated clock instead of wall-clock time.
+
+        The SQL model declares ``updated_at`` with
+        ``onupdate=utcnow``. SQLAlchemy fires that hook on any UPDATE
+        statement where ``updated_at`` is not in the SET clause —
+        which silently overwrites the simulated timestamp set by
+        ``execute_order`` and breaks the per-bar fill scan in
+        ``BacktestTradeOrderEvaluator._check_has_executed`` (which
+        filters candles via ``Datetime >= updated_at``). Callers that
+        already supply ``updated_at`` retain control.
+        """
+        data = dict(data) if data else {}
+        data.setdefault(
+            "updated_at",
+            self.configuration_service.config[INDEX_DATETIME],
+        )
+        return super().update(object_id, data)
+
+    def check_pending_orders(self, market_data):
+        """
+        Function to check if any pending orders have executed. It querys the
+        open orders and checks if the order has executed based on the OHLCV
+        data. If the order has executed, the order status is set to CLOSED
+        and the filled amount is set to the order amount.
+
+        Args:
+            market_data (dict): Dictionary containing the market data
+
+        Returns:
+            None
+        """
+        pending_orders = self.get_all({"status": OrderStatus.OPEN.value})
+        meta_data = market_data["metadata"]
+
+        for order in pending_orders:
+            ohlcv_meta_data = meta_data[DataType.OHLCV]
+
+            if order.get_symbol() not in ohlcv_meta_data:
+                continue
+
+            timeframes = ohlcv_meta_data[order.get_symbol()].keys()
+            sorted_timeframes = sorted(timeframes)
+            most_granular_interval = sorted_timeframes[0]
+            identifier = (
+                ohlcv_meta_data[order.get_symbol()][most_granular_interval]
+            )
+            data = market_data[identifier]
+
+            if self.has_executed(order, data):
+                self.update(
+                    order.id,
+                    {
+                        "status": OrderStatus.CLOSED.value,
+                        "filled": order.get_amount(),
+                        "remaining": 0,
+                        "updated_at": self.configuration_service
+                        .config[INDEX_DATETIME]
+                    }
+                )
+
+    def cancel_order(self, order):
+        order = self.order_repository.get(order.id)
+
+        if order is not None:
+
+            if OrderStatus.OPEN.equals(order.status):
+                self.update(
+                    order.id,
+                    {
+                        "status": OrderStatus.CANCELED.value,
+                        "remaining": 0,
+                        "updated_at": self.configuration_service
+                        .config[INDEX_DATETIME]
+                    }
+                )
+
+    def has_executed(self, order, ohlcv_data_frame: pl.DataFrame):
+        """
+        Check if the order has executed based on the OHLCV data.
+
+        A buy order is executed if the low price drops below or equals the
+        order price. Example: If the order price is 1000 and the low price
+        drops below or equals 1000, the order is executed. This simulates the
+        situation where a buyer is willing to pay a higher price than the
+        lowest price in the ohlcv data.
+
+        A sell order is executed if the high price goes above or equals the
+        order price. Example: If the order price is 1000 and the high price
+        goes above or equals 1000, the order is executed. This simulates the
+        situation where a seller is willing to accept a higher price for its
+        sell order.
+
+        Args:
+            order: Order object
+            ohlcv_data_frame: OHLCV data frame
+            True if the order has executed, False otherwise
+
+        Returns:
+            bool: True if the order has executed, False otherwise
+        """
+
+        # Extract attributes from the order object
+        created_at = order.get_created_at()
+        order_side = order.get_order_side()
+        order_price = order.get_price()
+        ohlcv_data_after_order = ohlcv_data_frame.filter(
+            pl.col('Datetime') >= created_at
+        )
+
+        # Market orders always execute on the next available candle
+        if OrderType.MARKET.equals(order.get_order_type()):
+            return not ohlcv_data_after_order.is_empty()
+
+        # Stop / Stop-Limit orders: trigger first, then evaluate fill
+        is_stop = OrderType.STOP.equals(order.get_order_type())
+        is_stop_limit = OrderType.STOP_LIMIT.equals(order.get_order_type())
+
+        if is_stop or is_stop_limit:
+            stop_price = order.get_stop_price()
+
+            if stop_price is None:
+                return False
+
+            if OrderSide.SELL.equals(order_side):
+                triggered = (
+                    ohlcv_data_after_order['Low'] <= stop_price
+                ).any()
+            elif OrderSide.BUY.equals(order_side):
+                triggered = (
+                    ohlcv_data_after_order['High'] >= stop_price
+                ).any()
+            else:
+                return False
+
+            if not triggered:
+                return False
+
+            # STOP becomes a market order on trigger
+            if is_stop:
+                return True
+
+            # STOP_LIMIT: after trigger, fall through to limit fill check
+            # against the configured limit price.
+
+        # Check if the order execution conditions are met
+        if OrderSide.BUY.equals(order_side) \
+                or OrderSide.COVER.equals(order_side):
+            # BUY / COVER: a willing seller appears at <= our price.
+            if (ohlcv_data_after_order['Low'] <= order_price).any():
+                return True
+        elif OrderSide.SELL.equals(order_side) \
+                or OrderSide.SHORT.equals(order_side):
+            # SELL / SHORT: a willing buyer appears at >= our price.
+            if (ohlcv_data_after_order['High'] >= order_price).any():
+                return True
+
+        # If conditions are not met, return False
+        return False
+
+    def create_snapshot(self, portfolio_id, created_at=None):
+
+        if created_at is None:
+            created_at = self.configuration_service \
+                .config[INDEX_DATETIME]
+
+        super(OrderBacktestService, self)\
+            .create_snapshot(portfolio_id, created_at=created_at)

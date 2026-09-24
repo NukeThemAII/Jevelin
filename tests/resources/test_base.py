@@ -1,0 +1,285 @@
+import logging
+import os
+import shutil
+from decimal import Decimal
+from unittest import TestCase
+
+from fastapi.testclient import TestClient
+
+from investing_algorithm_framework import create_app, App, \
+    TradingStrategy, TimeUnit, OrderStatus, PortfolioConfiguration, \
+    MarketCredential, Schedule
+from investing_algorithm_framework.domain import RESOURCE_DIRECTORY, \
+    ENVIRONMENT, Environment, BACKTEST_DATA_DIRECTORY_NAME
+from investing_algorithm_framework.infrastructure.database import \
+    Session, teardown_sqlalchemy
+from tests.resources.stubs import OrderExecutorTest, PortfolioProviderTest
+
+logger = logging.getLogger(__name__)
+
+
+class _CompatTestClient(TestClient):
+    """``fastapi.testclient.TestClient`` (httpx-based) with a Flask
+    test-client-style ``.data`` attribute added to every response, so
+    existing ``response.data.decode()`` assertions keep working."""
+
+    def request(self, *args, **kwargs):
+        response = super().request(*args, **kwargs)
+        response.data = response.content
+        return response
+
+
+class StrategyOne(TradingStrategy):
+    schedule = Schedule.every(10, TimeUnit.SECOND)
+    def run_strategy(self, algorithm, market_data):
+        algorithm.create_order(
+            target_symbol="BTC",
+            amount=1,
+            price=10,
+            order_side="BUY",
+            order_type="LIMIT",
+        )
+
+
+class TestBase(TestCase):
+    portfolio_configurations = []
+    config = {}
+    external_balances = None
+    external_orders = []
+    initial_orders = []
+    market_credentials = []
+    market_data_source_service = None
+    initialize = True
+    resource_directory = os.path.dirname(__file__)
+    data_providers = []
+    # v9.0 (#431) — when True, the test order executor synchronously
+    # fills any order it executes. This preserves the pre-v9.0 test
+    # contract where a Trade is created during ``order_service.create``.
+    # The default is False to keep ``order_status`` / pending-order
+    # semantics correct; tests that assert trade/position state right
+    # after creating an order opt-in by setting it to True.
+    auto_fill_orders = False
+
+    def setUp(self) -> None:
+        self.resource_directory = os.path.dirname(__file__)
+        config = self.config
+        config[RESOURCE_DIRECTORY] = self.resource_directory
+        config[ENVIRONMENT] = Environment.TEST.value
+        config[BACKTEST_DATA_DIRECTORY_NAME] = \
+            "test_data"
+        self.app: App = create_app(config=config)
+        portfolio_provider_lookup = self.app.container\
+            .portfolio_provider_lookup()
+        portfolio_provider_lookup.reset()
+        order_executor_test = OrderExecutorTest()
+        if self.auto_fill_orders:
+            order_executor_test.order_status = OrderStatus.CLOSED.value
+            order_executor_test.auto_fill = True
+        order_executor_lookup = self.app.container.order_executor_lookup()
+        order_executor_lookup.reset()
+        self.app.add_order_executor(order_executor_test)
+        portfolio_provider = PortfolioProviderTest()
+
+        if self.external_balances is not None:
+            portfolio_provider.external_balances = self.external_balances
+
+        self.app.add_portfolio_provider(portfolio_provider)
+
+        if len(self.data_providers) > 0:
+            for data_provider in self.data_providers:
+                self.app.add_data_provider(data_provider)
+
+        if len(self.portfolio_configurations) > 0:
+            for portfolio_configuration in self.portfolio_configurations:
+                self.app.add_portfolio_configuration(
+                    portfolio_configuration
+                )
+
+        # Add all market credentials
+        if len(self.market_credentials) > 0:
+            for market_credential in self.market_credentials:
+                self.app.add_market_credential(market_credential)
+
+        if self.initialize:
+            self.app.initialize_config()
+            self.app.initialize_storage(remove_database_if_exists=True)
+            self.app.initialize_services()
+            self.app.initialize_portfolios()
+
+            if self.initial_orders is not None:
+                for order in self.initial_orders:
+                    created_order = self.app.context.create_order(
+                        target_symbol=order.get_target_symbol(),
+                        amount=order.get_amount(),
+                        price=order.get_price(),
+                        order_side=order.get_order_side(),
+                        order_type=order.get_order_type()
+                    )
+
+                    # Update the order to the correct status
+                    order_service = self.app.container.order_service()
+
+                    if OrderStatus.CLOSED.value == order.get_status():
+                        order_service.update(
+                            created_order.get_id(),
+                            {
+                                "status": "CLOSED",
+                                "filled": order.get_filled(),
+                                "remaining": Decimal('0'),
+                            }
+                        )
+
+    def tearDown(self) -> None:
+        self._cleanup_database()
+
+    @staticmethod
+    def _remove_database_dir(resource_dir):
+        """Remove the databases directory using shutil.rmtree."""
+        database_dir = os.path.join(resource_dir, "databases")
+        if os.path.exists(database_dir):
+            shutil.rmtree(database_dir, ignore_errors=True)
+
+    def _cleanup_database(self):
+        """Close SQLAlchemy sessions, dispose engine, and remove db files."""
+        teardown_sqlalchemy()
+        self._remove_database_dir(self.resource_directory)
+
+    def remove_database(self):
+        self._cleanup_database()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._remove_database_dir(cls.resource_directory)
+
+
+class BitvavoTestBase(TestBase):
+    """Pre-configured TestBase for BITVAVO/EUR with 1000 EUR balance."""
+    portfolio_configurations = [
+        PortfolioConfiguration(
+            market="BITVAVO",
+            trading_symbol="EUR"
+        )
+    ]
+    market_credentials = [
+        MarketCredential(
+            market="BITVAVO",
+            api_key="api_key",
+            secret_key="secret_key"
+        )
+    ]
+    external_balances = {"EUR": 1000}
+
+
+class BinanceTestBase(TestBase):
+    """Pre-configured TestBase for binance/EUR with 1000 EUR balance."""
+    portfolio_configurations = [
+        PortfolioConfiguration(
+            market="binance",
+            trading_symbol="EUR",
+            initial_balance=1000,
+        )
+    ]
+    market_credentials = [
+        MarketCredential(
+            market="binance",
+            api_key="api_key",
+            secret_key="secret_key",
+        )
+    ]
+    external_balances = {"EUR": 1000}
+
+
+class WebTestBase(TestCase):
+    portfolio_configurations = []
+    market_credentials = []
+    iaf_app = None
+    config = {}
+    external_balances = {}
+    initial_orders = []
+    external_orders = []
+    initialize = True
+    resource_directory = os.path.dirname(__file__)
+    client = None
+
+    def setUp(self) -> None:
+        self.resource_directory = os.path.dirname(__file__)
+        self.iaf_app: App = create_app(
+            {
+                RESOURCE_DIRECTORY: self.resource_directory
+            },
+            web=True
+        )
+        order_executor_lookup = self.iaf_app.container.order_executor_lookup()
+        order_executor_lookup.reset()
+        portfolio_provider_lookup = self.iaf_app.container\
+            .portfolio_provider_lookup()
+        portfolio_provider_lookup.reset()
+        self.iaf_app.add_order_executor(OrderExecutorTest())
+        portfolio_provider = PortfolioProviderTest()
+
+        if self.external_balances is not None:
+            portfolio_provider.external_balances = self.external_balances
+
+        self.iaf_app.add_portfolio_provider(portfolio_provider)
+
+        if len(self.portfolio_configurations) > 0:
+            for portfolio_configuration in self.portfolio_configurations:
+                self.iaf_app.add_portfolio_configuration(
+                    portfolio_configuration
+                )
+
+        # Add all market credentials
+        if len(self.market_credentials) > 0:
+            for market_credential in self.market_credentials:
+                self.iaf_app.add_market_credential(market_credential)
+
+        if self.initialize:
+            self.iaf_app.initialize_config()
+            self.iaf_app.initialize_storage(remove_database_if_exists=True)
+            self.iaf_app.initialize_services()
+            self.iaf_app.initialize_portfolios()
+
+        if self.initial_orders is not None:
+            for order in self.initial_orders:
+                created_order = self.app.context.create_order(
+                    target_symbol=order.get_target_symbol(),
+                    amount=order.get_amount(),
+                    price=order.get_price(),
+                    order_side=order.get_order_side(),
+                    order_type=order.get_order_type()
+                )
+
+                # Update the order to the correct status
+                order_service = self.app.container.order_service()
+
+                if OrderStatus.CLOSED.value == order.get_status():
+                    order_service.update(
+                        created_order.get_id(),
+                        {
+                            "status": "CLOSED",
+                            "filled": order.get_filled(),
+                            "remaining": Decimal('0'),
+                        }
+                    )
+
+        # Skip starting a real uvicorn server (see App.run()'s
+        # is_live_web_run check) while still exercising the FastAPI
+        # app itself through its own TestClient. Entered explicitly so
+        # the client's background portal thread has one deterministic
+        # lifecycle for the whole test, closed again in tearDown().
+        self.iaf_app._web_app_testing = True
+        self.client = _CompatTestClient(self.iaf_app._web_app)
+        self.client.__enter__()
+
+    def tearDown(self) -> None:
+        self.client.__exit__(None, None, None)
+        teardown_sqlalchemy()
+        database_dir = os.path.join(self.resource_directory, "databases")
+        if os.path.exists(database_dir):
+            shutil.rmtree(database_dir, ignore_errors=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        database_dir = os.path.join(cls.resource_directory, "databases")
+        if os.path.exists(database_dir):
+            shutil.rmtree(database_dir, ignore_errors=True)

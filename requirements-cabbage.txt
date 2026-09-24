@@ -1,0 +1,3 @@
+# Install the actual framework from this checkout, not a substitute engine.
+-e .
+pyindicators==0.11.1
