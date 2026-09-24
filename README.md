@@ -96,12 +96,3 @@ upstream suite is preserved but has not all been executed for this delivery.
 
 This delivery preserves and uses the actual exchange-trading functionality in
 the source you supplied. It does not claim the above integrations exist.
-
-## Provenance
-
-Upstream: https://github.com/coding-kitties/investing-algorithm-framework
-Commit: `fff7436f12ea95a2e5f794ce6800663fc21ef8ec`.
-Original license and authors: [LICENSE](LICENSE), [AUTHORS.md](AUTHORS.md).
-CABBAGE-specific additions are in `cabbage/`, `cabbage_tests/`, launcher/setup
-files and this README. Upstream publishing workflows are preserved as disabled
-reference files under `.github/upstream-workflows/`; CABBAGE's workflow runs tests.
