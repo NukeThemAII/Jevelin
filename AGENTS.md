@@ -190,8 +190,9 @@ Jev ≈ $0.01–0.10/mo. RPC = $0 until onchain.
 
 - **Branches:** `dev` = agent work; `main` = verified/stable. Never delete branches or files
   without explicit user approval. Never force-push. Merge dev→main only after user verification.
-- **Claude Code is the coding authority** (`claude -p --dangerously-skip-permissions --output-format json`);
-  Hermes = orchestration/ops + small fixes. One Claude job at a time.
+- **Delegated coder: MiMoCode** (`mimo run --yolo`, `xiaomi/mimo-v2.6-pro`, Token Plan = $0 cost;
+  CLI at `~/.mimocode/bin/mimo`). Claude Code only when quota available. Hermes = orchestration/ops
+  + small fixes. One delegated coding job at a time. Verify every agent's claims by running tests.
 - **TDD:** tests before code for anything touching orders, money, or risk. `cabbage_tests/` is ours;
   `tests/` is upstream's — don't break upstream tests silently.
 - **Live money safety:** paper-first, deterministic gates, no hidden broker writes. Live mode stays

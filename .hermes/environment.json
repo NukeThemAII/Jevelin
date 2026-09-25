@@ -7,7 +7,8 @@
     "build": [],
     "test": [
       ".venv/bin/python -m unittest discover -s cabbage_tests -v",
-      ".venv/bin/python -m unittest tests.app.test_paper_trading -v"
+      ".venv/bin/python -m unittest tests.app.test_paper_trading -v",
+      ".venv/bin/python scripts/test_jev_client.py -v"
     ],
     "start": null,
     "port": null,
