@@ -88,17 +88,22 @@ Note: upstream's own VALIDATION.md said Bitvavo was unreachable from their envir
 **Jev (TypeSafe "System One" model) = calibrated typed decisions, not text.** Fast (~100ms), cheap
 ($0.042/1M input tokens, output free). API:
 
+**Verified live 2026-09-25 via OpenRouter** (`scripts/jev_probe.py` reproduces it):
+
 ```
-POST https://api.typesafe.ai/v1/systemone
-Authorization: Bearer $TYPESAFE_API_KEY
-{ "state": "<market state text/JSON>",
-  "model": "jev-latest",
+POST https://openrouter.ai/api/alpha/decisions        # NOT chat/completions — Jev is a "decisions model"
+Authorization: Bearer $OPENROUTER_API_KEY
+{ "model": "typesafe/jev-1.13",                       # slug is VERSIONED on OpenRouter; "jev-latest" is invalid there
+  "state": "<string or JSON string>",
   "questions": {
     "entry_quality": {"type": "choice", "instructions": "...", "criteria": {...}},
     "whipsaw":       {"type": "noul",   "instructions": "..."},
     "regime":        {"type": "score",  "instructions": "...", "criteria": [...]} } }
 ```
-→ per-question: answer + probability distribution + **confidence**. Docs: `docs.typesafe.ai` (llms.txt index). Python SDK `typesafe-sdk` exists, but plain HTTP is enough.
+
+→ `answers`: `choice{choice, probabilities, confidence}` | `score{score, legend, probabilities, confidence}` | `noul{noul}` — plus `usage{input_tokens, output_tokens, cost}`.
+Measured: 3-question fan-out = 530 input tokens = **$0.000022**, ~360ms, provider "TypeSafe". Native TypeSafe API (`api.typesafe.ai/v1/systemone`, `jev-latest`, `TYPESAFE_API_KEY`) is the same model but waitlisted — OpenRouter is our route today.
+⚠️ **Noul answers carry NO confidence field** (only the probability). Confidence-gating applies to choice/score; for noul gate on probability thresholds and/or self-consistency fan-out (TypeSafe's own cookbook pattern).
 
 **Design principle (from TypeSafe's own patterns doc): keep code in control.** Jev never places
 orders and never invents numbers. The deterministic RSI/EMA pipeline stays the authority;

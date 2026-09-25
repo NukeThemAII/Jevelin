@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "recipe": {
+    "name": "Jevelin",
+    "kind": "python",
+    "bootstrap": ["uv pip install -r requirements-cabbage.txt"],
+    "build": [],
+    "test": [
+      ".venv/bin/python -m unittest discover -s cabbage_tests -v",
+      ".venv/bin/python -m unittest tests.app.test_paper_trading -v"
+    ],
+    "start": null,
+    "port": null,
+    "readinessPath": null,
+    "evidence": [
+      "Saved manifest 2026-09-25: Jevelin is a Python CLI spot-trading bot on Investing Algorithm Framework 9.0.0a18 (vendored), NOT a FastAPI app — generic detection ran 'uv sync' + 'pytest', broke the venv and failed.",
+      "Verified recipe: uv pip install -r requirements-cabbage.txt, then unittest suites cabbage_tests (6) + tests.app.test_paper_trading (12). No long-running server: use --skip-start."
+    ]
+  },
+  "updatedAt": "2026-09-25T18:55:00+07:00"
+}
