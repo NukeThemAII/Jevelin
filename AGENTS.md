@@ -1,8 +1,8 @@
 # Jevelin — AI Agent Guide
 
-> **For:** Any AI agent (Hermes, Claude Code, Codex) working on this repo.
-> **What:** Whitelabel spot-trading engine, forked from `sopersone/cabbage-trading-machine`.
-> **Goal:** Build our own product on a proven runtime. Paper-first, free infra, real numbers only.
+> **For:** Any AI agent (Hermes, MiMoCode, Cline, Claude Code, Codex) working in this repo.
+> **What:** Jev-powered dual-book crypto trading system (spot + perps), paper-first, on Binance.
+> **Goal:** Prove an AI-decision edge with real numbers before any money moves. Honest numbers only.
 
 ---
 
@@ -27,130 +27,140 @@ Fork relationship is live (`upstream` remote configured). Upstream got 30 stars 
 
 ---
 
-## 2. Architecture (verified)
+## 2. System architecture (as built and verified)
 
 ```
-CabbageStrategy (cabbage/strategy.py)
-  → upstream RSI/EMA confluence pipeline (signal_cards, ScoreRules)
-  → upstream risk rules (StopLossRule, ExposureRule, ...)
-  → upstream order service
-  → CCXTOrderExecutor (live) | PaperTradingOrderExecutor (paper)
-  → portfolio/trade services → SQLite + RunReport (JSON + HTML)
+Binance public data (ccxt, keyless: OHLCV, trades, ticker, funding rate)
+   │
+   ▼
+jev_state.build_state()          60s price path + last trades + flow features
+   │
+   ▼
+jev_questions.QUESTIONS          5 questions: pump, dump, phase, exhaustion, whipsaw
+   │                              (CoinGecko Pump Pulse port + our whipsaw gate)
+   ▼
+jev_client.JevClient             POST openrouter.ai/api/alpha/decisions
+   │                              fail-open, 1 retry, usage/cost tracking, JSONL audit log
+   ▼
+jev_scorer.ShadowScorer          verdict: pump_0_100, dump_0_100, phase, exhaustion_prob,
+   │                              whipsaw_prob, confidence (0-100 normalization)
+   ├──────────────────────────────┐
+   ▼                              ▼
+jev_gates.decide()               jev_perps.decide_perps()
+spot: enter/exit/skip            perps: enter_long/enter_short/exit/skip
+size = 0.20 × confidence         margin = 0.10 × confidence, leverage ≤ 3
+   ▼                              ▼
+jev_paper.PaperPortfolio         jev_perps.PerpsPortfolio
+   │                              stops, liq price, funding accrual, no-flip
+   └──────────┬───────────────────┘
+              ▼
+   paper_loop.py                  one verdict per cycle drives BOTH books
+   runtime/*.json + *.trades.jsonl (decision + trade audit logs)
 ```
 
-- **Strategy:** RSI(14) + EMA(12/26) crossover. Long-only spot. Entry = RSI<30 (3 pts) + recent EMA cross (2 pts), confluence ≥5. Exit = RSI≥70 + recent crossunder. Closed candles only (drops the forming candle, refuses <30 bars).
-- **Config:** `cabbage/config.py` — frozen dataclass, env-driven (`CABBAGE_*`), validates everything up front.
-- **Modes:** `doctor` / `backtest` (offline fixture) / `paper` / `live` (explicit, requires `{MARKET}_API_KEY`+`{MARKET}_SECRET_KEY`).
-- **State:** `runtime/<mode>/<market>/<pair>/` — SQLite, run reports. `.gitignore`d. Don't run two processes on one state dir.
-- **Native:** `native/confluence/` = optional Rust wheel for hot loops. Python path works without it.
+| File | Role |
+|---|---|
+| `scripts/jev_client.py` | Jev API client (OpenRouter decisions endpoint) |
+| `scripts/jev_probe.py` | standalone API probe |
+| `scripts/jev_questions.py` | the question fan-out (CoinGecko Pump Pulse port + whipsaw) |
+| `scripts/jev_state.py` | deterministic market-state builder |
+| `scripts/jev_scorer.py` | data → state → Jev → normalized verdict |
+| `scripts/shadow_scorer.py` | CLI: score a symbol live (no trading) |
+| `scripts/jev_gates.py` | spot decision layer (verdict → action + risk vetoes) |
+| `scripts/jev_paper.py` | spot paper portfolio (PnL, persistence, trade log) |
+| `scripts/jev_perps.py` | perps paper book (long+short, stops, liq, funding) |
+| `scripts/paper_loop.py` | dual-book cycle loop (one verdict → both books) |
 
-## 3. Verification status (this VPS, 2026-09-25)
+The original RSI/EMA engine (`cabbage/` + vendored framework, below) remains as the runtime base.
+
+**Design principle (TypeSafe's own guidance): keep code in control.** Jev answers questions —
+it never outputs order sizes, never places orders, never invents numbers. All money math is
+deterministic, auditable code. On any error the system fails OPEN: skip the trade, log the
+reason, never fabricate a verdict.
+
+## 3. Trading design
+
+### Books (paper; promotion to live is a separate, human-gated decision)
+
+| | Spot book | Perps book |
+|---|---|---|
+| Direction | long-only | long + short |
+| Sizing | `size_fraction = 0.20 × confidence` | `margin = 0.10 × confidence`, `notional = margin × leverage` |
+| Leverage | 1x | hard cap **3x** |
+| Stop-loss | exit rules only | **mandatory on every position** (2% default) |
+| Liquidation | n/a | computed liq price; forced close loses whole margin |
+| Funding | n/a | paid/received on close per 8h periods; entries vetoed when funding runs against the side (>±0.01%/8h) |
+
+### Entry/exit gates (both books, in check order)
+1. No/broken verdict (`ok=False`, `confidence=None`, NaN/missing keys) → **skip** (`no_verdict`/`malformed`)
+2. Position held → exit rules only (**no flip** same cycle): long exits on `dump≥60` or `exhaustion≥0.8`; short exits on `pump≥60` or `exhaustion≥0.8`; stops/liq fire automatically in the portfolio
+3. Daily loss ≤ −5% → block entries only (`daily_loss_kill`); exits and stops always allowed
+4. `phase=capitulation` blocks longs only
+5. Shared entry gates: `whipsaw≤0.5`, `exhaustion≤0.6`, `confidence≥0.6`, 15-min cooldown
+6. Long needs `pump≥60`; short needs `dump≥60`; funding veto per book table
+7. Both sides qualify → prefer the stronger (`pump≥dump` → long, else short)
+
+Sizing is decided by code (`RiskConfig` / `PerpsConfig` constants × Jev confidence). Jev never
+chooses amounts. Change caps by changing config — nothing can exceed them.
+
+### Cadence (split — deliberately not per-second)
+- **Jev verdicts:** every **5 min** per pair + **event bursts** (volatility/trade-rate spike → score immediately for a few cycles). Jev calls cost ~$0.00002; redundancy is the enemy, not cost.
+- **Stop/liquidation checks:** every **10 s** — deterministic, free, and the real clock for risk.
+- **Cooldown between entries:** 15 min (in the gates).
+
+### Pairs
+- **v1 (now):** BTCUSDT — clean single-stream stats.
+- **v1.5:** BTC, ETH, SOL (static liquid majors).
+- **v2 (dynamic universe):** CoinGecko `/search/trending` + `/coins/markets` (free) pick hot coins → filter to Binance-listed pairs with a liquidity floor → score those. CoinGecko supplies discovery, Binance supplies data/execution. Trending coins are where pump/dump questions shine — and where slippage bites; build after baseline stats exist.
+
+### Rollout doctrine (hard gates, no skipping)
+1. **Shadow/paper** — dual books running, everything logged ← *we are here*
+2. **Analysis** — replay logs: did Jev vetoes beat baseline? Calibration check on `confidence`
+3. **Promotion gate** — N days paper + stat thresholds + explicit user approval
+4. **Live** — tiny float first, exchange-side stops required, human confirms every promotion step
+
+---
+
+## 4. Jev — verified API facts (2026-09-25)
+
+```
+POST https://openrouter.ai/api/alpha/decisions     # NOT chat/completions — Jev is a "decisions model"
+Authorization: Bearer $OPENR..._KEY
+{ "model": "typesafe/jev-1.13",                    # slug VERSIONED on OpenRouter ("jev-latest" invalid)
+  "state": "<string or JSON string>",
+  "questions": { <qid>: {"type": "choice"|"score"|"noul", "instructions": ..., "criteria": ...} } }
+```
+
+→ `answers`: `choice{choice, probabilities, confidence}` | `score{score, legend, probabilities, confidence}` | `noul{noul}` + `usage{input_tokens, output_tokens, cost}`.
+
+- Measured cost: **$0.0000141–$0.000038 per call** (5-question fan-out ≈ $0.00004), latency 360–475 ms.
+- **`noul` answers carry NO confidence field** — gate those on probability thresholds only.
+- Native TypeSafe API (`api.typesafe.ai/v1/systemone`) is the same model, waitlisted; OpenRouter is the working route. Key lives in `.env` (gitignored).
+- `scripts/jev_probe.py` reproduces live verification; `runtime/jev_decisions.jsonl` is the audit log (state hash + raw response per call — never fabricate, always store raw JSON).
+
+---
+
+## 5. Verification status (this VPS, 2026-09-25)
 
 | Check | Result |
 |---|---|
-| `pip install -r requirements-cabbage.txt` | ✅ clean, `pip check` OK |
-| `unittest discover -s cabbage_tests` (6 integration tests) | ✅ 6/6 |
-| `unittest tests.app.test_paper_trading` (12 upstream tests) | ✅ 12/12 |
-| `python -m cabbage doctor` | ✅ config OK |
-| `python -m cabbage doctor --online` | ✅ live Bitvavo public API reachable (BTC/EUR bid/ask verified) |
-| `python -m cabbage backtest` | ✅ runs, HTML report written — **0 trades** on bundled fixture (known, honest) |
-
-Note: upstream's own VALIDATION.md said Bitvavo was unreachable from their environment. From here it works. Their `runtime/` artifacts are gitignored; regenerate locally.
-
----
-
-## 4. Audit findings
-
-**Verdict (honest):** the framework is professional-grade — layered domain/services/infrastructure, event+vector engines with parity tests, deterministic accounting, hundreds of tests. That part is done and it is the hard part. The 220-line wrapper is clean and disciplined (validated config, explicit live gate, paper/live isolation guards, atomic writes) but strips risk features and is single-symbol. **Worth further development: yes. Worth live money: not yet** — P0-3 and P0-4 below are blockers, and the vanilla RSI/EMA strategy by itself is machinery, not an edge.
-
-**Strengths (keep):**
-- S1: Real framework, not a toy — event + vector backtest engines, SQLite accounting, run reports, risk-rule engine (stop-loss/TP/cooldown/exposure/scaling), studies/optimizer/permutation testing already inside.
-- S2: Correct safety posture — `live` is an explicit command; paper mode **cannot** be flipped to live by upstream env overrides (guard in `application.py`); live refuses to start without keys; incomplete-candle guard in strategy.
-- S3: Honest delivery — `VALIDATION.md` reports 0 trades and disclaims profitability. Atomic report writes (tmp+rename).
-- S4: Test harness covers the full paper path (BUY placed→filled→SELL placed→filled, real SQLite accounting, no mocks on execution).
-
-**Findings (fix in order):**
-- **F1 (opportunity):** Jev integration absent — our differentiator. See §5.
-- **F2 (bug-in-waiting):** Symbol plumbing leaks upstream constants. `strategy.py` uses identifier `'BTC_ohlcv'` and `super().prepare_signal_data` keys output by `simple_app.SYMBOL='BTC'`; the remap to `settings.base` works, but anything multi-symbol needs a refactor. Single-symbol only today.
-- **F3 (risk config):** Wrapper strips `take_profits`, `cooldowns`, `scaling_rules` and sets `ExposureRule(max_portfolio_percentage=100)` — *less* protection than the upstream example (80% exposure, TP 10%/50%, sell-cooldown 12 bars). Restore sane risk defaults before any live run.
-- **F4 (live risk):** Stops are client-side only. If the process dies mid-position, nothing protects it. Mitigation: watchdog + venue-side stop orders where supported (verify Bitvavo stop-loss order support) — before live.
-- **F5 (backtest realism):** Paper fills at quote with flat fee. Slippage models exist in the framework (`test_slippage_models.py`) — use them; paper results are otherwise optimistic.
-- **F6 (audit trail):** Framework has `decision_trace` / `record_schemas` — wire them so every signal decision is persisted. Required for Jev calibration analysis (§5).
-- **F7 (dependency):** Framework is alpha (`9.0.0a18`) and vendored. We control it (good) but must track upstream fixes manually. Pin known-good; diff before upgrading.
-- **F8 (docs):** README contains upstream promo framing + a RU starter. Ours will be rewritten in the whitelabel pass.
-- **F9 (CI):** Upstream workflows are `.disabled`. Add our own CI (tests + lint) on the fork.
-- **F10 (exchange defaults):** BITVAVO/BTC-EUR/2h defaults are fine for EU, but this is a global product — exchange/pair/timeframe are already env-driven; docs and defaults should follow.
+| 5 test suites (client/scorer/gates/paper/perps) | ✅ **77/77** |
+| Upstream suites (`cabbage_tests`, `tests.app.test_paper_trading`) | ✅ 6/6 + 12/12 |
+| `hermes verify` (recipe in `.hermes/environment.json`) | ✅ ok: True |
+| Live Jev calls | ✅ real answers, e.g. `pump strong p=0.87 conf=0.86` |
+| Live Binance → verdict pipeline | ✅ `pump=43 dump=40 phase=distribution whipsaw=0.46` |
+| Live dual-book cycle | ✅ both books act on one verdict (spot + perps lines logged) |
+| Live risk veto | ✅ `skip vetoed_by=capitulation` on real market state |
 
 ---
 
-## 5. Idea #1 — JevGate (the "try out Jev" plan)
+## 6. Delegation & tooling
 
-**Jev (TypeSafe "System One" model) = calibrated typed decisions, not text.** Fast (~100ms), cheap
-($0.042/1M input tokens, output free). API:
-
-**Verified live 2026-09-25 via OpenRouter** (`scripts/jev_probe.py` reproduces it):
-
-```
-POST https://openrouter.ai/api/alpha/decisions        # NOT chat/completions — Jev is a "decisions model"
-Authorization: Bearer $OPENROUTER_API_KEY
-{ "model": "typesafe/jev-1.13",                       # slug is VERSIONED on OpenRouter; "jev-latest" is invalid there
-  "state": "<string or JSON string>",
-  "questions": {
-    "entry_quality": {"type": "choice", "instructions": "...", "criteria": {...}},
-    "whipsaw":       {"type": "noul",   "instructions": "..."},
-    "regime":        {"type": "score",  "instructions": "...", "criteria": [...]} } }
-```
-
-→ `answers`: `choice{choice, probabilities, confidence}` | `score{score, legend, probabilities, confidence}` | `noul{noul}` — plus `usage{input_tokens, output_tokens, cost}`.
-Measured: 3-question fan-out = 530 input tokens = **$0.000022**, ~360ms, provider "TypeSafe". Native TypeSafe API (`api.typesafe.ai/v1/systemone`, `jev-latest`, `TYPESAFE_API_KEY`) is the same model but waitlisted — OpenRouter is our route today.
-⚠️ **Noul answers carry NO confidence field** (only the probability). Confidence-gating applies to choice/score; for noul gate on probability thresholds and/or self-consistency fan-out (TypeSafe's own cookbook pattern).
-
-**Design principle (from TypeSafe's own patterns doc): keep code in control.** Jev never places
-orders and never invents numbers. The deterministic RSI/EMA pipeline stays the authority;
-Jev is a **confidence-gated veto/confirm layer** on top of it.
-
-Architecture:
-```
-signal event (RSI/EMA confluence fires)
-  → build state (last N closed candles summary, RSI, EMA delta, position context, vol)
-  → ONE Jev call, fan-out questions:
-      entry_quality: choice(skip | normal | high)
-      whipsaw:       noul (is this cross a fakeout?)
-      risk_event:    noul (does state invalidate technicals — cascade/expiry/news?)
-      regime:        score(range | trend | chop)
-  → JevGate: mode=shadow|enforce, confidence thresholds, fail-open
-  → decision log (JSONL/SQLite) + framework decision_trace
-  → deterministic executor (unchanged)
-```
-
-Rollout (hard gates, no skipping):
-1. **Shadow mode** — Jev verdicts logged next to paper trades, zero execution impact.
-2. **Analysis** — replay logs: would Jev vetoes have improved PnL / max drawdown vs baseline? Calibration check on `confidence`.
-3. **Enforce mode** — confidence-gated vetoes (e.g. skip entries when `whipsaw > 0.6` AND `confidence ≥ 0.8`).
-4. **Paper-tracked**, then live only on user approval.
-
-Engineering rules:
-- **Fail-open:** API timeout/error → fall back to pure deterministic rule. Never block trading on a model API. One retry, hard timeout (~2s), circuit breaker.
-- **Cost control:** one call per *signal event*, not per bar (dozens/day, not thousands) → cents per month. Compact state (~1-2KB). Decision cache keyed by (bar_ts, signal, config_hash). Backtests replay recorded answers — free.
-- **No fabricated numbers:** store raw API JSON. If Jev is unavailable, the log says `jev: unavailable` — never invent a probability (this is exactly the upstream's sin).
-- Tests use recorded fixtures; no live API calls in CI.
-
-## 6. Idea backlog (own ideas, prioritized)
-
-| # | Idea | Why | When |
-|---|---|---|---|
-| 1 | **JevGate** (§5) | Differentiator; nobody has calibrated decision models in open bots | P0 |
-| 2 | **Whitelabel pass** — `cabbage`→`jevelin` pkg, `JEVELIN_*` env, CLI/docs rename, README rewrite, drop promo framing | It's our product now | P0 |
-| 3 | **Risk hard-limits** — restore TP/cooldowns/scaling, exposure ≤80%, daily-loss kill-switch, drawdown halt | F3/F4 — non-negotiable before live | P0 |
-| 4 | **Decision audit trail** (framework `decision_trace`) | Feeds Jev analysis + user trust | P0 |
-| 5 | **Telegram trade/decision feed** — same pattern as EarnGrid reporting | Operator visibility from phone | P1 |
-| 6 | **Walk-forward validation** — framework study/optimizer + permutation testing | Kills overfitting; honest stats | P1 |
-| 7 | **Paper→live promotion gate** — N days paper + stat thresholds + explicit user approval | User's demo-first doctrine (T212 style) | P1 |
-| 8 | **Slippage-aware backtests** (F5) | Realistic numbers before any real money | P1 |
-| 9 | **CI on fork** (tests + lint) | Upstream has none active | P1 |
-| 10 | Multi-symbol universe / cross-sectional momentum (framework pipelines support it) | Scale beyond single-pair | P2 |
-| 11 | Exchange-side stop orders / watchdog | Live safety | P2 (before live) |
-| 12 | Onchain execution (Base DEX) — reuse EarnGrid RPC stack | Far future; the "Robinhood Chain" thing upstream promised doesn't exist either | P3 |
+- **Default coder: Cline + mimo-v2.6-pro** (`cline -P xiaomi-token-plan-sgp --yolo`), Token Plan = **$0**. Handles multi-file jobs reliably (long iteration loops).
+- **Fast scalpel: Cline + Opus 5.5** (`cline -P openrouter --yolo`), risk-critical code or urgency. Measured **$0.37–1.36 per job** (scales with spec size).
+- MiMoCode CLI (`~/.mimocode/bin/mimo`) also available ($0), same model.
+- **One delegated coding job at a time.** Hermes specs, delegates, and **verifies every claim by running tests + a live smoke before commit** — agent self-reports are not evidence.
+- **Cost measurement pitfall (verified):** OpenRouter `/api/v1/auth/key` usage counters LAG real billing (read $0.09 minutes before it settled at $0.37); agent self-reported costs undershoot too. Trust the dashboard or settled reads only.
 
 ---
 
@@ -176,23 +186,23 @@ credentials, not data keys).
 EarnGrid's full measured RPC stack (fallback order, degradation) lives in `EarnGrid/RPC.md` —
 copy the pattern, not the keys, when the day comes. Base is where our infra already is.
 
-**Model (Jev):** $0.042/1M input tokens, output free → our volume ≈ **cents/month**. Keys:
-1. **`console.typesafe.ai/keys`** — official route, early-access waitlist, approval in waves.
-2. **OpenRouter** — `typesafe/jev-1.13` pay-per-token (credits needed; cheapest way in without waitlist).
+**Model (Jev):** measured **~$0.00002/call** via OpenRouter → run rate ≈ **$0.005–0.01/day**. Access routes:
+1. **OpenRouter** — `typesafe/jev-1.13` pay-per-token ✅ **live** (key in `.env`).
+2. **`console.typesafe.ai/keys`** — official TypeSafe route (early-access waitlist) — grab one when approved.
 3. **Vercel AI Gateway** — also serves it.
-Ask the user to grab a TypeSafe key (or OpenRouter credits) — that's the one credential this
-project genuinely needs. Everything else runs free today.
+
+**CoinGecko (v2 pair scout):** free public API (`/search/trending`, `/coins/markets`), keyless,
+rate-limited — discovery only; Binance supplies execution data.
 
 **Bottom line:** current bot = $0 infra (public CCXT data + local SQLite + paper mode).
 Jev ≈ $0.01–0.10/mo. RPC = $0 until onchain.
 
-## 8. Conventions (standing rules)
+## 7. Conventions (standing rules)
 
 - **Branches:** `dev` = agent work; `main` = verified/stable. Never delete branches or files
   without explicit user approval. Never force-push. Merge dev→main only after user verification.
-- **Delegated coder: MiMoCode** (`mimo run --yolo`, `xiaomi/mimo-v2.6-pro`, Token Plan = $0 cost;
-  CLI at `~/.mimocode/bin/mimo`). Claude Code only when quota available. Hermes = orchestration/ops
-  + small fixes. One delegated coding job at a time. Verify every agent's claims by running tests.
+- **Delegated coding:** see §6 — Cline+mimo default, Opus scalpel, one job at a time. Hermes specs
+  and verifies every agent's claims by running tests.
 - **TDD:** tests before code for anything touching orders, money, or risk. `cabbage_tests/` is ours;
   `tests/` is upstream's — don't break upstream tests silently.
 - **Live money safety:** paper-first, deterministic gates, no hidden broker writes. Live mode stays
@@ -203,11 +213,22 @@ Jev ≈ $0.01–0.10/mo. RPC = $0 until onchain.
   stays gitignored as-is; don't start a secrets-management campaign.
 - Times reported in Asia/Bangkok.
 
-## 9. Commands
+## 8. Commands
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt
+python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # NOT uv sync (broken lock)
 
+# Jev decision system (our layer)
+.venv/bin/python scripts/shadow_scorer.py --once               # live Jev score, no trading
+.venv/bin/python scripts/paper_loop.py --once                  # one dual-book cycle
+.venv/bin/python scripts/paper_loop.py --interval 300          # loop mode (5-min verdicts)
+.venv/bin/python scripts/jev_probe.py                          # API probe
+
+# tests — all 5 suites must stay green
+for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps; do
+  .venv/bin/python scripts/$t.py; done
+
+# original engine (upstream RSI/EMA app layer, unchanged)
 .venv/bin/python -m cabbage doctor              # config check, no orders
 .venv/bin/python -m cabbage doctor --online     # + public exchange data, no orders
 .venv/bin/python -m cabbage backtest            # offline event backtest + HTML report
@@ -215,15 +236,27 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt
 .venv/bin/python -m cabbage paper               # continuous paper runtime
 .venv/bin/python -m cabbage live                # REAL orders — explicit, needs keys
 
-.venv/bin/python -m unittest discover -s cabbage_tests -v        # our tests
+.venv/bin/python -m unittest discover -s cabbage_tests -v        # upstream-adjacent tests
 .venv/bin/python -m unittest tests.app.test_paper_trading -v     # upstream paper tests
 ```
 
-`.env` (gitignored) from `.env.example`: `CABBAGE_*` settings + `{MARKET}_API_KEY`/`{MARKET}_SECRET_KEY` for live only. (Names flip to `JEVELIN_*` in the whitelabel pass — update this table then.)
+`.env` (gitignored) from `.env.example`: `OPENROUTER_API_KEY`, `JEVELIN_MODEL=typesafe/jev-1.13`,
+`CABBAGE_*` settings + `{MARKET}_API_KEY`/`{MARKET}_SECRET_KEY` for live only. (Names flip to
+`JEVELIN_*` in the whitelabel pass — update this section then.)
 
-## 10. Open questions for the user
+## 9. Roadmap
 
-1. **Jev key:** join the TypeSafe waitlist (`console.typesafe.ai`) and/or grab OpenRouter credits — tell me which lands and I'll wire the shadow-mode gate.
-2. **Exchange scope:** stay Bitvavo/BTC-EUR for the experiment, or standardize on Binance (deeper liquidity, more pairs) for the whitelabel product? Both are CCXT-trivial.
+| # | Item | Status |
+|---|---|---|
+| 1 | Jev decision stack (client → scorer → gates → books) | ✅ done, 77/77 |
+| 2 | **Loop service launch** — supervised process, auto-restart, decision logs | next |
+| 3 | **Telegram decision/trade feed** (EarnGrid reporting pattern) | P1 |
+| 4 | Multi-pair (BTC/ETH/SOL) then **CoinGecko trending scout** | P1 → P2 |
+| 5 | **Analysis report** from accumulated logs (vetoes vs baseline, calibration) | P1, gates promotion |
+| 6 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
+| 7 | Walk-forward validation + slippage-aware replay | P2 |
+| 8 | Paper→live promotion gate (stats thresholds + explicit user approval) | gated on #5 |
+| 9 | Live: Binance keys, exchange-side stops, tiny float | gated on #8 |
+| 10 | Onchain execution (Base) — reuse EarnGrid RPC stack | P3 |
 
-*(Name is locked: **Jevelin**. Working name "TradeGrid" retired 2026-09-25.)*
+*(Name locked: **Jevelin**. "TradeGrid" retired 2026-09-25.)*

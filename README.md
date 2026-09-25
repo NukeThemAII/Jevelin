@@ -1,98 +1,102 @@
-<p align="center">
-  <img src="assets/cabbage-banner.png" alt="CABBAGE — spot trading bot" width="100%">
-</p>
+# Jevelin
 
-# CABBAGE
+**Jev-powered crypto trading on Binance — dual-book paper trading with hard risk gates.**
 
-CABBAGE built directly on **Investing Algorithm Framework 9.0.0a18**.
-The original framework is the runtime, not an unused vendored dependency.
+Jevelin puts a calibrated AI decision model ([Jev](https://openrouter.ai/typesafe/jev-1.13), TypeSafe "System One") in the loop of a deterministic trading engine: the model reads the market state and answers typed questions (how strong is the pump/dump, what phase, is this a fakeout), and **code** — not the model — turns those answers into trade actions with strict risk limits. Paper-first: everything below runs and logs real decisions against live market data without moving real money.
 
-[Русская инструкция → START-HERE-RU.md](START-HERE-RU.md)
+## Why a decision model?
 
-## Architecture
+Classic bots compute indicators and hope. Jevelin asks a calibrated model for probabilities on the questions that actually decide momentum trades, then gates on those probabilities and confidence:
 
-`CabbageStrategy → original signal/risk pipeline → original order service →
-CCXTOrderExecutor (live) or PaperTradingOrderExecutor (paper) → original
-portfolio/trade services → SQLite + RunReport`
-
-The full upstream Python package, original strategies/examples, tests and data,
-documentation, native sources and license are included. The original README is
-[UPSTREAM-README.md](UPSTREAM-README.md). No simplified replacement engine is used.
-
-## Install (Python 3.12 recommended)
-
-From the repository root:
-
-```sh
-python -m venv .venv
-# Windows cmd: .venv\Scripts\activate
-# macOS / Linux: source .venv/bin/activate
-python -m pip install -r requirements-cabbage.txt
+```
+pump     score  none → building → strong → euphoric     "how strong is the move up?"
+dump     score  none → building → strong → capitulating "how strong is the move down?"
+phase    choice accumulation | breakout | distribution | capitulation | ranging
+exhaustion noul  "is the move losing steam?"
+whipsaw  noul    "is this breakout a fakeout?"           (ours, not in the original set)
 ```
 
-Copy `.env.example` to `.env` and edit your settings. Never commit `.env`.
+The question set is ported from CoinGecko's open-source Pump Pulse Jev demo; the state builder, risk gates, and dual-book system are ours. Every answer is stored raw with a decision log — nothing is fabricated, ever.
 
-## Commands
+## How it works
 
-```sh
-python -m cabbage doctor                 # inspect configuration, no orders
-python -m cabbage doctor --online        # check public exchange data, no orders
-python -m cabbage backtest               # offline, original event-driven engine
-python -m cabbage paper --iterations 1   # one paper iteration using exchange data
-python -m cabbage paper                  # continuous original paper runtime
-python -m cabbage live                   # REAL exchange execution with your keys
+```
+Binance public data (free, keyless)
+   → state builder (price path, trade flow, features)
+   → ONE Jev call with 5 questions          ~400ms, ~$0.00004
+   → verdict (pump/dump 0-100, phase, exhaustion, whipsaw, confidence)
+   → risk gates (deterministic)             vetoes: whipsaw, exhaustion, capitulation,
+   │                                        daily-loss kill, cooldown, funding, malformed
+   ├→ spot book   long-only,  ≤20% equity × confidence
+   └→ perps book  long+short, ≤10% margin × confidence, leverage ≤3x,
+                  mandatory stop-loss, liquidation accounting, funding accrual
+   → JSONL decision/trade logs (full audit trail)
 ```
 
-`live` is the explicit real-order command. It requires the selected exchange's
-`{MARKET}_API_KEY` and `{MARKET}_SECRET_KEY`. Exchange/account support, permissions,
-pair availability, venue order minimums and sufficient balances remain necessary.
-The CABBAGE wrapper currently supports spot pairs requiring key/secret auth.
-The upstream framework retains its full extension APIs for other integrations.
+Key invariants:
+- **Code is in control.** Jev answers questions; it never sizes orders, never places them.
+- **Fail-open.** Any API error → skip the trade and log why. No fabricated verdicts.
+- **Hard risk caps.** Nothing can exceed configured exposure, leverage, or loss limits.
+- **Paper-first.** Promotion to live requires accumulated stats and explicit human approval.
 
-## What this strategy does
+## Status (2026-09-25, verified)
 
-It reuses the upstream RSI/EMA crossover strategy from `examples/simple_app.py`.
-The CABBAGE configuration uses long-only spot entries/exits, a fixed quote-currency
-ticket, a fixed percentage stop, and excludes incomplete candles. It does not use
-Jev or score smart-money wallets. No calibrated 80% model probability is invented.
+| | |
+|---|---|
+| Tests | 77/77 across 5 suites + 18 upstream tests green |
+| Live pipeline | verified end-to-end on real Binance data |
+| Live decisions | e.g. `skip, vetoed_by=capitulation` — risk gates working on real state |
+| Trading | **paper only** — no live orders, no profit claims yet |
 
-Default configuration reproduces an upstream market/pair: BITVAVO, BTC/EUR,
-2-hour candles, 50 EUR entry ticket, 5% stop, paper initial balance 1000 EUR,
-0.25% configured fee. These are software defaults, not investment recommendations.
-A valid entry is conditional; a run may legitimately produce no orders.
-The signal schedule cannot be faster than the candle timeframe, per upstream.
+Numbers will come from accumulated paper stats. Until then, this page makes no PnL claims.
 
-Stop management is provided by the original framework. Stops are not guaranteed
-exchange-side orders or guaranteed fill prices; stopping the bot can interrupt
-client-side protection. The original limit execution can leave orders pending.
+## Costs (measured, not estimated)
 
-## Data and state
+| What | Cost |
+|---|---|
+| One Jev decision (5 questions) | ~$0.00004 |
+| Full-day run (5-min cadence, 1 pair) | ~$0.01 |
+| Market data | $0 (Binance public API, keyless) |
+| Infrastructure | $0 (runs on any $5 VPS or a laptop) |
 
-State is separated by mode, market and pair under `runtime/`. The framework
-persists its database and run reports there. A bounded run or normal shutdown
-also exports `latest-run.json` from the actual framework report. No promotional
-P&L is preloaded. Do not run two processes against the same state directory.
-
-The bundled offline backtest uses original BTC/EUR candles from June 2024.
-It writes an HTML report and the framework's native backtest artifacts under
-`runtime/backtest/bitvavo/BTC-EUR/`. It is an integration check, not a profitability
-claim or a recreation of the supplied +$6,400 narrative.
-
-## Tests
+## Quickstart
 
 ```sh
-python -m unittest discover -s cabbage_tests -v
-python -m unittest tests.app.test_paper_trading -v
+git clone https://github.com/NukeThemAII/Jevelin && cd Jevelin
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-cabbage.txt
+
+# .env: OPENROUTER_API_KEY=sk-or-...   (get credits at openrouter.ai)
+cp .env.example .env
+
+# see a live AI verdict on real market data (no trading):
+.venv/bin/python scripts/shadow_scorer.py --once
+
+# one paper cycle across both books (spot + perps):
+.venv/bin/python scripts/paper_loop.py --once
+
+# run it:
+.venv/bin/python scripts/paper_loop.py --interval 300
 ```
 
-See [VALIDATION.md](VALIDATION.md) for actual results and limits. The complete
-upstream suite is preserved but has not all been executed for this delivery.
+Tests:
 
-## Still absent from the supplied upstream
+```sh
+for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps; do
+  .venv/bin/python scripts/$t.py; done
+```
 
-- Robinhood Chain RPC/DEX wallet scanner and signing/execution adapter.
-- Jev inference API implementation.
-- The promotional smart-wallet strategy and independently verified trade history.
+## Roadmap
 
-This delivery preserves and uses the actual exchange-trading functionality in
-the source you supplied. It does not claim the above integrations exist.
+- [x] Jev decision stack: client → questions → state → scorer → risk gates → paper books
+- [x] Dual-book paper loop (spot + perps) with full decision logging
+- [ ] Multi-pair (BTC, ETH, SOL) + CoinGecko trending pair discovery
+- [ ] Telegram decision/trade feed
+- [ ] Analysis report: do Jev vetoes beat baseline? calibration check
+- [ ] Promotion gate → live (tiny float, exchange-side stops, human-approved)
+
+## Provenance & license
+
+Built on the [Investing Algorithm Framework](https://github.com/mdutr/algorithm-framework) 9.0.0a18 (vendored), forked from [sopersone/cabbage-trading-machine](https://github.com/sopersone/cabbage-trading-machine) (whose engine layer we keep and extend — see `UPSTREAM-README.md`). Apache-2.0 — see `LICENSE` and `AUTHORS.md`.
+
+This is experimental software for research. Not financial advice. Paper results do not guarantee live results.
