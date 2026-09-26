@@ -244,19 +244,41 @@ for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_
 `CABBAGE_*` settings + `{MARKET}_API_KEY`/`{MARKET}_SECRET_KEY` for live only. (Names flip to
 `JEVELIN_*` in the whitelabel pass — update this section then.)
 
-## 9. Roadmap
+## 9. v2 build plan (design approved 2026-09-26)
+
+Full blueprint: **`docs/V2-DESIGN.md`** (audit of the first 8.7h paper run + v2 design). Coding
+sessions implement it milestone by milestone — one milestone per session, in order:
+
+| M | Build (file scope in V2-DESIGN.md B.7) | Why |
+|---|---|---|
+| **M0** | Instrument v1: fee+slippage model, decision ids, per-gate veto bitmask, atomic writes | honest numbers + analyzable (audit F-P0-1/3/4) |
+| **M1** | SQLite store + JSONL importer + replay utilities | free replay = the calibration backbone |
+| **M2** | Split-cadence supervisor (fast risk loop 5-10s, slow Jev 5min + burst trigger) + decision cache | stops react fast, Jev spend ↓ |
+| **M3** | Regime classifier (chop filter) + entry/exit hysteresis + confidence sizing tiers + config file | kills the churn the audit found (PF 0.613 in chop) |
+| **M4** | Calibration harness: per-gate attribution, confidence curve, weekly re-tune report | the machine that learns whether Jev has an edge |
+| **M5** | Multi-pair (BTC/ETH/SOL) + portfolio risk (per-pair caps, global kill, drawdown halt) | scale + portfolio-grade safety |
+| **M6** | CoinGecko discovery scout (trending → Binance liquidity/age filters) | dynamic universe (B.4a; CG = where to look, never what to do) |
+| **M7** | Observability: Telegram feed, daily summary, promotion-gate report | operator visibility + go/no-go automation |
+
+Key v2 decisions already made (don't re-litigate): fees+slippage mandatory in all PnL; regime
+`chop` forbids entries; exits need hysteresis (2 consecutive cycles or ≥75 single tick); whipsaw
+gate cuts at 0.45 with self-consistency fan-out in the 0.40–0.60 band; shorts must become
+reachable or the perps book merges into a leverage tier; CoinGecko cross-venue divergence and
+vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net PF ≥1.15, DD ≤3%.
+
+## 10. Roadmap
 
 | # | Item | Status |
 |---|---|---|
 | 1 | Jev decision stack (client → scorer → gates → books) | ✅ done, 77/77 |
-| 2 | **Loop service launch** — supervised process, auto-restart, decision logs | next |
-| 3 | **Telegram decision/trade feed** (EarnGrid reporting pattern) | P1 |
-| 4 | Multi-pair (BTC/ETH/SOL) then **CoinGecko trending scout** | P1 → P2 |
-| 5 | **Analysis report** from accumulated logs (vetoes vs baseline, calibration) | P1, gates promotion |
-| 6 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
-| 7 | Walk-forward validation + slippage-aware replay | P2 |
-| 8 | Paper→live promotion gate (stats thresholds + explicit user approval) | gated on #5 |
-| 9 | Live: Binance keys, exchange-side stops, tiny float | gated on #8 |
+| 2 | 8.7h paper run + full audit (docs/V2-DESIGN.md Part A) | ✅ done 2026-09-26 |
+| 3 | v2 design blueprint (Part B) | ✅ approved — build plan §9 |
+| 4 | **M0: instrument v1 (fees/slippage, ids, bitmask)** | **next coding session** |
+| 5 | M1–M3 (store, supervisor, regime+hysteresis) | queued |
+| 6 | M4 calibration harness → M5 multi-pair → M6 CoinGecko scout → M7 observability | queued |
+| 7 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
+| 8 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
+| 9 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #8 |
 | 10 | Onchain execution (Base) — reuse EarnGrid RPC stack | P3 |
 
 *(Name locked: **Jevelin**. "TradeGrid" retired 2026-09-25.)*
