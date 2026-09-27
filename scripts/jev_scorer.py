@@ -56,7 +56,18 @@ class ShadowScorer:
             now_ms = int(time.time() * 1000)
             state = build_state(symbol, closes, trades, now_ms)
             state_str = json.dumps(state, separators=(",", ":"), sort_keys=True)
+            return self.score_state(state_str, symbol, decision_id=decision_id)
+        except Exception as exc:  # fail-open: never fabricate values
+            return {"ok": False, "error": str(exc), "symbol": symbol,
+                    "decision_id": decision_id}
 
+    def score_state(self, state_str: str, symbol: str,
+                    decision_id: Optional[str] = None) -> dict:
+        """Verdict from an already-built state string (M2 supervisor). Fail-open.
+
+        The exact Jev call + parse flow of ``score``; the caller owns state
+        building and the decision cache."""
+        try:
             result = self.client.ask(state_str, QUESTIONS, decision_id=decision_id)
             if not result.get("ok"):
                 return {

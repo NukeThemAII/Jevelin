@@ -227,13 +227,19 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 
 # Jev decision system (our layer)
 .venv/bin/python scripts/shadow_scorer.py --once               # live Jev score, no trading
-.venv/bin/python scripts/paper_loop.py --once                  # one dual-book cycle
-.venv/bin/python scripts/paper_loop.py --interval 300          # loop mode (5-min verdicts)
+.venv/bin/python scripts/jevelin_supervisor.py --once          # M2 supervisor: 1 slow cycle + fast ticks
+.venv/bin/python scripts/jevelin_supervisor.py --max-cycles 12 # bounded live supervisor run
+.venv/bin/python scripts/paper_loop.py --once                  # deprecated fallback: one dual-book cycle
+.venv/bin/python scripts/paper_loop.py --interval 300          # deprecated fallback loop
 .venv/bin/python scripts/jev_probe.py                          # API probe
 .venv/bin/python scripts/jev_summary.py                        # offline stats: net PnL, fees, per-gate vetoes
+.venv/bin/python scripts/jev_import.py                         # JSONL -> SQLite (idempotent)
+.venv/bin/python scripts/jev_replay.py --summary               # store vs JSONL cross-check
 
-# tests — all 5 suites must stay green
-for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps; do
+# tests — all 11 script suites must stay green
+for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
+         test_jev_store test_jev_import test_jev_replay test_jev_radar \
+         test_jev_cache test_jev_supervisor; do
   .venv/bin/python scripts/$t.py; done
 
 # original engine (upstream RSI/EMA app layer, unchanged)
@@ -282,11 +288,12 @@ vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net P
 | 2 | 8.7h paper run + full audit (docs/V2-DESIGN.md Part A) | ✅ done 2026-09-26 |
 | 3 | v2 design blueprint (Part B) | ✅ approved — build plan §9 |
 | 4 | M0: instrument v1 (fees/slippage, ids, bitmask, atomic writes) | ✅ done 2026-09-27 (commit 39a175a, 94/94 tests; `jev_summary.py`) |
-| 5 | M1–M3 (store, supervisor, regime+hysteresis) | queued |
-| 6 | M4 calibration harness → M5 multi-pair → M6 CoinGecko scout → M7 observability | queued |
-| 7 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
-| 8 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
-| 9 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #8 |
-| 10 | Onchain execution (Base) — reuse EarnGrid RPC stack | P3 |
+| 5 | M1: SQLite store + JSONL importer + replay utilities | ✅ done 2026-09-27 (commit 70858a6; `jev_replay.py --summary` cross-check) |
+| 6 | M2: split-cadence supervisor + decision cache (`jevelin_supervisor.py`) | ✅ done 2026-09-27 (24h sim 73/288 Jev calls = 25.3% ≤ 40%; stops ≤10s; 32/32 new tests) |
+| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | queued |
+| 8 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
+| 9 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
+| 10 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #9 |
+| 11 | Onchain execution (Base) — reuse EarnGrid RPC stack | P3 |
 
 *(Name locked: **Jevelin**. "TradeGrid" retired 2026-09-25.)*
