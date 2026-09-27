@@ -2,8 +2,11 @@
 """jev_import — idempotent JSONL -> SQLite importer (M1).
 
 Sources are READ-ONLY (a live paper loop owns them):
-  runtime/jev_decisions.jsonl  -> decisions  (jev_client.JevClient audit rows)
-  runtime/*.trades.jsonl       -> trades     (spot + perps fill rows)
+  runtime/jev_decisions.jsonl  -> decisions       (jev_client.JevClient audit rows)
+  runtime/*.trades.jsonl       -> trades          (spot + perps fill rows)
+  runtime/*decisions*.jsonl    -> gate_decisions  (M4: gate evaluation rows,
+    e.g. paper_decisions.jsonl — action, veto_bitmask, regime, cycle price,
+    per-book verdict; everything the calibration harness replays from).
 
 Lossless: every imported row keeps the verbatim source line in ``raw_json``.
 Pre-M0 rows (no ``fees``/``slippage``/``decision_id``/...) import with NULLs;
@@ -24,6 +27,8 @@ Field mapping (anything else lives on verbatim in raw_json):
   decisions ts = ts (epoch s), cost = raw.usage.cost, ok = not error,
             verdict_json = raw.answers, state_json = {"state_sha256": ...}
             (the client logs a state hash, never the state body).
+  gate_decisions ts = ts_ms (epoch ms), book as for trades, verdict_json =
+            row.verdict, fan_out 1/0; anything else lives verbatim in raw_json.
 
 Usage: .venv/bin/python scripts/jev_import.py [--runtime-dir runtime]
        [--db runtime/jevelin.db]
@@ -125,6 +130,38 @@ def decision_row(obj: dict, raw_line: str, seq: int) -> dict:
         "raw_json": raw_line,
     }
 
+
+def gate_decision_row(obj: dict, raw_line: str, seq: int, path: Path) -> dict:
+    """Map one *decisions*.jsonl gate record to the gate_decisions schema (M4).
+
+    The gate layers log one row per (decision, book): action, veto_bitmask,
+    regime, the cycle price and the normalized verdict. Lossless: anything the
+    schema does not cover stays verbatim in raw_json.
+    """
+    ts = obj.get("ts_ms")
+    if not isinstance(ts, (int, float)):
+        ts_val = obj.get("ts")
+        ts = float(ts_val) * 1000.0 if isinstance(ts_val, (int, float)) else None
+    verdict = obj.get("verdict") if isinstance(obj.get("verdict"), dict) else None
+    mask = obj.get("veto_bitmask")
+    fan = obj.get("fan_out")
+    return {
+        "ts": float(ts) if ts is not None else None,
+        "decision_id": obj.get("decision_id") or _synthetic_id(ts, seq),
+        "book": _book_of(obj, path),
+        "symbol": obj.get("symbol"),
+        "price": _f(obj, "price"),
+        "action": obj.get("action") if isinstance(obj.get("action"), str) else None,
+        "executed": obj.get("executed") if isinstance(obj.get("executed"), str) else None,
+        "veto_bitmask": mask if isinstance(mask, int) and not isinstance(mask, bool) else None,
+        "reason": obj.get("reason") or "",
+        "equity": _f(obj, "equity"),
+        "regime": obj.get("regime") if isinstance(obj.get("regime"), str) else None,
+        "fan_out": (1 if fan else 0) if fan is not None else None,
+        "verdict_json": json.dumps(verdict) if verdict is not None else None,
+        "raw_json": raw_line,
+    }
+
 def _read_lines(path):
     """Yield (seq, raw_line) for non-blank lines; seq = 1-based file line number."""
     try:
@@ -186,6 +223,27 @@ def import_decisions_file(conn, path) -> dict:
     return stats
 
 
+def import_gate_decisions_file(conn, path) -> dict:
+    """Import one *decisions*.jsonl gate log into gate_decisions (M4)."""
+    path = Path(path)
+    stats = _blank_stats("gate_dec", path)
+    for seq, raw in _read_lines(path):
+        stats["lines"] += 1
+        try:
+            obj = json.loads(raw)
+            if not isinstance(obj, dict):
+                raise ValueError("line is not a JSON object")
+        except ValueError:
+            stats["bad"] += 1
+            continue
+        stats["parsed"] += 1
+        if jev_store.upsert_gate_decision(conn, gate_decision_row(obj, raw, seq, path)):
+            stats["new"] += 1
+        else:
+            stats["dupe"] += 1
+    return stats
+
+
 def import_all(runtime_dir, conn) -> dict:
     """Import every supported JSONL in ``runtime_dir``. Idempotent."""
     runtime_dir = Path(runtime_dir)
@@ -195,6 +253,9 @@ def import_all(runtime_dir, conn) -> dict:
         files.append(import_decisions_file(conn, decisions_path))
     for path in sorted(runtime_dir.glob("*.trades.jsonl")):
         files.append(import_trades_file(conn, path))
+    for path in sorted(runtime_dir.glob("*.jsonl")):
+        if "decisions" in path.name and path.name != DECISIONS_FILE:
+            files.append(import_gate_decisions_file(conn, path))
     totals = {"lines": 0, "parsed": 0, "new": 0, "dupe": 0, "bad": 0}
     for entry in files:
         for key in totals:

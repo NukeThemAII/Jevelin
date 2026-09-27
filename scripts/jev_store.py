@@ -9,11 +9,15 @@ docs/V2-DESIGN.md B.5 plus the M1 radar table:
             latency_ms, ok, raw_json)
   trades(id, decision_id, ts, book, symbol, side, price, qty, notional, fees,
          slippage, realized_pnl, funding_paid, reason, veto_bitmask, raw_json)
+  gate_decisions(id, ts, decision_id, book, symbol, price, action, executed,
+                 veto_bitmask, reason, equity, regime, fan_out, verdict_json,
+                 raw_json)                      # M4: per-book gate evaluations
   positions(id, book, symbol, side, qty, entry_price, stop_price, liq_price,
             entry_ts, close_ts)
   marks(ts, symbol, price, equity, book)
   radar_candidates(ts, run_id, rank, symbol, coingecko_id, price_usd,
                    volume_24h, mcap, ath_date, passed, rejections_json, raw_json)
+  calibration_runs(id, params, metrics_json)    # M4: one row per calibrate run
 
 ``decision_id`` is TEXT and ``veto_bitmask`` is INTEGER. ``raw_json`` holds the
 verbatim source line (lossless import) wherever the source row carries fields
@@ -22,13 +26,16 @@ beyond the schema.
 Deterministic upsert keys (idempotent re-imports never duplicate):
   trades   — UNIQUE (book, ts, side, COALESCE(reason, ''))   # the M1 trade key
   decisions — UNIQUE (decision_id, ts)
+  gate_decisions — UNIQUE (decision_id, book, ts)            # the M4 gate key
   radar_candidates — UNIQUE (run_id, coingecko_id)
 
-NOTE: ``trades.ts`` is epoch MILLISECONDS (as the source rows carry ``ts_ms``);
-``decisions.ts`` is epoch SECONDS (as ``jev_client`` logs ``time.time()``).
+NOTE: ``trades.ts`` and ``gate_decisions.ts`` are epoch MILLISECONDS (the source
+rows carry ``ts_ms``); ``decisions.ts`` is epoch SECONDS (as ``jev_client`` logs
+``time.time()``).
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -116,6 +123,32 @@ CREATE TABLE IF NOT EXISTS config_versions (
     yaml TEXT,
     applied_ts REAL
 );
+
+CREATE TABLE IF NOT EXISTS gate_decisions (
+    id INTEGER PRIMARY KEY,
+    ts REAL,
+    decision_id TEXT NOT NULL,
+    book TEXT,
+    symbol TEXT,
+    price REAL,
+    action TEXT,
+    executed TEXT,
+    veto_bitmask INTEGER,
+    reason TEXT,
+    equity REAL,
+    regime TEXT,
+    fan_out INTEGER,
+    verdict_json TEXT,
+    raw_json TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_decisions_dedup
+    ON gate_decisions (decision_id, book, ts);
+
+CREATE TABLE IF NOT EXISTS calibration_runs (
+    id INTEGER PRIMARY KEY,
+    params TEXT,
+    metrics_json TEXT
+);
 """
 
 
@@ -141,6 +174,9 @@ _DECISION_COLS = ("ts", "decision_id", "symbol", "state_json", "verdict_json",
 _TRADE_COLS = ("decision_id", "ts", "book", "symbol", "side", "price", "qty",
                "notional", "fees", "slippage", "realized_pnl", "funding_paid",
                "reason", "veto_bitmask", "raw_json")
+_GATE_COLS = ("ts", "decision_id", "book", "symbol", "price", "action",
+              "executed", "veto_bitmask", "reason", "equity", "regime",
+              "fan_out", "verdict_json", "raw_json")
 _RADAR_COLS = ("ts", "run_id", "rank", "symbol", "coingecko_id", "price_usd",
                "volume_24h", "mcap", "ath_date", "passed", "rejections_json",
                "raw_json")
@@ -191,6 +227,53 @@ def upsert_radar_candidate(conn, row: dict) -> bool:
                    ("run_id", "coingecko_id"),
                    "run_id = ? AND coingecko_id = ?",
                    (row.get("run_id"), row.get("coingecko_id")), row)
+
+
+def upsert_gate_decision(conn, row: dict) -> bool:
+    """Upsert one gate_decisions row; key = (decision_id, book, ts). True iff new."""
+    return _upsert(conn, "gate_decisions", _GATE_COLS,
+                   ("decision_id", "book", "ts"),
+                   "decision_id = ? AND book = ? AND ts = ?",
+                   (row.get("decision_id"), row.get("book"), row.get("ts")), row)
+
+
+def list_gate_decisions(conn, book=None, since_ts=None) -> list:
+    """gate_decisions rows ordered by time (ts is epoch ms)."""
+    sql = "SELECT * FROM gate_decisions"
+    args = []
+    where = []
+    if book is not None:
+        where.append("book = ?")
+        args.append(book)
+    if since_ts is not None:
+        where.append("ts >= ?")
+        args.append(float(since_ts))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY ts, id"
+    return [dict(r) for r in conn.execute(sql, args).fetchall()]
+
+
+def insert_calibration_run(conn, params, metrics) -> int:
+    """Record one calibration run (M4): params = CLI opts, metrics = headline
+    numbers — stored as JSON text (non-str inputs are json.dumps'd)."""
+    def _text(value):
+        return value if isinstance(value, str) else json.dumps(value, default=str)
+
+    cur = conn.execute(
+        "INSERT INTO calibration_runs (params, metrics_json) VALUES (?, ?)",
+        (_text(params), _text(metrics)))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def list_calibration_runs(conn, limit=None) -> list:
+    sql = "SELECT * FROM calibration_runs ORDER BY id"
+    args = []
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
 def insert_config_version(conn, yaml_text: str, applied_ts=None) -> int:

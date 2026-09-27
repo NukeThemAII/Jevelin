@@ -239,11 +239,14 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 .venv/bin/python scripts/jev_summary.py                        # offline stats: net PnL, fees, per-gate vetoes
 .venv/bin/python scripts/jev_import.py                         # JSONL -> SQLite (idempotent)
 .venv/bin/python scripts/jev_replay.py --summary               # store vs JSONL cross-check
+.venv/bin/python scripts/jev_calibrate.py --out report.md      # M4: calibration report, on-demand (no cron)
+.venv/bin/python scripts/jev_calibrate.py --since 2026-09-27   #   (optional: filter data from a date)
 
-# tests — all 13 script suites must stay green
+# tests — all 14 script suites must stay green
 for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
          test_jev_store test_jev_import test_jev_replay test_jev_radar \
-         test_jev_cache test_jev_supervisor test_jev_regime test_jev_config; do
+         test_jev_cache test_jev_supervisor test_jev_regime test_jev_config \
+         test_jev_calibrate; do
   .venv/bin/python scripts/$t.py; done
 
 # original engine (upstream RSI/EMA app layer, unchanged)
@@ -294,7 +297,7 @@ vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net P
 | 4 | M0: instrument v1 (fees/slippage, ids, bitmask, atomic writes) | ✅ done 2026-09-27 (commit 39a175a, 94/94 tests; `jev_summary.py`) |
 | 5 | M1: SQLite store + JSONL importer + replay utilities | ✅ done 2026-09-27 (commit 70858a6; `jev_replay.py --summary` cross-check) |
 | 6 | M2: split-cadence supervisor + decision cache (`jevelin_supervisor.py`) | ✅ done 2026-09-27 (24h sim 73/288 Jev calls = 25.3% ≤ 40%; stops ≤10s; 32/32 new tests) |
-| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4–M7 queued |
+| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4 ✅ done 2026-09-28 (commit `M4-SHA`; `jev_calibrate.py`: counterfactual veto-value engine + per-gate attribution/confidence curve/fan-out+ hysteresis stats/re-tune proposals, `gate_decisions`+`calibration_runs` store tables; 304 tests / 14 suites) — **M5 is next**; M6–M7 queued |
 | 8 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
 | 9 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
 | 10 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #9 |
