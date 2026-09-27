@@ -297,7 +297,7 @@ vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net P
 | 4 | M0: instrument v1 (fees/slippage, ids, bitmask, atomic writes) | ✅ done 2026-09-27 (commit 39a175a, 94/94 tests; `jev_summary.py`) |
 | 5 | M1: SQLite store + JSONL importer + replay utilities | ✅ done 2026-09-27 (commit 70858a6; `jev_replay.py --summary` cross-check) |
 | 6 | M2: split-cadence supervisor + decision cache (`jevelin_supervisor.py`) | ✅ done 2026-09-27 (24h sim 73/288 Jev calls = 25.3% ≤ 40%; stops ≤10s; 32/32 new tests) |
-| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4 ✅ done 2026-09-28 (commit `M4-SHA`; `jev_calibrate.py`: counterfactual veto-value engine + per-gate attribution/confidence curve/fan-out+ hysteresis stats/re-tune proposals, `gate_decisions`+`calibration_runs` store tables; 304 tests / 14 suites) — **M5 is next**; M6–M7 queued |
+| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4 ✅ done 2026-09-28 (commit `2814ab5`; `jev_calibrate.py`: counterfactual veto-value engine + per-gate attribution/confidence curve/fan-out + hysteresis stats/re-tune proposals, `gate_decisions`+`calibration_runs` store tables; 304 tests / 14 suites) — **M5 is next**; M6–M7 queued |
 | 8 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
 | 9 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
 | 10 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #9 |
