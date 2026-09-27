@@ -103,6 +103,13 @@ reason, never fabricate a verdict.
 Sizing is decided by code (`RiskConfig` / `PerpsConfig` constants × Jev confidence). Jev never
 chooses amounts. Change caps by changing config — nothing can exceed them.
 
+**Fill model (M0, live since 2026-09-27):** every fill pays a fee + slippage per side —
+spot `fee_rate=0.001` (operator's real Binance rate 0.10%), perps `taker_fee_rate=0.0005`
+(Binance USDT-M taker 0.05%), `slippage_rate=0.0005` (5 bp, adverse; settable to 0 for
+perfect-limit-fill analysis). All in `scripts/jev_config.py`, overridable via
+`paper_loop.py --fee-rate/--slippage-rate`. Every decision has a `decision_id` end-to-end
+and every decision record carries the full `veto_bitmask` of ALL failing gates.
+
 ### Cadence (split — deliberately not per-second)
 - **Jev verdicts:** every **5 min** per pair + **event bursts** (volatility/trade-rate spike → score immediately for a few cycles). Jev calls cost ~$0.00002; redundancy is the enemy, not cost.
 - **Stop/liquidation checks:** every **10 s** — deterministic, free, and the real clock for risk.
@@ -223,6 +230,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 .venv/bin/python scripts/paper_loop.py --once                  # one dual-book cycle
 .venv/bin/python scripts/paper_loop.py --interval 300          # loop mode (5-min verdicts)
 .venv/bin/python scripts/jev_probe.py                          # API probe
+.venv/bin/python scripts/jev_summary.py                        # offline stats: net PnL, fees, per-gate vetoes
 
 # tests — all 5 suites must stay green
 for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps; do
@@ -273,7 +281,7 @@ vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net P
 | 1 | Jev decision stack (client → scorer → gates → books) | ✅ done, 77/77 |
 | 2 | 8.7h paper run + full audit (docs/V2-DESIGN.md Part A) | ✅ done 2026-09-26 |
 | 3 | v2 design blueprint (Part B) | ✅ approved — build plan §9 |
-| 4 | **M0: instrument v1 (fees/slippage, ids, bitmask)** | **next coding session** |
+| 4 | M0: instrument v1 (fees/slippage, ids, bitmask, atomic writes) | ✅ done 2026-09-27 (commit 39a175a, 94/94 tests; `jev_summary.py`) |
 | 5 | M1–M3 (store, supervisor, regime+hysteresis) | queued |
 | 6 | M4 calibration harness → M5 multi-pair → M6 CoinGecko scout → M7 observability | queued |
 | 7 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
