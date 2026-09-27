@@ -62,6 +62,10 @@ class PaperPortfolio:
         self.slippage_rate: float = sr if sr is not None and sr >= 0 else float(SLIPPAGE_RATE)
         self.fees_paid: float = 0.0
         self.slippage_paid: float = 0.0
+        # M3 hysteresis state (persisted in the state JSON): consecutive exit-
+        # signal cycles and decision cycles since entry.
+        self.exit_signal_cycles: int = 0
+        self.cycles_held: int = 0
 
     # -- accounting helpers ---------------------------------------------
 
@@ -98,6 +102,8 @@ class PaperPortfolio:
             equity_usd=equity,
             daily_pnl_pct=daily_pnl_pct,
             last_entry_ts_ms=self.last_entry_ts_ms,
+            exit_signal_cycles=self.exit_signal_cycles,
+            cycles_held=self.cycles_held,
         )
 
     # -- actions ---------------------------------------------------------
@@ -130,11 +136,28 @@ class PaperPortfolio:
                 return self._enter(action, symbol, p, ts, out, did, reason)
             if kind == "exit":
                 return self._exit(symbol, p, ts, out, did, reason)
+            # hold / skip: adopt the gate layer's updated hysteresis counters
+            self._adopt_signal_state(action)
             out["detail"] = f"no-op action={kind!r}"
             return out
         except Exception as exc:  # defensive: never raise into the loop
             out["detail"] = f"error: {type(exc).__name__}: {exc}"
             return out
+
+    def _adopt_signal_state(self, action) -> None:
+        """Persist decide() hysteresis counters (M3): never trust junk."""
+        if not isinstance(action, dict):
+            return
+        esc = action.get("exit_signal_cycles")
+        if isinstance(esc, int) and not isinstance(esc, bool) and esc >= 0:
+            self.exit_signal_cycles = esc
+        ch = action.get("cycles_held")
+        if isinstance(ch, int) and not isinstance(ch, bool) and ch >= 0:
+            self.cycles_held = ch
+
+    def _reset_signal_state(self) -> None:
+        self.exit_signal_cycles = 0
+        self.cycles_held = 0
 
     def _enter(self, action, symbol, price, ts_ms, out, decision_id=None, reason=""):
         if self.position is not None:
@@ -164,10 +187,12 @@ class PaperPortfolio:
             "entry_fee": fee,
         }
         self.last_entry_ts_ms = ts_ms
+        self._reset_signal_state()  # fresh position: hysteresis counters restart
         out.update(executed="enter", qty=qty, usd=usd, realized_pnl=0.0,
                    fees=fee, slippage=slippage, detail="entered")
         self._append_trade(ts_ms, symbol, "buy", fill, qty, usd, 0.0, fee, slippage,
-                           decision_id, reason or "entered")
+                           decision_id, reason or "entered",
+                           size_tier=action.get("size_tier"))
         return out
 
     def _exit(self, symbol, price, ts_ms, out, decision_id=None, reason=""):
@@ -188,6 +213,7 @@ class PaperPortfolio:
         self.fees_paid += fee
         self.slippage_paid += slippage
         self.position = None
+        self._reset_signal_state()  # closed: hysteresis counters restart
         out.update(
             executed="exit", qty=qty, usd=proceeds, realized_pnl=realized_pnl,
             fees=fee, slippage=slippage, detail="exited"
@@ -197,7 +223,7 @@ class PaperPortfolio:
         return out
 
     def _append_trade(self, ts_ms, symbol, side, price, qty, usd, realized_pnl,
-                      fees, slippage, decision_id, reason):
+                      fees, slippage, decision_id, reason, size_tier=None):
         line = {
             "ts_ms": int(ts_ms),
             "decision_id": decision_id,
@@ -211,6 +237,7 @@ class PaperPortfolio:
             "fees": float(fees),
             "slippage": float(slippage),
             "reason": reason,
+            "size_tier": size_tier,
         }
         try:
             path = self._trade_log_path()
@@ -231,6 +258,8 @@ class PaperPortfolio:
             "last_entry_ts_ms": self.last_entry_ts_ms,
             "fees_paid": self.fees_paid,
             "slippage_paid": self.slippage_paid,
+            "exit_signal_cycles": self.exit_signal_cycles,
+            "cycles_held": self.cycles_held,
         }
 
     def save(self) -> None:
@@ -277,4 +306,8 @@ class PaperPortfolio:
         self.fees_paid = fees if fees is not None and fees >= 0 else 0.0
         slip = _finite(data.get("slippage_paid"))
         self.slippage_paid = slip if slip is not None and slip >= 0 else 0.0
+        esc = _finite(data.get("exit_signal_cycles"))
+        self.exit_signal_cycles = int(esc) if esc is not None and esc >= 0 else 0
+        ch = _finite(data.get("cycles_held"))
+        self.cycles_held = int(ch) if ch is not None and ch >= 0 else 0
         return True

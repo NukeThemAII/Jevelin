@@ -52,10 +52,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jev_import  # noqa: E402  (store row mapping, identical to the importer)
 import jev_store  # noqa: E402
 from jev_cache import DecisionCache  # noqa: E402
-from jev_config import append_jsonl, new_decision_id  # noqa: E402
+from jev_config import (  # noqa: E402
+    FanoutConfig,
+    MarketConfig,
+    RegimeConfig,
+    append_jsonl,
+    new_decision_id,
+)
 from jev_gates import RiskConfig, decide  # noqa: E402
 from jev_perps import decide_perps  # noqa: E402
 from jev_questions import QUESTIONS  # noqa: E402
+from jev_regime import classify  # noqa: E402
 from jev_scorer import ShadowScorer  # noqa: E402
 from jev_state import build_state  # noqa: E402
 # Reused v1 cycle plumbing (paper_loop is imported, never modified).
@@ -72,11 +79,14 @@ class MarketData:
     symbol. All reads fail open (None / stale / empty, never raise).
     """
 
-    def __init__(self, exchange=None, maxlen: int = 600) -> None:
+    def __init__(self, exchange=None, maxlen: int = 600,
+                 ohlcv_ttl_seconds: float = 60.0) -> None:
         self.exchange = exchange if exchange is not None else self._build_exchange()
         self._prices = {}
         self._trades = {}
         self._closes = {}
+        self._ohlcv = {}  # (symbol, timeframe) -> (fetched_ms, rows) — M3 TTL cache
+        self.ohlcv_ttl_ms = int(float(ohlcv_ttl_seconds) * 1000)
         self._maxlen = int(maxlen)
 
     @staticmethod
@@ -119,6 +129,26 @@ class MarketData:
             buf.extend(trades)
         except Exception as exc:  # fail-open: keep the previous window
             print(f"market: refresh error {symbol}: {type(exc).__name__}: {exc}")
+
+    def ohlcv(self, symbol, timeframe, limit, now_ms):
+        """TTL-cached OHLCV rows (M3 regime inputs). Fail-open: stale/empty.
+
+        One fetch per (symbol, timeframe) per ``ohlcv_ttl_ms`` — burst cycles
+        reuse the same window instead of hammering the REST API.
+        """
+        key = (symbol, str(timeframe))
+        entry = self._ohlcv.get(key)
+        now = int(now_ms)
+        if entry is not None and now - entry[0] < self.ohlcv_ttl_ms and entry[1]:
+            return entry[1]
+        try:
+            rows = self.exchange.fetch_ohlcv(symbol, timeframe, limit=int(limit))
+        except Exception as exc:  # fail-open: keep the previous window
+            print(f"market: ohlcv error {symbol} {timeframe}: "
+                  f"{type(exc).__name__}: {exc}")
+            return entry[1] if entry is not None else []
+        self._ohlcv[key] = (now, rows)
+        return rows
 
     def closes(self, symbol):
         return list(self._closes.get(symbol) or [])
@@ -195,6 +225,23 @@ class LogTailer:
         return out
 
 
+def _m3_decision_row(book, decision_id, symbol, now_ms, price, action, result, verdict,
+                     equity, regime):
+    """paper_loop._decision_row + M3 fields: regime + fan-out audit trail."""
+    row = _decision_row(book, decision_id, symbol, now_ms, price, action, result,
+                        verdict, equity)
+    row["regime"] = regime
+    v = verdict if isinstance(verdict, dict) else {}
+    row["fan_out"] = int(v.get("fan_out") or 0)
+    if "whipsaw_prob_2" in v:
+        row["verdict"]["whipsaw_prob_2"] = v.get("whipsaw_prob_2")
+    if "answers_2" in v:
+        row["answers_2"] = v.get("answers_2")  # the second raw answer (M3)
+    if v.get("fan_out_error"):
+        row["fan_out_error"] = v.get("fan_out_error")
+    return row
+
+
 class Supervisor:
     """Split-cadence driver over the existing gates/books. Fail-open everywhere.
 
@@ -210,7 +257,9 @@ class Supervisor:
                  burst_trades: int = 150, burst_cycles: int = 2,
                  cache_min_move: float = 0.0005, cache_ttl: float = 1800.0,
                  clock=time.time, decision_log_path: str = "runtime/paper_decisions.jsonl",
-                 once: bool = False, max_cycles: Optional[int] = None) -> None:
+                 once: bool = False, max_cycles: Optional[int] = None,
+                 risk_cfg=None, regime_cfg=None, fanout_cfg=None,
+                 market_cfg=None) -> None:
         self.symbols = list(symbols)
         self.market = market
         self.client = client
@@ -231,7 +280,13 @@ class Supervisor:
                                   cache_ttl=cache_ttl, clock=clock)
             for symbol in self.symbols
         }
-        self.scorer = ShadowScorer(client, exchange=getattr(market, "exchange", None))
+        # M3 config sections (frozen dataclasses from jev_config / config/v2.yaml)
+        self.risk_cfg = risk_cfg if risk_cfg is not None else RiskConfig()
+        self.regime_cfg = regime_cfg if regime_cfg is not None else RegimeConfig()
+        self.fanout_cfg = fanout_cfg if fanout_cfg is not None else FanoutConfig()
+        self.market_cfg = market_cfg if market_cfg is not None else MarketConfig()
+        self.scorer = ShadowScorer(client, exchange=getattr(market, "exchange", None),
+                                   fanout=self.fanout_cfg)
         self.slow_results = []  # per-symbol result dicts, appended per cycle
         self._counts = {"slow_cycles": 0, "fast_ticks": 0, "jev_calls": 0}
         self._burst_remaining = {}
@@ -502,6 +557,7 @@ class Supervisor:
             state = build_state(symbol, self.market.closes(symbol),
                                 self.market.trades(symbol), now_ms)
             state_str = json.dumps(state, separators=(",", ":"), sort_keys=True)
+            regime = self._compute_regime(symbol, now_ms)
             price = self.market.last_price(symbol)
             if price is None:
                 print(f"slow: {_ts_iso(now_ms)} decision={decision_id} {symbol} "
@@ -545,14 +601,14 @@ class Supervisor:
             self._write_decision_rows(symbol, state_str, verdict, decision_id,
                                       cache_hit, cost)
             spot_out = self._run_spot(verdict, pair, symbol, price, now_ms,
-                                      decision_id, cache_hit, burst, cost)
+                                      decision_id, cache_hit, burst, cost, regime)
             perps_out = self._run_perps(verdict, pair, symbol, price, now_ms,
-                                        decision_id, cache_hit, burst, cost)
+                                        decision_id, cache_hit, burst, cost, regime)
             self._capture_trade_rows()
             return {"symbol": symbol, "ts_ms": now_ms,
                     "decision_id": decision_id, "cache_hit": cache_hit,
                     "burst": burst, "cost": cost, "verdict": verdict,
-                    "spot": spot_out, "perps": perps_out}
+                    "regime": regime, "spot": spot_out, "perps": perps_out}
         except Exception as exc:  # fail-open: one pair's error never breaks the loop
             print(f"slow: cycle error {symbol}: {type(exc).__name__}: {exc} "
                   f"decision={decision_id}")
@@ -561,6 +617,18 @@ class Supervisor:
                     "burst": 0, "cost": 0.0,
                     "error": f"{type(exc).__name__}: {exc}"}
 
+    def _compute_regime(self, symbol, now_ms) -> str:
+        """Deterministic regime (M3, free). Fail-open -> "chop" (no entries)."""
+        try:
+            rows_15m = self.market.ohlcv(symbol, "15m",
+                                         self.market_cfg.ohlcv_15m_limit, now_ms)
+            rows_1h = self.market.ohlcv(symbol, "1h",
+                                        self.market_cfg.ohlcv_1h_limit, now_ms)
+            return classify(rows_15m, rows_1h, self.regime_cfg)
+        except Exception as exc:  # fail-open: unknown regime forbids entries
+            print(f"regime: classify error {symbol}: {type(exc).__name__}: {exc}")
+            return "chop"
+
     def _score(self, cache, symbol, state_str, price, decision_id):
         """Fresh Jev score (the only path that spends money). Returns
         ("miss", verdict)."""
@@ -568,6 +636,8 @@ class Supervisor:
         self._counts["jev_calls"] += 1
         verdict = self.scorer.score_state(state_str, symbol,
                                           decision_id=decision_id)
+        # M3 fan-out: a 2nd sample in the whipsaw band is a 2nd Jev call
+        self._counts["jev_calls"] += int(verdict.get("fan_out") or 0)
         if verdict.get("ok"):
             cache.store(state_str, verdict, price=price, now=self._time())
         return "miss", verdict
@@ -575,20 +645,23 @@ class Supervisor:
     # -- gates + books (paper_loop semantics; line shape + cache/burst/cost) --
 
     def _run_spot(self, verdict, pair, symbol, price, now_ms, decision_id,
-                  cache_hit, burst, cost) -> dict:
+                  cache_hit, burst, cost, regime=None) -> dict:
         """Spot book: decide + apply + save + log (same as paper_loop.run_cycle)."""
         try:
             portfolio = pair.spot
-            cfg = RiskConfig()
+            cfg = self.risk_cfg
             pf = portfolio.to_pf_state(price)  # pre-trade state drives the decision
-            action = decide(verdict, pf, cfg, now_ms, decision_id=decision_id)
+            action = decide(verdict, pf, cfg, now_ms, decision_id=decision_id,
+                            regime=regime)
             result = portfolio.apply_action(action, symbol, price, now_ms,
                                             decision_id=decision_id)
             portfolio.save()
             pf_line = portfolio.to_pf_state(price)  # post-trade status for the line
             print(
                 f"spot: {_ts_iso(now_ms)} decision={decision_id} {symbol} "
-                f"price={price:.4f} action={action['action']} "
+                f"price={price:.4f} regime={regime} "
+                f"fan_out={int((verdict or {}).get('fan_out') or 0)} "
+                f"action={action['action']} "
                 f"executed={result['executed']} {_veto_status(action)} "
                 f"fees={result.get('fees', 0.0):.6f} "
                 f"slippage={result.get('slippage', 0.0):.6f} "
@@ -596,9 +669,9 @@ class Supervisor:
                 f"daily_pnl_pct={pf_line.daily_pnl_pct:.4f} "
                 f"cache={cache_hit} burst={burst} cost={cost:.6f}"
             )
-            append_jsonl(self.decision_log_path, _decision_row(
+            append_jsonl(self.decision_log_path, _m3_decision_row(
                 "spot", decision_id, symbol, now_ms, price, action, result,
-                verdict, pf_line.equity_usd))
+                verdict, pf_line.equity_usd, regime))
             return {"action": action, "result": result,
                     "equity": pf_line.equity_usd,
                     "has_position": pf_line.has_position,
@@ -609,7 +682,7 @@ class Supervisor:
             return {"error": f"{type(exc).__name__}: {exc}"}
 
     def _run_perps(self, verdict, pair, symbol, price, now_ms, decision_id,
-                   cache_hit, burst, cost):
+                   cache_hit, burst, cost, regime=None):
         """Perps book: decide_perps + apply + save + log (paper_loop semantics)."""
         if pair.perps is None:
             return None
@@ -619,7 +692,7 @@ class Supervisor:
             funding_rate = fetch_funding_rate(self.funding_exchange, symbol)
             pf = perps_portfolio.to_pf_state(price)  # pre-trade state drives the decision
             action = decide_perps(verdict, pf, perps_cfg, now_ms, funding_rate,
-                                  decision_id=decision_id)
+                                  decision_id=decision_id, regime=regime)
             result = perps_portfolio.apply_action(action, symbol, price, now_ms,
                                                   funding_rate,
                                                   decision_id=decision_id)
@@ -629,7 +702,9 @@ class Supervisor:
             funding_str = "na" if funding_rate is None else f"{funding_rate:.6f}"
             print(
                 f"perps: {_ts_iso(now_ms)} decision={decision_id} {symbol} "
-                f"price={price:.4f} funding={funding_str} action={action['action']} "
+                f"price={price:.4f} regime={regime} "
+                f"fan_out={int((verdict or {}).get('fan_out') or 0)} "
+                f"funding={funding_str} action={action['action']} "
                 f"executed={result['executed']} detail={result['detail']} "
                 f"{_veto_status(action)} "
                 f"fees={result.get('fees', 0.0):.6f} "
@@ -638,9 +713,9 @@ class Supervisor:
                 f"daily_pnl_pct={pf_line.daily_pnl_pct:.4f} "
                 f"cache={cache_hit} burst={burst} cost={cost:.6f}"
             )
-            append_jsonl(self.decision_log_path, _decision_row(
+            append_jsonl(self.decision_log_path, _m3_decision_row(
                 "perps", decision_id, symbol, now_ms, price, action, result,
-                verdict, pf_line.equity_usd))
+                verdict, pf_line.equity_usd, regime))
             return {"funding_rate": funding_rate, "action": action,
                     "result": result, "equity": pf_line.equity_usd,
                     "has_position": pf_line.has_position, "side": pf_line.side,

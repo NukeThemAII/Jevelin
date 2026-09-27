@@ -34,13 +34,20 @@ def _confidence_min(answers: dict) -> Optional[float]:
 
 
 class ShadowScorer:
-    """Pull public trades/OHLCV, score via JevClient. Public data only."""
+    """Pull public trades/OHLCV, score via JevClient. Public data only.
 
-    def __init__(self, client, exchange=None) -> None:
+    ``fanout`` (FanoutConfig, M3): when the raw whipsaw noul lands in the
+    coin-flip band (band_low, band_high), take a SECOND Jev sample of the same
+    state/questions and record it on the verdict (``fan_out``/``whipsaw_prob_2``
+    / ``answers_2``); the gate layer majority-votes and fails closed on a split.
+    """
+
+    def __init__(self, client, exchange=None, fanout=None) -> None:
         self.client = client
         self.exchange = (
             exchange if exchange is not None else ccxt.binance({"enableRateLimit": True})
         )
+        self.fanout = fanout
 
     def score(self, symbol: str, decision_id: Optional[str] = None) -> dict:
         """Verdict dict for one cycle. ``decision_id`` flows into the verdict and
@@ -94,7 +101,41 @@ class ShadowScorer:
                 "answers": answers,
                 "latency_ms": result.get("latency_ms"),
             }
+            self._maybe_fanout(state_str, verdict, decision_id)
             return verdict
         except Exception as exc:  # fail-open: never fabricate values
             return {"ok": False, "error": str(exc), "symbol": symbol,
                     "decision_id": decision_id}
+
+    def _maybe_fanout(self, state_str: str, verdict: dict,
+                      decision_id: Optional[str] = None) -> None:
+        """M3 whipsaw self-consistency fan-out: 2nd sample in the coin-flip band.
+
+        Only the raw whipsaw noul triggers it (band_low < noul < band_high).
+        On success the second raw answers + noul land on the verdict; on any
+        failure nothing is fabricated — ``fan_out=1`` with no ``whipsaw_prob_2``
+        tells the gate to fail closed (whipsaw_fanout_tie).
+        """
+        if self.fanout is None:
+            return
+        try:
+            w = float(verdict.get("whipsaw_prob"))
+        except (TypeError, ValueError):
+            return
+        if not (self.fanout.band_low < w < self.fanout.band_high):
+            return  # outside the band: single sample, as today
+        verdict["fan_out"] = 1
+        try:
+            result = self.client.ask(state_str, QUESTIONS, decision_id=decision_id)
+        except Exception as exc:  # fail-open: record, never fabricate
+            verdict["fan_out_error"] = f"{type(exc).__name__}: {exc}"
+            return
+        if not result.get("ok"):
+            verdict["fan_out_error"] = str(result.get("error") or "jev ask failed")
+            return
+        try:
+            answers2 = result.get("answers") or {}
+            verdict["whipsaw_prob_2"] = float(answers2["whipsaw"]["noul"])
+            verdict["answers_2"] = answers2
+        except Exception as exc:  # malformed 2nd sample: fail-closed upstream
+            verdict["fan_out_error"] = f"bad 2nd sample: {type(exc).__name__}: {exc}"

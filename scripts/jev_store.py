@@ -110,6 +110,12 @@ CREATE TABLE IF NOT EXISTS radar_candidates (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_radar_dedup
     ON radar_candidates (run_id, coingecko_id);
+
+CREATE TABLE IF NOT EXISTS config_versions (
+    id INTEGER PRIMARY KEY,
+    yaml TEXT,
+    applied_ts REAL
+);
 """
 
 
@@ -185,6 +191,27 @@ def upsert_radar_candidate(conn, row: dict) -> bool:
                    ("run_id", "coingecko_id"),
                    "run_id = ? AND coingecko_id = ?",
                    (row.get("run_id"), row.get("coingecko_id")), row)
+
+
+def insert_config_version(conn, yaml_text: str, applied_ts=None) -> int:
+    """Record one applied config (M3): resolved yaml text + apply timestamp."""
+    import time
+
+    ts = time.time() if applied_ts is None else float(applied_ts)
+    cur = conn.execute(
+        "INSERT INTO config_versions (yaml, applied_ts) VALUES (?, ?)",
+        (str(yaml_text), ts))
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def list_config_versions(conn, limit=None) -> list:
+    sql = "SELECT * FROM config_versions ORDER BY id"
+    args = []
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
 def get_decision(conn, row_id):

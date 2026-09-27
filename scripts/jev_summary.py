@@ -151,6 +151,19 @@ def _print_veto_table(decisions) -> None:
               + str(counts[0]).rjust(8) + str(counts[1]).rjust(8) + str(total).rjust(8))
 
 
+def _print_regime_distribution(decisions) -> None:
+    """M3: counts by regime from the gate-decision records (cheap, read-only)."""
+    counts = {}
+    for book in BOOKS:
+        for row in decisions[book]:
+            regime = row.get("regime") or "n/a"
+            counts[regime] = counts.get(regime, 0) + 1
+    if not counts:
+        return
+    parts = "  ".join(f"{name}={counts[name]}" for name in sorted(counts))
+    print(f"regime distribution (decision records): {parts}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Offline M0 replay summary (reads logs only).")
     p.add_argument("--runtime-dir", default="runtime",
@@ -166,6 +179,7 @@ def main(argv=None) -> int:
         _print_book(book, trades[book])
     print()
     _print_veto_table(decisions)
+    _print_regime_distribution(decisions)
     return 0
 
 

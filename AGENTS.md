@@ -85,23 +85,27 @@ reason, never fabricate a verdict.
 | | Spot book | Perps book |
 |---|---|---|
 | Direction | long-only | long + short |
-| Sizing | `size_fraction = 0.20 × confidence` | `margin = 0.10 × confidence`, `notional = margin × leverage` |
+| Sizing | confidence tiers of the 20% cap (60/80/100%) | confidence tiers of the 10% margin cap, `notional = margin × leverage` |
 | Leverage | 1x | hard cap **3x** |
 | Stop-loss | exit rules only | **mandatory on every position** (2% default) |
 | Liquidation | n/a | computed liq price; forced close loses whole margin |
 | Funding | n/a | paid/received on close per 8h periods; entries vetoed when funding runs against the side (>±0.01%/8h) |
 
-### Entry/exit gates (both books, in check order)
+### Entry/exit gates (both books, M3 numbers — all in `config/v2.yaml`)
 1. No/broken verdict (`ok=False`, `confidence=None`, NaN/missing keys) → **skip** (`no_verdict`/`malformed`)
-2. Position held → exit rules only (**no flip** same cycle): long exits on `dump≥60` or `exhaustion≥0.8`; short exits on `pump≥60` or `exhaustion≥0.8`; stops/liq fire automatically in the portfolio
+2. Position held → exit rules only (**no flip** same cycle): `dump≥65` × 2 consecutive cycles OR one cycle `dump≥75` (pump mirrored on shorts); min hold 3 cycles before signal exits; stops/liq fire automatically in the portfolio and always bypass
 3. Daily loss ≤ −5% → block entries only (`daily_loss_kill`); exits and stops always allowed
-4. `phase=capitulation` blocks longs only
-5. Shared entry gates: `whipsaw≤0.5`, `exhaustion≤0.6`, `confidence≥0.6`, 15-min cooldown
-6. Long needs `pump≥60`; short needs `dump≥60`; funding veto per book table
-7. Both sides qualify → prefer the stronger (`pump≥dump` → long, else short)
+4. Regime (deterministic `jev_regime`, computed before Jev): `chop` → ALL entries blocked (`regime_chop`); `trend_down` blocks longs / `trend_up` blocks shorts (`regime_counter`; `counter_trend: allow` re-enables by config)
+5. `phase ∈ {breakout, accumulation}` (`phase_not_in_entry_set`; `capitulation` keeps its own flag for attribution)
+6. Shared entry gates: `whipsaw≤0.45` (2-sample fan-out majority vote when raw noul ∈ 0.40–0.60; split → `whipsaw_fanout_tie` fail-closed), `exhaustion≤0.55`, `confidence≥0.65`, 15-min cooldown
+7. Long needs `pump≥65`; short needs `dump≥65`; funding veto per book table
+8. Both sides qualify → prefer the stronger (`pump≥dump` → long, else short)
 
-Sizing is decided by code (`RiskConfig` / `PerpsConfig` constants × Jev confidence). Jev never
-chooses amounts. Change caps by changing config — nothing can exceed them.
+Sizing is decided by code — confidence tiers: [0.65, 0.70) → 60% of cap, [0.70, 0.85) → 80%, ≥0.85 →
+100% (caps unchanged: spot 20%, perps 10% margin / 3x; `size_tier` logged on every fill). Every
+threshold lives in `config/v2.yaml` (`config_version: 2`, loader in `scripts/jev_config.py`;
+CLI flags override the yaml). Jev never chooses amounts. Change caps by changing config — nothing
+can exceed them.
 
 **Fill model (M0, live since 2026-09-27):** every fill pays a fee + slippage per side —
 spot `fee_rate=0.001` (operator's real Binance rate 0.10%), perps `taker_fee_rate=0.0005`
@@ -236,10 +240,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 .venv/bin/python scripts/jev_import.py                         # JSONL -> SQLite (idempotent)
 .venv/bin/python scripts/jev_replay.py --summary               # store vs JSONL cross-check
 
-# tests — all 11 script suites must stay green
+# tests — all 13 script suites must stay green
 for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
          test_jev_store test_jev_import test_jev_replay test_jev_radar \
-         test_jev_cache test_jev_supervisor; do
+         test_jev_cache test_jev_supervisor test_jev_regime test_jev_config; do
   .venv/bin/python scripts/$t.py; done
 
 # original engine (upstream RSI/EMA app layer, unchanged)
@@ -290,7 +294,7 @@ vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net P
 | 4 | M0: instrument v1 (fees/slippage, ids, bitmask, atomic writes) | ✅ done 2026-09-27 (commit 39a175a, 94/94 tests; `jev_summary.py`) |
 | 5 | M1: SQLite store + JSONL importer + replay utilities | ✅ done 2026-09-27 (commit 70858a6; `jev_replay.py --summary` cross-check) |
 | 6 | M2: split-cadence supervisor + decision cache (`jevelin_supervisor.py`) | ✅ done 2026-09-27 (24h sim 73/288 Jev calls = 25.3% ≤ 40%; stops ≤10s; 32/32 new tests) |
-| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | queued |
+| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4–M7 queued |
 | 8 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
 | 9 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
 | 10 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #9 |

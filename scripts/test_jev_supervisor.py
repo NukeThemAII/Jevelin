@@ -76,11 +76,12 @@ class FakeClient:
 class FakeMarket:
     """Duck-typed stand-in for jev_supervisor.MarketData."""
 
-    def __init__(self, price=100.0, closes=None, trades=None):
+    def __init__(self, price=100.0, closes=None, trades=None, regime="trend_up"):
         self.exchange = object()  # never used by the supervisor's state flow
         self.price = float(price)
         self._closes = list(closes) if closes is not None else [float(price)] * 10
         self._trades = list(trades or [])
+        self.regime = regime  # synthetic OHLCV tape flavor for jev_regime
         self.history = []  # (ts_ms, price) as fed by poll_ticker
         self.polls = 0
         self.on_poll = None  # optional hook(ts_ms) for fault injection
@@ -94,6 +95,19 @@ class FakeMarket:
 
     def refresh(self, symbol, now_ms):
         pass
+
+    def ohlcv(self, symbol, timeframe, limit, now_ms=None):
+        """Synthetic OHLCV rows classifying as ``self.regime`` (M3)."""
+        n = int(limit) if str(timeframe) == "15m" else min(int(limit), 40)
+        step = 1.005 if self.regime == "trend_up" else (
+            0.995 if self.regime == "trend_down" else 1.0)
+        closes = [100.0 * step ** t for t in range(n)]
+        if self.regime == "chop":
+            closes = [100.0, 100.06, 100.03, 99.98][:4] * (n // 4 + 1)
+            closes = closes[:n]
+        t0 = T0_MS - n * 900_000
+        return [[t0 + i * 900_000, c, c * 1.0005, c * 0.9995, c, 1.0]
+                for i, c in enumerate(closes)]
 
     def closes(self, symbol):
         return list(self._closes)
@@ -413,13 +427,86 @@ class LiveStoreWriteTests(unittest.TestCase):
         spot_trades = read_jsonl(Path(self.tmp.name) / "paper_btc.json.trades.jsonl")
         self.assertEqual(set(spot_trades[0]), {
             "ts_ms", "decision_id", "book", "symbol", "side", "price", "qty", "usd",
-            "realized_pnl", "fees", "slippage", "reason"})
+            "realized_pnl", "fees", "slippage", "reason", "size_tier"})
         decisions = read_jsonl(Path(self.tmp.name) / "paper_decisions.jsonl")
         self.assertEqual(len(decisions), 2)  # spot + perps gate rows
         self.assertEqual(set(decisions[0]), {
             "ts_ms", "decision_id", "book", "symbol", "price", "action", "executed",
             "veto_bitmask", "vetoed_by", "reason", "equity", "fees", "slippage",
-            "realized_pnl", "funding_paid", "verdict"})
+            "realized_pnl", "funding_paid", "verdict", "regime", "fan_out"})
+        self.assertEqual(decisions[0]["regime"], "trend_up")  # M3 regime on the row
+        self.assertEqual(decisions[0]["fan_out"], 0)
+
+
+BAND_ANSWERS = {
+    "pump": {"score": 2.5, "confidence": 0.8},
+    "dump": {"score": 0.5, "confidence": 0.8},
+    "phase": {"choice": "accumulation", "confidence": 0.8},
+    "exhaustion": {"noul": 0.3},
+    "whipsaw": {"noul": 0.5},  # coin-flip band -> fan-out takes a 2nd sample
+}
+
+
+class RegimeAndFanoutTests(unittest.TestCase):
+    """M3: regime on the cycle path + whipsaw fan-out second Jev sample."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.clock = FakeClock()
+
+    def _sup(self, market, client):
+        books = make_books(self.tmp.name)
+        sup = Supervisor([SYMBOL], market, client, {SYMBOL: books}, conn=None,
+                         clock=self.clock.now,
+                         decision_log_path=str(Path(self.tmp.name) / "paper_decisions.jsonl"))
+        self.addCleanup(sup.restore_signal_handlers)
+        return sup, books
+
+    def test_regime_on_cycle_lines_and_rows(self):
+        market = FakeMarket(price=100.0, regime="chop")
+        sup, books = self._sup(market, FakeClient())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sup.slow_cycle()
+        text = out.getvalue()
+        self.assertIn("regime=chop", text)
+        self.assertIn("regime_chop", text)  # entries vetoed by the chop regime
+        rows = read_jsonl(Path(self.tmp.name) / "paper_decisions.jsonl")
+        self.assertEqual({r["regime"] for r in rows}, {"chop"})
+        self.assertIsNone(books.spot.position)  # nothing entered in chop
+
+    def test_regime_trend_allows_entry(self):
+        market = FakeMarket(price=100.0, regime="trend_up")
+        sup, books = self._sup(market, FakeClient())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sup.slow_cycle()
+        self.assertIn("regime=trend_up", out.getvalue())
+        self.assertIsNotNone(books.perps.position)
+
+    def test_fanout_second_sample_in_band(self):
+        market = FakeMarket(price=100.0, regime="trend_up")
+        client = FakeClient(answers=BAND_ANSWERS)  # whipsaw 0.5 -> coin-flip band
+        sup, books = self._sup(market, client)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sup.slow_cycle()
+        self.assertEqual(client.calls, 2)  # 1 verdict + 1 fan-out sample
+        self.assertIn("fan_out=1", out.getvalue())
+        rows = read_jsonl(Path(self.tmp.name) / "paper_decisions.jsonl")
+        self.assertEqual(rows[0]["fan_out"], 1)
+        self.assertAlmostEqual(rows[0]["verdict"]["whipsaw_prob_2"], 0.5)
+        self.assertIn("answers_2", rows[0])  # the second raw answer is logged
+        # both samples fail (0.5 > 0.45) -> high_whipsaw veto, no entry
+        self.assertIsNone(books.spot.position)
+        self.assertEqual(rows[0]["vetoed_by"][0], "high_whipsaw")
+
+    def test_no_fanout_outside_band(self):
+        market = FakeMarket(price=100.0, regime="trend_up")
+        client = FakeClient()  # whipsaw 0.2 -> outside band: single call
+        sup, _books = self._sup(market, client)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sup.slow_cycle()
+        self.assertEqual(client.calls, 1)
+        self.assertIn("fan_out=0", out.getvalue())
 
 
 class RiskFlagTests(unittest.TestCase):

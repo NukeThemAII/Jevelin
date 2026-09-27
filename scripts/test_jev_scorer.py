@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from jev_config import FanoutConfig
 from jev_questions import CRITERIA_SIZES, QUESTIONS
 from jev_scorer import ShadowScorer, normalize_score
 from jev_state import build_state
@@ -148,6 +149,81 @@ class FailOpenTests(unittest.TestCase):
         self.assertFalse(v["ok"])
         self.assertIn("ccxt down", v["error"])
         self.assertNotIn("phase", v)
+
+
+def _answers_with_whipsaw(w, w2=None):
+    """FULL_ANSWERS clone with the whipsaw noul replaced."""
+    import copy
+
+    a = copy.deepcopy(FULL_ANSWERS)
+    a["whipsaw"]["noul"] = w
+    return a
+
+
+def _mock_client_seq(results):
+    """Mock client whose ask() returns each result in order."""
+    c = MagicMock()
+    c.ask.side_effect = list(results)
+    return c
+
+
+def _ok_result(answers):
+    return {"ok": True, "answers": answers, "error": None,
+            "usage": {"input_tokens": 100, "output_tokens": 5, "cost": 0.00002},
+            "raw": {}, "latency_ms": 123.0}
+
+
+class FanoutTests(unittest.TestCase):
+    """M3 whipsaw self-consistency fan-out: 2nd Jev sample in (0.40, 0.60)."""
+
+    def test_band_triggers_second_sample(self):
+        client = _mock_client_seq([_ok_result(_answers_with_whipsaw(0.5)),
+                                   _ok_result(_answers_with_whipsaw(0.43))])
+        scorer = ShadowScorer(client, exchange=_mock_exchange(),
+                              fanout=FanoutConfig())
+        v = scorer.score_state("{}", "BTC/USDT")
+        self.assertEqual(client.ask.call_count, 2)  # ONE extra sample, same state
+        self.assertEqual(client.ask.call_args_list[1].args[0], "{}")
+        self.assertEqual(v["fan_out"], 1)
+        self.assertAlmostEqual(v["whipsaw_prob"], 0.5)
+        self.assertAlmostEqual(v["whipsaw_prob_2"], 0.43)
+        self.assertEqual(v["answers_2"]["whipsaw"]["noul"], 0.43)
+
+    def test_outside_band_single_call(self):
+        for w in (0.3, 0.4, 0.6, 0.7):  # band is the OPEN interval (0.40, 0.60)
+            client = _mock_client_seq([_ok_result(_answers_with_whipsaw(w))])
+            scorer = ShadowScorer(client, exchange=_mock_exchange(),
+                                  fanout=FanoutConfig())
+            v = scorer.score_state("{}", "BTC/USDT")
+            self.assertEqual(client.ask.call_count, 1, w)
+            self.assertNotIn("whipsaw_prob_2", v)
+            self.assertIsNone(v.get("fan_out"))
+
+    def test_band_edges_fan_out(self):
+        for w in (0.401, 0.5, 0.599):
+            client = _mock_client_seq([_ok_result(_answers_with_whipsaw(w)),
+                                       _ok_result(_answers_with_whipsaw(0.2))])
+            scorer = ShadowScorer(client, exchange=_mock_exchange(),
+                                  fanout=FanoutConfig())
+            scorer.score_state("{}", "BTC/USDT")
+            self.assertEqual(client.ask.call_count, 2, w)
+
+    def test_second_sample_failure_recorded_not_fabricated(self):
+        client = _mock_client_seq([_ok_result(_answers_with_whipsaw(0.5)),
+                                   {"ok": False, "answers": None, "error": "timeout"}])
+        scorer = ShadowScorer(client, exchange=_mock_exchange(),
+                              fanout=FanoutConfig())
+        v = scorer.score_state("{}", "BTC/USDT")
+        self.assertEqual(v["fan_out"], 1)
+        self.assertNotIn("whipsaw_prob_2", v)  # never fabricate the 2nd sample
+        self.assertIn("timeout", v["fan_out_error"])
+
+    def test_no_fanout_config_keeps_single_call(self):
+        client = _mock_client_seq([_ok_result(_answers_with_whipsaw(0.5))])
+        scorer = ShadowScorer(client, exchange=_mock_exchange())
+        v = scorer.score_state("{}", "BTC/USDT")
+        self.assertEqual(client.ask.call_count, 1)  # legacy path unchanged
+        self.assertIsNone(v.get("fan_out"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,94 @@
+# Jevelin config v2 (M3) — every gate/regime/cost threshold lives here.
+#
+# Rules (scripts/jev_config.py load_config):
+#   * dataclass defaults == these values (single source of truth; parity-tested);
+#   * keys may be omitted (the dataclass default applies);
+#   * unknown keys warn to stderr, bad types/values abort startup;
+#   * config_version must be 2.
+# Supervisor CLI flags (--fee-rate, --slippage-rate, --whipsaw, ...) override
+# this file at runtime. Design numbers: docs/V2-DESIGN.md B.3 (AS WRITTEN).
+config_version: 2
+
+# M0 execution costs (F-P0-1): per-side fee + adverse slippage.
+execution:
+  spot_fee_rate: 0.001          # operator's real Binance spot rate
+  perps_taker_fee_rate: 0.0005  # Binance USDT-M VIP0 taker
+  slippage_rate: 0.0005         # 5 bp adverse per side; 0.0 = perfect fills
+
+# M3 regime classifier (scripts/jev_regime.py) — pure OHLCV math, no Jev.
+regime:
+  vol_window: 16               # last 16 x 15m log returns for realized vol
+  atr_period: 14               # ATR(14) on 15m = vol expectation
+  vol_ratio_threshold: 0.8     # realized/ATR below -> compressed
+  donchian_period: 20          # Donchian(20) width on 15m
+  donchian_history: 50         # trailing widths for the width percentile
+  narrow_percentile: 0.4       # width percentile below -> narrow
+  ema_period: 9                # short EMA on 1h closes
+  ema_slope_bars: 3            # slope over the last 3 EMA points
+  flat_slope: 0.001            # |slope|/bar below -> flat (~0.1%/bar)
+
+# M3 whipsaw self-consistency fan-out: 2nd Jev sample in the coin-flip band.
+fanout:
+  band_low: 0.4
+  band_high: 0.6
+
+# M2 decision cache.
+cache:
+  cache_min_move: 0.0005       # < 5 bp price move reuses the verdict
+  cache_ttl: 1800.0            # verdict reuse window (s)
+
+# M2 burst trigger.
+burst:
+  burst_threshold: 0.003       # |1-min return| forcing a score
+  burst_trades: 150            # 1-min trade count forcing a score
+  burst_cycles: 2              # extra forced slow cycles after a spike
+
+# Supervisor market-data fetch policy (regime inputs).
+market:
+  ohlcv_ttl_seconds: 60.0      # per-timeframe OHLCV cache TTL
+  ohlcv_15m_limit: 60
+  ohlcv_1h_limit: 120
+
+# Spot book gate thresholds (long-only) — B.3 numbers.
+spot:
+  max_position_fraction: 0.2
+  entry_min_pump: 65.0
+  entry_max_whipsaw: 0.45
+  entry_max_exhaustion: 0.55
+  min_confidence: 0.65
+  entry_phases: [breakout, accumulation]
+  counter_trend: block         # block | allow (counter-trend side entries)
+  exit_min_dump: 65.0          # hysteresis bar (x exit_consecutive_cycles)
+  exit_hard_dump: 75.0         # single-tick exit bar
+  exit_consecutive_cycles: 2
+  min_hold_cycles: 3           # cycles before any signal exit; stops bypass
+  cooldown_seconds: 900
+  daily_loss_limit_pct: 5.0
+  tier_thresholds: [0.7, 0.85]        # confidence band edges
+  tier_fractions: [0.6, 0.8, 1.0]     # fraction of cap per band
+
+# Perps book gate thresholds (long + short) — mirror of spot + short side.
+perps:
+  max_leverage: 3.0
+  max_margin_fraction: 0.1
+  entry_min_pump: 65.0
+  short_min_dump: 65.0
+  entry_max_whipsaw: 0.45
+  entry_max_exhaustion: 0.55
+  min_confidence: 0.65
+  entry_phases: [breakout, accumulation]
+  counter_trend: block
+  exit_min_dump: 65.0
+  exit_hard_dump: 75.0
+  exit_min_pump: 65.0          # short-exit bars mirror the long side
+  exit_hard_pump: 75.0
+  exit_consecutive_cycles: 2
+  min_hold_cycles: 3
+  cooldown_seconds: 900
+  daily_loss_limit_pct: 5.0
+  stop_loss_pct: 2.0
+  max_abs_funding_pct: 0.01    # percent per 8h
+  tier_thresholds: [0.7, 0.85]
+  tier_fractions: [0.6, 0.8, 1.0]
+  taker_fee_rate: 0.0005
+  slippage_rate: 0.0005

@@ -31,37 +31,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jev_config import (  # noqa: E402
     PERPS_TAKER_FEE_RATE,
     SLIPPAGE_RATE,
+    PerpsConfig,
     atomic_write_json,
     bitmask_for,
 )
-from jev_gates import NUMERIC_KEYS, REQUIRED_KEYS, PortfolioState, _as_float  # noqa: E402
+from jev_gates import (  # noqa: E402
+    NUMERIC_KEYS,
+    REQUIRED_KEYS,
+    PortfolioState,
+    _as_counter,
+    _as_float,
+    sizing_tier,
+    whipsaw_gate_name,
+)
 from jev_paper import _finite, _utc_today  # noqa: E402
 
 FUNDING_PERIOD_MS = 8 * 60 * 60 * 1000  # 28_800_000 ms = one 8h funding period
 LIQ_BUFFER = 0.95  # approx liquidation: 95% of the initial-margin move (no MM math)
 SIDES = ("long", "short")
-
-
-@dataclass(frozen=True)
-class PerpsConfig:
-    max_leverage: float = 3.0
-    max_margin_fraction: float = 0.10
-    entry_min_pump: float = 60.0
-    short_min_dump: float = 60.0
-    min_confidence: float = 0.6
-    entry_max_whipsaw: float = 0.5
-    entry_max_exhaustion: float = 0.6
-    exit_exhaustion: float = 0.8
-    cooldown_seconds: int = 900
-    daily_loss_limit_pct: float = 5.0
-    stop_loss_pct: float = 2.0
-    max_abs_funding_pct: float = 0.01  # percent per 8h -> 0.0001 as a rate
-    # Long-exit dump threshold (rule 2 references it; same default as RiskConfig).
-    exit_min_dump: float = 60.0
-    # Execution costs (M0 / F-P0-1): Binance USDT-M VIP0 taker + 5 bps slippage.
-    # Paper fills are taker-style; slippage 0.0 = perfect limit fills.
-    taker_fee_rate: float = PERPS_TAKER_FEE_RATE
-    slippage_rate: float = SLIPPAGE_RATE
 
 
 @dataclass
@@ -126,6 +113,10 @@ class PerpsPortfolio:
         self.day_start_equity: float = float(initial_equity_usd)
         self.fees_paid: float = 0.0
         self.slippage_paid: float = 0.0
+        # M3 hysteresis state (persisted in the state JSON): consecutive exit-
+        # signal cycles and decision cycles since entry.
+        self.exit_signal_cycles: int = 0
+        self.cycles_held: int = 0
 
     def _trade_log_path(self) -> Path:
         return Path(self.state_path + ".trades.jsonl")
@@ -159,6 +150,8 @@ class PerpsPortfolio:
             equity_usd=equity,
             daily_pnl_pct=daily_pnl_pct,
             last_entry_ts_ms=self.last_entry_ts_ms,
+            exit_signal_cycles=self.exit_signal_cycles,
+            cycles_held=self.cycles_held,
             side=self.position["side"] if self.position else None,
         )
 
@@ -215,11 +208,28 @@ class PerpsPortfolio:
                     return out
                 return self._close(symbol, p, ts, out, "exited",
                                    reason or "exit", did)
+            # hold / skip: adopt the gate layer's updated hysteresis counters
+            self._adopt_signal_state(action)
             out["detail"] = f"no-op action={kind!r}"
             return out
         except Exception as exc:  # defensive: never raise into the loop
             out["detail"] = f"error: {type(exc).__name__}: {exc}"
             return out
+
+    def _adopt_signal_state(self, action) -> None:
+        """Persist decide_perps' hysteresis counters (M3): never trust junk."""
+        if not isinstance(action, dict):
+            return
+        esc = action.get("exit_signal_cycles")
+        if isinstance(esc, int) and not isinstance(esc, bool) and esc >= 0:
+            self.exit_signal_cycles = esc
+        ch = action.get("cycles_held")
+        if isinstance(ch, int) and not isinstance(ch, bool) and ch >= 0:
+            self.cycles_held = ch
+
+    def _reset_signal_state(self) -> None:
+        self.exit_signal_cycles = 0
+        self.cycles_held = 0
 
     def _enter(self, side, action, symbol, price, ts_ms, funding_rate, out,
                decision_id=None, reason=""):
@@ -267,11 +277,12 @@ class PerpsPortfolio:
             "funding_rate_at_entry": _finite(funding_rate),
         }
         self.last_entry_ts_ms = ts_ms
+        self._reset_signal_state()  # fresh position: hysteresis counters restart
         out.update(executed=f"enter_{side}", qty=qty, usd=notional, realized_pnl=0.0,
                    fees=fee, slippage=slippage, detail="entered")
         self._append_trade(ts_ms, symbol, side, f"enter_{side}", fill, qty, notional,
                            leverage, 0.0, 0.0, fee, slippage, decision_id,
-                           reason or "entered")
+                           reason or "entered", size_tier=action.get("size_tier"))
         return out
 
     def _close(self, symbol, price, ts_ms, out, detail, reason, decision_id=None,
@@ -301,6 +312,7 @@ class PerpsPortfolio:
         self.fees_paid += fee
         self.slippage_paid += slippage
         self.position = None
+        self._reset_signal_state()  # closed: hysteresis counters restart
         out.update(executed="exit", qty=qty, usd=float(pos["notional_usd"]),
                    realized_pnl=realized, fees=fee, slippage=slippage,
                    funding_paid=funding, detail=detail)
@@ -310,7 +322,8 @@ class PerpsPortfolio:
         return out
 
     def _append_trade(self, ts_ms, symbol, side, action, price, qty, notional, leverage,
-                      realized_pnl, funding_paid, fees, slippage, decision_id, reason):
+                      realized_pnl, funding_paid, fees, slippage, decision_id, reason,
+                      size_tier=None):
         line = {
             "ts_ms": int(ts_ms),
             "decision_id": decision_id,
@@ -327,6 +340,7 @@ class PerpsPortfolio:
             "fees": float(fees),
             "slippage": float(slippage),
             "reason": reason,
+            "size_tier": size_tier,
         }
         try:
             path = self._trade_log_path()
@@ -347,6 +361,8 @@ class PerpsPortfolio:
             "day_start_equity": self.day_start_equity,
             "fees_paid": self.fees_paid,
             "slippage_paid": self.slippage_paid,
+            "exit_signal_cycles": self.exit_signal_cycles,
+            "cycles_held": self.cycles_held,
         }
 
     def save(self) -> None:
@@ -400,6 +416,10 @@ class PerpsPortfolio:
         self.fees_paid = fees if fees is not None and fees >= 0 else 0.0
         slip = _finite(data.get("slippage_paid"))
         self.slippage_paid = slip if slip is not None and slip >= 0 else 0.0
+        esc = _finite(data.get("exit_signal_cycles"))
+        self.exit_signal_cycles = int(esc) if esc is not None and esc >= 0 else 0
+        ch = _finite(data.get("cycles_held"))
+        self.cycles_held = int(ch) if ch is not None and ch >= 0 else 0
         return True
 
 
@@ -408,33 +428,46 @@ class PerpsPortfolio:
 # ---------------------------------------------------------------------------
 
 def _res(action: str, reason: str, size_fraction: float = 0.0, leverage: float = 0.0,
-         failed: Optional[list] = None, decision_id: Optional[str] = None) -> dict:
+         failed: Optional[list] = None, decision_id: Optional[str] = None,
+         size_tier: Optional[int] = None, exit_signal_cycles: int = 0,
+         cycles_held: int = 0) -> dict:
     """Decision record: vetoed_by lists EVERY failing gate (F-P1-4)."""
     failed = list(failed or [])
     return {"action": action, "reason": reason, "size_fraction": float(size_fraction),
-            "leverage": float(leverage), "vetoed_by": failed,
-            "veto_bitmask": bitmask_for(failed), "decision_id": decision_id}
+            "size_tier": size_tier, "leverage": float(leverage), "vetoed_by": failed,
+            "veto_bitmask": bitmask_for(failed), "decision_id": decision_id,
+            "exit_signal_cycles": int(exit_signal_cycles),
+            "cycles_held": int(cycles_held)}
 
 
-def _skip(reason: str, failed: list, decision_id: Optional[str] = None) -> dict:
-    return _res("skip", reason, failed=failed, decision_id=decision_id)
+def _skip(reason: str, failed: list, decision_id: Optional[str] = None,
+          exit_signal_cycles: int = 0, cycles_held: int = 0) -> dict:
+    return _res("skip", reason, failed=failed, decision_id=decision_id,
+                exit_signal_cycles=exit_signal_cycles, cycles_held=cycles_held)
 
 
 def decide_perps(verdict: dict, pf: PortfolioState, cfg: PerpsConfig, now_ms: int,
                  funding_rate: Optional[float] = None,
-                 decision_id: Optional[str] = None) -> dict:
-    """Map a Jev verdict + perps book state to enter_long/enter_short/exit/skip. Never raises."""
+                 decision_id: Optional[str] = None,
+                 regime: Optional[str] = None) -> dict:
+    """Map a Jev verdict + perps book state to enter_long/enter_short/exit/skip.
+
+    Never raises. M3 (B.3) semantics: regime/phase/whipsaw-fanout entry gates,
+    dump/pump exit hysteresis with min hold, confidence sizing tiers. See the
+    module docstring for the exit rule (no separate exhaustion exit in v2).
+    ``regime`` None = caller has no regime data (deprecated v1 fallback).
+    """
     try:
         did = decision_id
         if did is None and isinstance(verdict, dict):
             did = verdict.get("decision_id")
-        return _decide_perps(verdict, pf, cfg, now_ms, funding_rate, did)
+        return _decide_perps(verdict, pf, cfg, now_ms, funding_rate, did, regime)
     except Exception as exc:  # defensive: never raise into the trading loop
         return _skip(f"malformed: {type(exc).__name__}: {exc}", ["malformed"], decision_id)
 
 
 def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
-                  decision_id=None) -> dict:
+                  decision_id=None, regime=None) -> dict:
     # (1) fail-open validation — same contract as jev_gates.decide
     if not isinstance(verdict, dict):
         return _skip("malformed: verdict is not a dict", ["malformed"], decision_id)
@@ -457,27 +490,36 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
     pump, dump = vals["pump_0_100"], vals["dump_0_100"]
     exh, whip, conf = vals["exhaustion_prob"], vals["whipsaw_prob"], vals["confidence"]
 
-    # (2)+(9) position held: exit or hold — never open the opposite side this cycle
+    # fan-out sample (M3): present-but-unusable counts as a tie (fail-closed)
+    w2_raw = verdict.get("whipsaw_prob_2")
+    w2 = _as_float(w2_raw) if w2_raw is not None else None
+    fan_out = bool(verdict.get("fan_out")) or w2 is not None
+
+    # (2)+(9) position held: exit or hold — never open the opposite side this
+    # cycle. Hysteresis (B.3) mirrors the spot book: long exits on dump, short
+    # exits on pump (>= bar x exit_consecutive_cycles OR one cycle >= hard bar);
+    # min hold applies to signal exits, stops/liq always fire in the portfolio.
     if pf.has_position:
         side = getattr(pf, "side", None)
-        if side == "long":
-            if dump >= cfg.exit_min_dump:
-                return _res("exit", f"long exit: dump {dump} >= {cfg.exit_min_dump}",
-                            decision_id=decision_id)
-            if exh >= cfg.exit_exhaustion:
-                return _res("exit", f"long exit: exhaustion {exh} >= {cfg.exit_exhaustion}",
-                            decision_id=decision_id)
-        elif side == "short":
-            if pump >= cfg.entry_min_pump:
-                return _res("exit", f"short exit: pump {pump} >= {cfg.entry_min_pump}",
-                            decision_id=decision_id)
-            if exh >= cfg.exit_exhaustion:
-                return _res("exit", f"short exit: exhaustion {exh} >= {cfg.exit_exhaustion}",
-                            decision_id=decision_id)
-        else:
+        if side not in SIDES:
             return _skip(f"malformed: held position side {side!r}", ["malformed"],
                          decision_id)
-        return _skip("hold", [], decision_id)
+        signal_val = dump if side == "long" else pump
+        min_bar = cfg.exit_min_dump if side == "long" else cfg.exit_min_pump
+        hard_bar = cfg.exit_hard_dump if side == "long" else cfg.exit_hard_pump
+        age_now = _as_counter(pf.cycles_held) + 1
+        signal = signal_val >= min_bar
+        streak = _as_counter(pf.exit_signal_cycles) + 1 if signal else 0
+        if age_now >= cfg.min_hold_cycles:
+            if signal_val >= hard_bar:
+                return _res("exit", f"{side} exit: {signal_val} >= {hard_bar} "
+                            f"(single-tick exit bar)", decision_id=decision_id,
+                            exit_signal_cycles=streak, cycles_held=age_now)
+            if streak >= cfg.exit_consecutive_cycles:
+                return _res("exit", f"{side} exit: {signal_val} >= {min_bar} for "
+                            f"{streak} consecutive cycles", decision_id=decision_id,
+                            exit_signal_cycles=streak, cycles_held=age_now)
+        return _skip("hold", [], decision_id, streak, age_now)
 
     # ENTRY path — evaluate ALL gates (F-P1-4): shared, long-side, short-side.
     # Every failing gate is recorded; ``reason`` stays the first in check order.
@@ -486,8 +528,23 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
         shared.append(("daily_loss_kill",
                        f"daily_loss_kill: daily pnl {pf.daily_pnl_pct}% <= "
                        f"-{cfg.daily_loss_limit_pct}%"))
-    if whip > cfg.entry_max_whipsaw:
-        shared.append(("high_whipsaw", f"high_whipsaw: {whip} > {cfg.entry_max_whipsaw}"))
+    if regime == "chop":
+        shared.append(("regime_chop", "regime_chop: chop forbids all entries"))
+    if phase == "capitulation":
+        shared.append(("capitulation", "capitulation: phase blocks entries"))
+    if phase not in cfg.entry_phases:
+        shared.append(("phase_not_in_entry_set",
+                       f"phase_not_in_entry_set: phase {phase} not in "
+                       f"{list(cfg.entry_phases)}"))
+    whip_gate = whipsaw_gate_name(whip, w2, fan_out, cfg.entry_max_whipsaw)
+    if whip_gate == "high_whipsaw":
+        shared.append(("high_whipsaw",
+                       f"high_whipsaw: both fan-out samples > {cfg.entry_max_whipsaw}"
+                       if fan_out else f"high_whipsaw: {whip} > {cfg.entry_max_whipsaw}"))
+    elif whip_gate == "whipsaw_fanout_tie":
+        shared.append(("whipsaw_fanout_tie",
+                       f"whipsaw_fanout_tie: fan-out samples disagree or 2nd "
+                       f"sample unusable ({whip} vs {w2})"))
     if exh > cfg.entry_max_exhaustion:
         shared.append(("high_exhaustion",
                        f"high_exhaustion: {exh} > {cfg.entry_max_exhaustion}"))
@@ -500,51 +557,59 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
                            f"cooldown: {elapsed}ms since last entry < "
                            f"{cfg.cooldown_seconds * 1000}ms"))
 
-    # (4)(6)(7) side-specific gates; funding None/non-finite => fail-open (no veto)
+    # side-specific gates (ALL failing recorded); funding None/non-finite =>
+    # fail-open (no veto)
     fr = _as_float(funding_rate)
     thr = cfg.max_abs_funding_pct / 100.0  # 0.01% per 8h -> 0.0001
+    long_failed = []
+    if regime == "trend_down" and cfg.counter_trend == "block":
+        long_failed.append(("regime_counter",
+                            "regime_counter: trend_down blocks long entries"))
     if pump < cfg.entry_min_pump:
-        long_veto = ("low_pump", f"low_pump: {pump} < {cfg.entry_min_pump}")
-    elif phase == "capitulation":
-        long_veto = ("capitulation", "capitulation: phase blocks long entries")
-    elif fr is not None and fr > thr:
-        long_veto = ("funding", f"funding: {fr} > {thr} blocks long")
-    else:
-        long_veto = None
+        long_failed.append(("low_pump", f"low_pump: {pump} < {cfg.entry_min_pump}"))
+    if fr is not None and fr > thr:
+        long_failed.append(("funding", f"funding: {fr} > {thr} blocks long"))
+    short_failed = []
+    if regime == "trend_up" and cfg.counter_trend == "block":
+        short_failed.append(("regime_counter",
+                             "regime_counter: trend_up blocks short entries"))
     if dump < cfg.short_min_dump:
-        short_veto = ("low_dump", f"low_dump: {dump} < {cfg.short_min_dump}")
-    elif fr is not None and fr < -thr:
-        short_veto = ("funding", f"funding: {fr} < {-thr} blocks short")
-    else:
-        short_veto = None
+        short_failed.append(("low_dump", f"low_dump: {dump} < {cfg.short_min_dump}"))
+    if fr is not None and fr < -thr:
+        short_failed.append(("funding", f"funding: {fr} < {-thr} blocks short"))
 
     # all failing gates in evaluation order (shared -> long -> short), deduped
     failed = []
-    for item in shared + [v for v in (long_veto, short_veto) if v is not None]:
+    for item in shared + long_failed + short_failed:
         if item[0] not in [name for name, _ in failed]:
             failed.append(item)
 
     if shared:  # a shared gate blocks entries on both sides
         return _skip(shared[0][1], [name for name, _ in failed], decision_id)
 
-    # (8) pick a side; prefer long when pump >= dump
+    # pick a side; prefer long when pump >= dump
     prefer_long = pump >= dump
-    if long_veto is None and (short_veto is not None or prefer_long):
+    long_ok, short_ok = not long_failed, not short_failed
+    if long_ok and (prefer_long or not short_ok):
         side = "long"
-    elif short_veto is None:
+    elif short_ok:
         side = "short"
     else:
         # Both blocked: report the preferred side's veto, unless it is just a weak
-        # signal and the other side hit a real veto (capitulation / funding).
-        first, other = (long_veto, short_veto) if prefer_long else (short_veto, long_veto)
+        # signal and the other side hit a real veto (regime / funding).
+        first, other = ((long_failed, short_failed) if prefer_long
+                        else (short_failed, long_failed))
         weak = ("low_pump", "low_dump")
-        tag, why = other if (first[0] in weak and other[0] not in weak) else first
+        why = (other[0][1] if (first[0][0] in weak and other[0][0] not in weak)
+               else first[0][1])
         return _skip(why, [name for name, _ in failed], decision_id)
 
-    size = round(cfg.max_margin_fraction * conf, 4)
+    frac, tier = sizing_tier(conf, cfg)
+    size = round(cfg.max_margin_fraction * frac, 4)
     return _res(
         f"enter_{side}",
         f"all gates passed ({side}): pump={pump} dump={dump} whipsaw={whip} "
-        f"exhaustion={exh} confidence={conf} funding={'na' if fr is None else fr}",
-        size, cfg.max_leverage, [], decision_id,
+        f"exhaustion={exh} confidence={conf} tier={tier}% "
+        f"funding={'na' if fr is None else fr}",
+        size, cfg.max_leverage, [], decision_id, size_tier=tier,
     )

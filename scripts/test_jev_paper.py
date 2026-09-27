@@ -16,7 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from jev_config import atomic_write_json, new_decision_id
-from jev_gates import RiskConfig
+from jev_gates import RiskConfig, decide
 from jev_paper import PaperPortfolio, _utc_today
 from paper_loop import run_cycle
 
@@ -196,17 +196,19 @@ class RunCycleTests(unittest.TestCase):
         with redirect_stdout(out1):
             r1 = run_cycle(scorer, portfolio, CFG, exchange, "BTC/USDT", NOW)
         self.assertEqual(r1["result"]["executed"], "enter")
-        self.assertAlmostEqual(r1["result"]["qty"], 17.991004497751124)  # 0.18*10000 / 100.05
-        self.assertEqual(r1["result"]["usd"], 1800.0)
+        # conf 0.9 -> 100% tier -> 0.20 * 10000 target notional
+        self.assertAlmostEqual(r1["result"]["qty"], 19.99000499750125)  # 2000 / 100.05
+        self.assertEqual(r1["result"]["usd"], 2000.0)
         self.assertTrue(r1["has_position"])
 
+        portfolio.cycles_held = 2  # M3 min hold: >= 3 cycles before signal exits
         out2 = io.StringIO()
         with redirect_stdout(out2):
             r2 = run_cycle(scorer, portfolio, CFG, exchange, "BTC/USDT", NOW + 2_000_000)
         self.assertEqual(r2["result"]["executed"], "exit")
-        self.assertAlmostEqual(r2["result"]["realized_pnl"], 174.24296851574232, places=6)
+        self.assertAlmostEqual(r2["result"]["realized_pnl"], 193.60329835082476, places=6)
         self.assertFalse(r2["has_position"])
-        self.assertAlmostEqual(r2["equity"], 10174.242968515742, places=6)
+        self.assertAlmostEqual(r2["equity"], 10193.603298350825, places=6)
 
         self.assertIn("action=enter", out1.getvalue())
         self.assertIn("action=exit", out2.getvalue())
@@ -385,6 +387,52 @@ class AtomicWriteTests(unittest.TestCase):
         self.assertFalse(Path(self.state_path + ".tmp").exists())
 
 
+class HysteresisPersistence(unittest.TestCase):
+    """M3: exit-signal counters + position age persist in the book state JSON."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = os.path.join(self.tmp.name, "paper.json")
+
+    def test_counters_persist_across_restart(self):
+        pf = PaperPortfolio(10000.0, self.state_path)
+        pf.apply_action({"action": "enter", "size_fraction": 0.20}, "BTC/USDT", 100.0, NOW)
+        # one dump-signal cycle -> hold; counters advance and persist
+        act = decide(_enter_verdict(dump_0_100=70.0), pf.to_pf_state(100.0), CFG, NOW + 1)
+        self.assertEqual((act["action"], act["exit_signal_cycles"], act["cycles_held"]),
+                         ("skip", 1, 1))
+        pf.apply_action(act, "BTC/USDT", 100.0, NOW + 1)
+        pf.save()
+
+        pf2 = PaperPortfolio(555.0, self.state_path)  # restart from the JSON fixture
+        self.assertTrue(pf2.load())
+        self.assertEqual((pf2.exit_signal_cycles, pf2.cycles_held), (1, 1))
+        # the streak is not forgotten across the restart (age 2 < 3 still holds)
+        act2 = decide(_enter_verdict(dump_0_100=70.0), pf2.to_pf_state(100.0), CFG, NOW + 2)
+        self.assertEqual((act2["action"], act2["exit_signal_cycles"], act2["cycles_held"]),
+                         ("skip", 2, 2))
+        pf2.apply_action(act2, "BTC/USDT", 100.0, NOW + 2)
+        # third consecutive dump signal at age 3 -> exit fires
+        act3 = decide(_enter_verdict(dump_0_100=70.0), pf2.to_pf_state(100.0), CFG, NOW + 3)
+        self.assertEqual(act3["action"], "exit")
+
+    def test_min_hold_blocks_early_signal_exit(self):
+        pf = PaperPortfolio(10000.0, self.state_path)
+        pf.apply_action({"action": "enter", "size_fraction": 0.20}, "BTC/USDT", 100.0, NOW)
+        act = decide(_enter_verdict(dump_0_100=75.0), pf.to_pf_state(100.0), CFG, NOW + 1)
+        self.assertEqual((act["action"], act["reason"]), ("skip", "hold"))  # age 1 < 3
+
+    def test_trade_rows_carry_size_tier(self):
+        pf = PaperPortfolio(10000.0, self.state_path)
+        act = decide(_enter_verdict(), pf.to_pf_state(100.0), CFG, NOW)
+        self.assertEqual(act["size_tier"], 100)  # conf 0.9 -> 100% tier
+        pf.apply_action(act, "BTC/USDT", 100.0, NOW)
+        trades = [json.loads(line) for line in
+                  Path(self.state_path + ".trades.jsonl").read_text().splitlines()]
+        self.assertEqual(trades[0]["size_tier"], 100)
+
+
 class SummaryScriptTests(unittest.TestCase):
     """M0 acceptance: jev_summary.py reads trades + decision logs offline."""
 
@@ -399,6 +447,8 @@ class SummaryScriptTests(unittest.TestCase):
             exchange.fetch_ticker.side_effect = [{"last": 100.0}, {"last": 110.0}]
             with redirect_stdout(io.StringIO()):
                 run_cycle(scorer, portfolio, CFG, exchange, "BTC/USDT", NOW)
+            portfolio.cycles_held = 2  # M3 min hold before the signal exit
+            with redirect_stdout(io.StringIO()):
                 run_cycle(scorer, portfolio, CFG, exchange, "BTC/USDT", NOW + 2_000_000)
             # one more cycle that is vetoed (low_pump -> bit 256 in the table)
             scorer.score.side_effect = None
@@ -417,7 +467,7 @@ class SummaryScriptTests(unittest.TestCase):
         self.assertIn("slippage paid:", text)
         self.assertIn("net PnL:", text)
         self.assertIn("current equity:", text)
-        self.assertIn("174.24", text)  # fee+slippage-aware net (gross was 180.0)
+        self.assertIn("193.60", text)  # fee+slippage-aware net at the 100% size tier
         self.assertIn("low_pump", text)  # per-gate veto table from the bitmask
 
 

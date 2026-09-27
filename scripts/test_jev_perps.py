@@ -53,20 +53,24 @@ def _long_v(**kw):
 
 
 def _short_v(**kw):
-    base = {"pump_0_100": 10.0, "dump_0_100": 75.0, "phase": "distribution"}
+    base = {"pump_0_100": 10.0, "dump_0_100": 75.0, "phase": "breakout"}
     base.update(kw)
     return _verdict(**base)
 
 
 def _flat(**kw):
     base = dict(has_position=False, equity_usd=10000.0, daily_pnl_pct=0.0,
-                last_entry_ts_ms=None, side=None)
+                last_entry_ts_ms=None, side=None, exit_signal_cycles=0, cycles_held=0)
     base.update(kw)
     return PerpsPortfolioState(**base)
 
 
 def _held(side, **kw):
-    return _flat(has_position=True, side=side, **kw)
+    # default: min hold satisfied (age 4) so exit-rule assertions are not
+    # confounded by the 3-cycle min hold
+    base = {"cycles_held": 3}
+    base.update(kw)
+    return _flat(has_position=True, side=side, **base)
 
 
 class _TmpCase(unittest.TestCase):
@@ -87,12 +91,14 @@ class EnterSizing(_TmpCase):
     def test_long_enter_sizing_and_leverage_clamp(self):
         act = decide_perps(_long_v(), _flat(), CFG, NOW, None)
         self.assertEqual(act["action"], "enter_long")
-        self.assertEqual(act["size_fraction"], 0.09)  # round(0.10 * 0.9, 4)
+        self.assertEqual(act["size_fraction"], 0.10)  # conf 0.9 -> 100% tier of 10% cap
+        self.assertEqual(act["size_tier"], 100)
         self.assertEqual(act["leverage"], 3.0)
         self.assertEqual(act["vetoed_by"], [])
 
         pf = self._pf()
-        act = dict(act, leverage=10.0)  # attempt to exceed the cap
+        # money math below uses an explicit 0.09 margin fraction (M0 fixture)
+        act = dict(act, size_fraction=0.09, leverage=10.0)  # attempt to exceed the cap
         res = pf.apply_action(act, SYM, 100.0, NOW, 0.00005)
         self.assertEqual(res["executed"], "enter_long")
         pos = pf.position
@@ -121,9 +127,10 @@ class EnterSizing(_TmpCase):
     def test_short_enter_sizing_and_inverse_pnl(self):
         act = decide_perps(_short_v(), _flat(), CFG, NOW, None)
         self.assertEqual(act["action"], "enter_short")
-        self.assertEqual(act["size_fraction"], 0.09)
+        self.assertEqual(act["size_fraction"], 0.10)  # conf 0.9 -> 100% tier
+        self.assertEqual(act["size_tier"], 100)
         pf = self._pf()
-        pf.apply_action(act, SYM, 100.0, NOW)
+        pf.apply_action(dict(act, size_fraction=0.09), SYM, 100.0, NOW)
         pos = pf.position
         self.assertEqual(pos["side"], "short")
         self.assertAlmostEqual(pos["qty"], 27.01350675337669)  # 2700 / 99.95 fill
@@ -233,25 +240,38 @@ class Funding(_TmpCase):
 
 
 class DecisionRules(unittest.TestCase):
-    def test_short_requires_dump_60(self):
-        act = decide_perps(_short_v(dump_0_100=59.9), _flat(), CFG, NOW, None)
+    def test_short_requires_dump_65(self):
+        act = decide_perps(_short_v(dump_0_100=64.9), _flat(), CFG, NOW, None)
         self.assertEqual(act["action"], "skip")
         self.assertEqual(act["vetoed_by"], ["low_pump", "low_dump"])  # both sides blocked
         self.assertEqual(act["veto_bitmask"],
                          int(VetoFlags.LOW_PUMP | VetoFlags.LOW_DUMP))
-        self.assertEqual(decide_perps(_short_v(dump_0_100=60.0), _flat(), CFG, NOW)["action"],
+        self.assertEqual(decide_perps(_short_v(dump_0_100=65.0), _flat(), CFG, NOW)["action"],
                          "enter_short")
 
-    def test_capitulation_blocks_long_only(self):
+    def test_phase_whitelist_blocks_all_sides(self):
+        # B.3: entries need phase in {breakout, accumulation} — capitulation is
+        # outside the set for BOTH sides; the capitulation flag stays (attribution).
         act = decide_perps(_long_v(phase="capitulation"), _flat(), CFG, NOW, None)
         self.assertEqual(act["action"], "skip")
-        self.assertEqual(act["vetoed_by"], ["capitulation", "low_dump"])
+        self.assertEqual(act["vetoed_by"],
+                         ["capitulation", "phase_not_in_entry_set", "low_dump"])
         act = decide_perps(_short_v(phase="capitulation"), _flat(), CFG, NOW, None)
-        self.assertEqual(act["action"], "enter_short")
-        # both signals high + capitulation -> long blocked, short taken
+        self.assertEqual(act["action"], "skip")
+        self.assertEqual(act["vetoed_by"],
+                         ["capitulation", "phase_not_in_entry_set", "low_pump"])
+        # both signals high + capitulation -> still no entry
         act = decide_perps(_verdict(pump_0_100=80.0, dump_0_100=70.0, phase="capitulation"),
                            _flat(), CFG, NOW, None)
-        self.assertEqual(act["action"], "enter_short")
+        self.assertEqual(act["action"], "skip")
+
+    def test_entry_phase_whitelist(self):
+        for phase in ("breakout", "accumulation"):
+            self.assertEqual(decide_perps(_long_v(phase=phase), _flat(), CFG, NOW)["action"],
+                             "enter_long")
+        for phase in ("distribution", "ranging"):
+            act = decide_perps(_long_v(phase=phase), _flat(), CFG, NOW, None)
+            self.assertEqual(act["vetoed_by"][0], "phase_not_in_entry_set")
 
     def test_both_sides_prefer_stronger(self):
         self.assertEqual(decide_perps(_verdict(pump_0_100=70.0, dump_0_100=70.0), _flat(),
@@ -284,18 +304,21 @@ class DecisionRules(unittest.TestCase):
         act = decide_perps(_short_v(), _held("long"), CFG, NOW)
         self.assertEqual(act["action"], "exit")
         # holding short, strong long signal: exit only, never enter_long
-        act = decide_perps(_long_v(), _held("short"), CFG, NOW)
+        act = decide_perps(_verdict(pump_0_100=80.0), _held("short"), CFG, NOW)
         self.assertEqual(act["action"], "exit")
         # holding long, long signal: hold (no pyramiding)
         act = decide_perps(_long_v(), _held("long"), CFG, NOW)
         self.assertEqual((act["action"], act["reason"]), ("skip", "hold"))
         act = decide_perps(_short_v(), _held("short"), CFG, NOW)
         self.assertEqual((act["action"], act["reason"]), ("skip", "hold"))
-        # exhaustion exits both sides
+        # B.3 has no exhaustion exit: exhaustion alone holds (v1 exit superseded)
         for side in ("long", "short"):
-            act = decide_perps(_verdict(pump_0_100=10.0, exhaustion_prob=0.85), _held(side),
-                               CFG, NOW)
-            self.assertEqual(act["action"], "exit")
+            act = decide_perps(_verdict(pump_0_100=10.0, dump_0_100=10.0,
+                                        exhaustion_prob=0.95), _held(side), CFG, NOW)
+            self.assertEqual(act["action"], "skip", side)
+        # min hold blocks signal exits before 3 cycles (stops/liq bypass elsewhere)
+        act = decide_perps(_short_v(), _held("long", cycles_held=0), CFG, NOW)
+        self.assertEqual((act["action"], act["reason"]), ("skip", "hold"))
         # portfolio level: enter while holding is refused
         with tempfile.TemporaryDirectory() as d:
             pf = PerpsPortfolio(10000.0, os.path.join(d, "p.json"))
@@ -314,7 +337,8 @@ class DecisionRules(unittest.TestCase):
                          ("skip", ["daily_loss_kill", "low_pump"]))
         act = decide_perps(_short_v(), _held("long", daily_pnl_pct=-7.0), CFG, NOW)
         self.assertEqual(act["action"], "exit")
-        act = decide_perps(_long_v(), _held("short", daily_pnl_pct=-7.0), CFG, NOW)
+        act = decide_perps(_verdict(pump_0_100=80.0), _held("short", daily_pnl_pct=-7.0),
+                           CFG, NOW)
         self.assertEqual(act["action"], "exit")
 
     def test_malformed_fail_open(self):
@@ -362,7 +386,8 @@ class Persistence(_TmpCase):
         self.assertFalse(Path(self.state_path + ".tmp").exists())  # atomic replace
         raw = json.loads(Path(self.state_path).read_text())
         self.assertEqual(set(raw), {"equity", "position", "last_entry_ts_ms", "day",
-                                    "day_start_equity", "fees_paid", "slippage_paid"})
+                                    "day_start_equity", "fees_paid", "slippage_paid",
+                                    "exit_signal_cycles", "cycles_held"})
 
         pf2 = PerpsPortfolio(555.0, self.state_path)
         self.assertTrue(pf2.load())
@@ -376,7 +401,7 @@ class Persistence(_TmpCase):
         t = self._trades()[0]
         self.assertEqual(set(t), {"ts_ms", "decision_id", "book", "symbol", "side", "action",
                                   "price", "qty", "notional", "leverage", "realized_pnl",
-                                  "funding_paid", "fees", "slippage", "reason"})
+                                  "funding_paid", "fees", "slippage", "reason", "size_tier"})
         self.assertEqual((t["side"], t["action"], t["leverage"]), ("short", "enter_short", 3.0))
         self.assertEqual(t["book"], "perps")
         self.assertAlmostEqual(t["fees"], 1.2)  # 0.0005 * 2400 notional
@@ -404,6 +429,143 @@ class Persistence(_TmpCase):
         self.assertFalse(pf.load())
         self.assertEqual(pf.equity, 10000.0)
         self.assertIsNone(pf.position)
+
+    def test_hysteresis_counters_survive_restart(self):
+        pf = self._pf()
+        pf.apply_action({"action": "enter_long", "size_fraction": 0.09}, SYM, 100.0, NOW)
+        act = decide_perps(_verdict(dump_0_100=70.0), pf.to_pf_state(100.0), CFG, NOW + 1)
+        self.assertEqual((act["action"], act["exit_signal_cycles"], act["cycles_held"]),
+                         ("skip", 1, 1))
+        pf.apply_action(act, SYM, 100.0, NOW + 1)
+        pf.save()
+
+        pf2 = PerpsPortfolio(555.0, self.state_path)  # restart from the JSON fixture
+        self.assertTrue(pf2.load())
+        self.assertEqual((pf2.exit_signal_cycles, pf2.cycles_held), (1, 1))
+        self.assertEqual(pf2.to_pf_state(100.0).side, "long")
+        # the streak survives the restart: 2nd dump signal at age 2 (still min-hold)
+        act2 = decide_perps(_verdict(dump_0_100=70.0), pf2.to_pf_state(100.0), CFG, NOW + 2)
+        self.assertEqual((act2["action"], act2["exit_signal_cycles"]), ("skip", 2))
+        pf2.apply_action(act2, SYM, 100.0, NOW + 2)
+        # 3rd dump signal at age 3 -> the 2-consecutive rule fires
+        act3 = decide_perps(_verdict(dump_0_100=70.0), pf2.to_pf_state(100.0), CFG, NOW + 3)
+        self.assertEqual(act3["action"], "exit")
+        res = pf2.apply_action(act3, SYM, 100.0, NOW + 3)
+        self.assertEqual(res["executed"], "exit")
+        self.assertEqual((pf2.exit_signal_cycles, pf2.cycles_held), (0, 0))  # reset
+
+
+class RegimeGates(unittest.TestCase):
+    """B.3 regime vetoes on the perps book."""
+
+    def test_regime_chop_blocks_both_sides(self):
+        for v, side_veto in ((_long_v(), "low_dump"), (_short_v(), "low_pump")):
+            act = decide_perps(v, _flat(), CFG, NOW, None, regime="chop")
+            self.assertEqual((act["action"], act["vetoed_by"]),
+                             ("skip", ["regime_chop", side_veto]))
+            self.assertEqual(act["veto_bitmask"],
+                             int(VetoFlags.REGIME_CHOP | VetoFlags.LOW_DUMP
+                                 if side_veto == "low_dump" else
+                                 VetoFlags.REGIME_CHOP | VetoFlags.LOW_PUMP))
+
+    def test_regime_counter_blocks_counter_side(self):
+        act = decide_perps(_short_v(), _flat(), CFG, NOW, None, regime="trend_up")
+        self.assertEqual((act["action"], act["vetoed_by"]),
+                         ("skip", ["low_pump", "regime_counter"]))
+        act = decide_perps(_long_v(), _flat(), CFG, NOW, None, regime="trend_down")
+        self.assertEqual((act["action"], act["vetoed_by"]),
+                         ("skip", ["regime_counter", "low_dump"]))
+        self.assertEqual(decide_perps(_long_v(), _flat(), CFG, NOW, None,
+                                      regime="trend_up")["action"], "enter_long")
+        self.assertEqual(decide_perps(_short_v(), _flat(), CFG, NOW, None,
+                                      regime="trend_down")["action"], "enter_short")
+
+    def test_counter_trend_allow_config(self):
+        cfg = PerpsConfig(counter_trend="allow")
+        self.assertEqual(decide_perps(_short_v(), _flat(), cfg, NOW, None,
+                                      regime="trend_up")["action"], "enter_short")
+
+    def test_exits_never_regime_blocked(self):
+        for regime in ("chop", "trend_up", "trend_down"):
+            act = decide_perps(_verdict(dump_0_100=80.0), _held("long"), CFG, NOW, None,
+                               regime=regime)
+            self.assertEqual(act["action"], "exit", regime)
+
+
+class FanoutPerps(unittest.TestCase):
+    """B.3 whipsaw fan-out resolves as a shared gate on the perps book too."""
+
+    def test_fanout_tie_vetoes_shared(self):
+        v = _long_v(fan_out=1, whipsaw_prob=0.44, whipsaw_prob_2=0.5)
+        act = decide_perps(v, _flat(), CFG, NOW, None)
+        self.assertEqual(act["vetoed_by"], ["whipsaw_fanout_tie", "low_dump"])
+        self.assertEqual(act["veto_bitmask"],
+                         int(VetoFlags.WHIPSAW_FANOUT_TIE | VetoFlags.LOW_DUMP))
+
+    def test_fanout_pass_pass_enters(self):
+        v = _long_v(fan_out=1, whipsaw_prob=0.44, whipsaw_prob_2=0.42)
+        self.assertEqual(decide_perps(v, _flat(), CFG, NOW, None)["action"], "enter_long")
+
+    def test_fanout_fail_fail_vetoes(self):
+        v = _long_v(fan_out=1, whipsaw_prob=0.5, whipsaw_prob_2=0.6)
+        act = decide_perps(v, _flat(), CFG, NOW, None)
+        self.assertEqual(act["vetoed_by"], ["high_whipsaw", "low_dump"])
+
+
+class SizingTiers(unittest.TestCase):
+    def test_tier_boundaries(self):
+        for conf, frac, tier in ((0.65, 0.06, 60), (0.699, 0.06, 60), (0.70, 0.08, 80),
+                                 (0.8499, 0.08, 80), (0.85, 0.10, 100)):
+            act = decide_perps(_long_v(confidence=conf), _flat(), CFG, NOW, None)
+            self.assertEqual((act["size_fraction"], act["size_tier"]),
+                             (round(frac, 4), tier), conf)
+
+    def test_trade_rows_carry_size_tier(self):
+        with tempfile.TemporaryDirectory() as d:
+            pf = PerpsPortfolio(10000.0, os.path.join(d, "p.json"))
+            act = decide_perps(_long_v(), pf.to_pf_state(100.0), CFG, NOW, None)
+            pf.apply_action(act, SYM, 100.0, NOW)
+            rows = [json.loads(line) for line in
+                    Path(d, "p.json.trades.jsonl").read_text().splitlines()]
+            self.assertEqual(rows[0]["size_tier"], 100)
+
+
+class HysteresisExits(unittest.TestCase):
+    """B.3 mirrored exit rule: pump x2 consecutive OR single >=75; min hold 3."""
+
+    def test_long_exit_hysteresis(self):
+        act = decide_perps(_verdict(dump_0_100=70.0), _held("long"), CFG, NOW)
+        self.assertEqual((act["action"], act["exit_signal_cycles"]), ("skip", 1))
+        act = decide_perps(_verdict(dump_0_100=70.0), _held("long", exit_signal_cycles=1),
+                           CFG, NOW)
+        self.assertEqual(act["action"], "exit")
+        self.assertIn("consecutive", act["reason"])
+        act = decide_perps(_verdict(dump_0_100=80.0), _held("long"), CFG, NOW)
+        self.assertEqual(act["action"], "exit")
+
+    def test_short_exit_hysteresis_mirrored(self):
+        act = decide_perps(_verdict(pump_0_100=70.0), _held("short"), CFG, NOW)
+        self.assertEqual((act["action"], act["exit_signal_cycles"]), ("skip", 1))
+        act = decide_perps(_verdict(pump_0_100=70.0), _held("short", exit_signal_cycles=1),
+                           CFG, NOW)
+        self.assertEqual(act["action"], "exit")
+        act = decide_perps(_verdict(pump_0_100=80.0), _held("short"), CFG, NOW)
+        self.assertEqual(act["action"], "exit")
+
+    def test_min_hold_blocks_early_signal_exits(self):
+        for age in (0, 1):  # age_now in (1, 2) < 3
+            act = decide_perps(_verdict(dump_0_100=90.0), _held("long", cycles_held=age),
+                               CFG, NOW)
+            self.assertEqual((act["action"], act["reason"]), ("skip", "hold"), age)
+
+    def test_stops_bypass_min_hold(self):
+        with tempfile.TemporaryDirectory() as d:
+            pf = PerpsPortfolio(10000.0, os.path.join(d, "p.json"))
+            pf.apply_action({"action": "enter_long", "size_fraction": 0.09}, SYM, 100.0, NOW)
+            self.assertEqual(pf.cycles_held, 0)  # fresh position, min hold not met
+            res = pf.apply_action({"action": "skip"}, SYM, 97.0, NOW + 5000)  # below stop
+            self.assertEqual(res["detail"], "stop_loss")
+            self.assertIsNone(pf.position)
 
 
 class DualBookCycle(unittest.TestCase):

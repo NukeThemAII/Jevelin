@@ -215,6 +215,30 @@ class RadarCrud(unittest.TestCase):
         self.assertIsNone(row["rank"])
 
 
+class ConfigVersionTests(unittest.TestCase):
+    """M3: config_versions(id, yaml, applied_ts) records applied configs."""
+
+    def setUp(self):
+        self.conn = jev_store.connect(":memory:")
+
+    def test_insert_and_list(self):
+        row_id = jev_store.insert_config_version(self.conn, "config_version: 2\n",
+                                                 applied_ts=123.0)
+        self.assertIsInstance(row_id, int)
+        rows = jev_store.list_config_versions(self.conn)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["yaml"], "config_version: 2\n")
+        self.assertEqual(rows[0]["applied_ts"], 123.0)
+        jev_store.insert_config_version(self.conn, "v2b", applied_ts=124.0)
+        rows = jev_store.list_config_versions(self.conn)
+        self.assertEqual([r["yaml"] for r in rows], ["config_version: 2\n", "v2b"])
+
+    def test_applied_ts_defaults_to_now(self):
+        jev_store.insert_config_version(self.conn, "x")
+        row = jev_store.list_config_versions(self.conn)[0]
+        self.assertGreater(row["applied_ts"], 1_700_000_000.0)  # real wall clock
+
+
 if __name__ == "__main__":
     unittest.main()
 
