@@ -170,6 +170,16 @@ class JevClientTests(unittest.TestCase):
         self.assertIsNone(entry["raw"])
         self.assertIn("HTTP 400", entry["error"])
 
+    def test_decision_id_logged(self) -> None:
+        with mock.patch(
+            "urllib.request.urlopen", return_value=_mock_response(FAKE_RESPONSE)
+        ):
+            self.client.ask("id-state", QUESTIONS, decision_id="decid0000042")
+            self.client.ask("id-state-2", QUESTIONS)
+        entries = [json.loads(l) for l in self.log_path.read_text().strip().splitlines()]
+        self.assertEqual(entries[0]["decision_id"], "decid0000042")  # M0 / F-P1-3
+        self.assertIsNone(entries[1]["decision_id"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -20,7 +20,6 @@ Safety invariants:
 from __future__ import annotations
 
 import json
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +28,12 @@ from typing import Optional
 # Make sibling modules importable when this file is run/imported directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from jev_config import (  # noqa: E402
+    PERPS_TAKER_FEE_RATE,
+    SLIPPAGE_RATE,
+    atomic_write_json,
+    bitmask_for,
+)
 from jev_gates import NUMERIC_KEYS, REQUIRED_KEYS, PortfolioState, _as_float  # noqa: E402
 from jev_paper import _finite, _utc_today  # noqa: E402
 
@@ -53,6 +58,10 @@ class PerpsConfig:
     max_abs_funding_pct: float = 0.01  # percent per 8h -> 0.0001 as a rate
     # Long-exit dump threshold (rule 2 references it; same default as RiskConfig).
     exit_min_dump: float = 60.0
+    # Execution costs (M0 / F-P0-1): Binance USDT-M VIP0 taker + 5 bps slippage.
+    # Paper fills are taker-style; slippage 0.0 = perfect limit fills.
+    taker_fee_rate: float = PERPS_TAKER_FEE_RATE
+    slippage_rate: float = SLIPPAGE_RATE
 
 
 @dataclass
@@ -115,6 +124,8 @@ class PerpsPortfolio:
         self.last_entry_ts_ms: Optional[int] = None
         self.day: str = _utc_today()
         self.day_start_equity: float = float(initial_equity_usd)
+        self.fees_paid: float = 0.0
+        self.slippage_paid: float = 0.0
 
     def _trade_log_path(self) -> Path:
         return Path(self.state_path + ".trades.jsonl")
@@ -154,14 +165,17 @@ class PerpsPortfolio:
     # -- actions ---------------------------------------------------------
 
     def apply_action(self, action: dict, symbol: str, price: float, ts_ms: int,
-                     funding_rate: Optional[float] = None) -> dict:
+                     funding_rate: Optional[float] = None,
+                     decision_id: Optional[str] = None) -> dict:
         """Apply a decide_perps() action locally. Never raises.
 
         Automatic exits run first, whatever the action: (a) liquidation,
-        (b) stop-loss; then (c) the explicit action.
+        (b) stop-loss; then (c) the explicit action. Every fill pays the taker
+        fee and adverse slippage (M0 / F-P0-1); liquidation fills use the
+        computed liq price as-is (no slippage).
         """
         out = {"executed": None, "qty": 0.0, "usd": 0.0, "realized_pnl": 0.0,
-               "funding_paid": 0.0, "detail": ""}
+               "fees": 0.0, "slippage": 0.0, "funding_paid": 0.0, "detail": ""}
         try:
             p = _finite(price)
             if p is None or p <= 0:
@@ -171,15 +185,21 @@ class PerpsPortfolio:
                 out["detail"] = "bad ts_ms"
                 return out
             ts = int(ts_ms)
+            did = decision_id
+            if did is None and isinstance(action, dict):
+                did = action.get("decision_id")
+            reason = str(action.get("reason") or "") if isinstance(action, dict) else ""
 
             if self.position is not None:
                 pos = self.position
                 long_ = pos["side"] == "long"
                 liq, stop = float(pos["liq_price"]), float(pos["stop_price"])
                 if (long_ and p <= liq) or (not long_ and p >= liq):
-                    return self._close(symbol, p, ts, out, "liquidated", "liquidated")
+                    # liquidation fills at the computed liq price, as-is
+                    return self._close(symbol, liq, ts, out, "liquidated", "liquidated",
+                                       did, fill_as_is=True)
                 if (long_ and p <= stop) or (not long_ and p >= stop):
-                    return self._close(symbol, p, ts, out, "stop_loss", "stop_loss")
+                    return self._close(symbol, p, ts, out, "stop_loss", "stop_loss", did)
 
             if not isinstance(action, dict):
                 out["detail"] = "bad action"
@@ -187,20 +207,22 @@ class PerpsPortfolio:
             kind = action.get("action")
             if kind in ("enter_long", "enter_short"):
                 side = "long" if kind == "enter_long" else "short"
-                return self._enter(side, action, symbol, p, ts, funding_rate, out)
+                return self._enter(side, action, symbol, p, ts, funding_rate, out,
+                                   did, reason)
             if kind == "exit":
                 if self.position is None:
                     out["detail"] = "exit while flat"
                     return out
                 return self._close(symbol, p, ts, out, "exited",
-                                   str(action.get("reason") or "exit"))
+                                   reason or "exit", did)
             out["detail"] = f"no-op action={kind!r}"
             return out
         except Exception as exc:  # defensive: never raise into the loop
             out["detail"] = f"error: {type(exc).__name__}: {exc}"
             return out
 
-    def _enter(self, side, action, symbol, price, ts_ms, funding_rate, out):
+    def _enter(self, side, action, symbol, price, ts_ms, funding_rate, out,
+               decision_id=None, reason=""):
         cfg = self.cfg
         if self.position is not None:
             out["detail"] = "enter while holding"  # no flip, no pyramiding
@@ -217,10 +239,19 @@ class PerpsPortfolio:
         leverage = min(cfg.max_leverage, lev_raw)  # hard cap, never exceed
         margin = size_fraction * self.equity
         notional = margin * leverage
-        qty = notional / price
+        # Adverse slippage by trade direction: long entry is a buy (fills UP),
+        # short entry is a sell (fills DOWN).
+        fill = price * (1.0 + cfg.slippage_rate) if side == "long" \
+            else price * (1.0 - cfg.slippage_rate)
+        qty = notional / fill
         if margin <= 0 or qty <= 0:
             out["detail"] = "non-positive size"
             return out
+        fee = notional * cfg.taker_fee_rate
+        slippage = abs(fill - price) * qty
+        self.equity -= fee  # entry fee reduces equity immediately
+        self.fees_paid += fee
+        self.slippage_paid += slippage
         self.position = {
             "symbol": symbol,
             "side": side,
@@ -228,42 +259,62 @@ class PerpsPortfolio:
             "leverage": leverage,
             "notional_usd": notional,
             "qty": qty,
-            "entry_price": price,
-            "stop_price": stop_price_for(side, price, cfg),
-            "liq_price": liq_price_for(side, price, leverage),
+            "entry_price": fill,  # fill price: all PnL math uses fills
+            "stop_price": stop_price_for(side, fill, cfg),
+            "liq_price": liq_price_for(side, fill, leverage),
             "entry_ts_ms": ts_ms,
+            "entry_fee": fee,
             "funding_rate_at_entry": _finite(funding_rate),
         }
         self.last_entry_ts_ms = ts_ms
         out.update(executed=f"enter_{side}", qty=qty, usd=notional, realized_pnl=0.0,
-                   detail="entered")
-        self._append_trade(ts_ms, symbol, side, f"enter_{side}", price, qty, notional,
-                           leverage, 0.0, 0.0, str(action.get("reason") or "entered"))
+                   fees=fee, slippage=slippage, detail="entered")
+        self._append_trade(ts_ms, symbol, side, f"enter_{side}", fill, qty, notional,
+                           leverage, 0.0, 0.0, fee, slippage, decision_id,
+                           reason or "entered")
         return out
 
-    def _close(self, symbol, price, ts_ms, out, detail, reason):
+    def _close(self, symbol, price, ts_ms, out, detail, reason, decision_id=None,
+               fill_as_is=False):
         pos = self.position
         side, qty = pos["side"], float(pos["qty"])
         margin = float(pos["margin_usd"])
-        if detail == "liquidated":
-            realized = -margin  # whole margin lost
+        entry_fee = _finite(pos.get("entry_fee")) or 0.0
+        # Adverse slippage on exit fills; liquidation fills use the given liq
+        # price as-is (fill_as_is=True).
+        if fill_as_is:
+            fill = price
         else:
-            realized = unrealized_pnl(side, float(pos["entry_price"]), price, qty)
-            realized = max(realized, -margin)  # isolated margin floor
+            fill = price * (1.0 - self.cfg.slippage_rate) if side == "long" \
+                else price * (1.0 + self.cfg.slippage_rate)
+        slippage = abs(fill - price) * qty
+        fee = abs(qty * fill) * self.cfg.taker_fee_rate
+        if detail == "liquidated":
+            gross = -margin  # whole margin lost
+        else:
+            gross = unrealized_pnl(side, float(pos["entry_price"]), fill, qty)
+            gross = max(gross, -margin)  # isolated margin floor
         funding = funding_paid_for(pos, ts_ms)
-        self.equity += realized - funding
+        # Realized PnL includes BOTH fill fees (M0 / F-P0-1); funding stays separate.
+        realized = gross - entry_fee - fee
+        self.equity += gross - fee - funding
+        self.fees_paid += fee
+        self.slippage_paid += slippage
         self.position = None
         out.update(executed="exit", qty=qty, usd=float(pos["notional_usd"]),
-                   realized_pnl=realized, funding_paid=funding, detail=detail)
-        self._append_trade(ts_ms, symbol or pos.get("symbol"), side, detail, price, qty,
+                   realized_pnl=realized, fees=fee, slippage=slippage,
+                   funding_paid=funding, detail=detail)
+        self._append_trade(ts_ms, symbol or pos.get("symbol"), side, detail, fill, qty,
                            float(pos["notional_usd"]), float(pos["leverage"]), realized,
-                           funding, reason)
+                           funding, fee, slippage, decision_id, reason)
         return out
 
     def _append_trade(self, ts_ms, symbol, side, action, price, qty, notional, leverage,
-                      realized_pnl, funding_paid, reason):
+                      realized_pnl, funding_paid, fees, slippage, decision_id, reason):
         line = {
             "ts_ms": int(ts_ms),
+            "decision_id": decision_id,
+            "book": "perps",
             "symbol": symbol,
             "side": side,
             "action": action,
@@ -273,6 +324,8 @@ class PerpsPortfolio:
             "leverage": float(leverage),
             "realized_pnl": float(realized_pnl),
             "funding_paid": float(funding_paid),
+            "fees": float(fees),
+            "slippage": float(slippage),
             "reason": reason,
         }
         try:
@@ -292,15 +345,13 @@ class PerpsPortfolio:
             "last_entry_ts_ms": self.last_entry_ts_ms,
             "day": self.day,
             "day_start_equity": self.day_start_equity,
+            "fees_paid": self.fees_paid,
+            "slippage_paid": self.slippage_paid,
         }
 
     def save(self) -> None:
-        """Atomic write: tmp file in the same dir, then os.replace."""
-        path = Path(self.state_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = Path(str(path) + ".tmp")
-        tmp.write_text(json.dumps(self._state_dict(), indent=2))
-        os.replace(tmp, path)
+        """Atomic write (tmp in the same dir + os.replace); see jev_config."""
+        atomic_write_json(self.state_path, self._state_dict())
 
     def _load_position(self, pos) -> Optional[dict]:
         if not isinstance(pos, dict) or pos.get("side") not in SIDES:
@@ -323,6 +374,7 @@ class PerpsPortfolio:
             "stop_price": stop if stop and stop > 0 else stop_price_for(side, entry, self.cfg),
             "liq_price": liq if liq and liq > 0 else liq_price_for(side, entry, nums["leverage"]),
             "entry_ts_ms": int(_finite(pos.get("entry_ts_ms")) or 0),
+            "entry_fee": _finite(pos.get("entry_fee")) or 0.0,
             "funding_rate_at_entry": _finite(pos.get("funding_rate_at_entry")),
         }
 
@@ -344,6 +396,10 @@ class PerpsPortfolio:
         dse = _finite(data.get("day_start_equity"))
         if dse is not None and dse > 0:
             self.day_start_equity = dse
+        fees = _finite(data.get("fees_paid"))
+        self.fees_paid = fees if fees is not None and fees >= 0 else 0.0
+        slip = _finite(data.get("slippage_paid"))
+        self.slippage_paid = slip if slip is not None and slip >= 0 else 0.0
         return True
 
 
@@ -352,42 +408,51 @@ class PerpsPortfolio:
 # ---------------------------------------------------------------------------
 
 def _res(action: str, reason: str, size_fraction: float = 0.0, leverage: float = 0.0,
-         vetoed_by: Optional[str] = None) -> dict:
+         failed: Optional[list] = None, decision_id: Optional[str] = None) -> dict:
+    """Decision record: vetoed_by lists EVERY failing gate (F-P1-4)."""
+    failed = list(failed or [])
     return {"action": action, "reason": reason, "size_fraction": float(size_fraction),
-            "leverage": float(leverage), "vetoed_by": vetoed_by}
+            "leverage": float(leverage), "vetoed_by": failed,
+            "veto_bitmask": bitmask_for(failed), "decision_id": decision_id}
 
 
-def _skip(reason: str, vetoed_by: Optional[str]) -> dict:
-    return _res("skip", reason, vetoed_by=vetoed_by)
+def _skip(reason: str, failed: list, decision_id: Optional[str] = None) -> dict:
+    return _res("skip", reason, failed=failed, decision_id=decision_id)
 
 
 def decide_perps(verdict: dict, pf: PortfolioState, cfg: PerpsConfig, now_ms: int,
-                 funding_rate: Optional[float] = None) -> dict:
+                 funding_rate: Optional[float] = None,
+                 decision_id: Optional[str] = None) -> dict:
     """Map a Jev verdict + perps book state to enter_long/enter_short/exit/skip. Never raises."""
     try:
-        return _decide_perps(verdict, pf, cfg, now_ms, funding_rate)
+        did = decision_id
+        if did is None and isinstance(verdict, dict):
+            did = verdict.get("decision_id")
+        return _decide_perps(verdict, pf, cfg, now_ms, funding_rate, did)
     except Exception as exc:  # defensive: never raise into the trading loop
-        return _skip(f"malformed: {type(exc).__name__}: {exc}", "malformed")
+        return _skip(f"malformed: {type(exc).__name__}: {exc}", ["malformed"], decision_id)
 
 
-def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate) -> dict:
+def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
+                  decision_id=None) -> dict:
     # (1) fail-open validation — same contract as jev_gates.decide
     if not isinstance(verdict, dict):
-        return _skip("malformed: verdict is not a dict", "malformed")
+        return _skip("malformed: verdict is not a dict", ["malformed"], decision_id)
     if verdict.get("ok") is not True or verdict.get("confidence") is None:
         err = verdict.get("error")
-        return _skip(f"no verdict ({err})" if err else "no verdict", "no_verdict")
+        return _skip(f"no verdict ({err})" if err else "no verdict", ["no_verdict"],
+                     decision_id)
     missing = [k for k in REQUIRED_KEYS if k not in verdict]
     if missing:
-        return _skip(f"malformed: missing keys {missing}", "malformed")
+        return _skip(f"malformed: missing keys {missing}", ["malformed"], decision_id)
     vals = {}
     for k in NUMERIC_KEYS:
         f = _as_float(verdict[k])
         if f is None:
-            return _skip(f"malformed: {k} not a finite number", "malformed")
+            return _skip(f"malformed: {k} not a finite number", ["malformed"], decision_id)
         vals[k] = f
     if not isinstance(verdict["phase"], str):
-        return _skip("malformed: phase not a string", "malformed")
+        return _skip("malformed: phase not a string", ["malformed"], decision_id)
     phase = verdict["phase"]
     pump, dump = vals["pump_0_100"], vals["dump_0_100"]
     exh, whip, conf = vals["exhaustion_prob"], vals["whipsaw_prob"], vals["confidence"]
@@ -397,37 +462,43 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate) -> dict:
         side = getattr(pf, "side", None)
         if side == "long":
             if dump >= cfg.exit_min_dump:
-                return _res("exit", f"long exit: dump {dump} >= {cfg.exit_min_dump}")
+                return _res("exit", f"long exit: dump {dump} >= {cfg.exit_min_dump}",
+                            decision_id=decision_id)
             if exh >= cfg.exit_exhaustion:
-                return _res("exit", f"long exit: exhaustion {exh} >= {cfg.exit_exhaustion}")
+                return _res("exit", f"long exit: exhaustion {exh} >= {cfg.exit_exhaustion}",
+                            decision_id=decision_id)
         elif side == "short":
             if pump >= cfg.entry_min_pump:
-                return _res("exit", f"short exit: pump {pump} >= {cfg.entry_min_pump}")
+                return _res("exit", f"short exit: pump {pump} >= {cfg.entry_min_pump}",
+                            decision_id=decision_id)
             if exh >= cfg.exit_exhaustion:
-                return _res("exit", f"short exit: exhaustion {exh} >= {cfg.exit_exhaustion}")
+                return _res("exit", f"short exit: exhaustion {exh} >= {cfg.exit_exhaustion}",
+                            decision_id=decision_id)
         else:
-            return _skip(f"malformed: held position side {side!r}", "malformed")
-        return _skip("hold", None)
+            return _skip(f"malformed: held position side {side!r}", ["malformed"],
+                         decision_id)
+        return _skip("hold", [], decision_id)
 
-    # (3) daily loss kill blocks entries on both sides
+    # ENTRY path — evaluate ALL gates (F-P1-4): shared, long-side, short-side.
+    # Every failing gate is recorded; ``reason`` stays the first in check order.
+    shared = []  # (gate name, readable reason) in check order
     if pf.daily_pnl_pct <= -cfg.daily_loss_limit_pct:
-        return _skip(
-            f"daily_loss_kill: daily pnl {pf.daily_pnl_pct}% <= -{cfg.daily_loss_limit_pct}%",
-            "daily_loss_kill")
-
-    # (5) shared entry gates
+        shared.append(("daily_loss_kill",
+                       f"daily_loss_kill: daily pnl {pf.daily_pnl_pct}% <= "
+                       f"-{cfg.daily_loss_limit_pct}%"))
     if whip > cfg.entry_max_whipsaw:
-        return _skip(f"high_whipsaw: {whip} > {cfg.entry_max_whipsaw}", "high_whipsaw")
+        shared.append(("high_whipsaw", f"high_whipsaw: {whip} > {cfg.entry_max_whipsaw}"))
     if exh > cfg.entry_max_exhaustion:
-        return _skip(f"high_exhaustion: {exh} > {cfg.entry_max_exhaustion}", "high_exhaustion")
+        shared.append(("high_exhaustion",
+                       f"high_exhaustion: {exh} > {cfg.entry_max_exhaustion}"))
     if conf < cfg.min_confidence:
-        return _skip(f"low_confidence: {conf} < {cfg.min_confidence}", "low_confidence")
+        shared.append(("low_confidence", f"low_confidence: {conf} < {cfg.min_confidence}"))
     if pf.last_entry_ts_ms is not None:
         elapsed = now_ms - pf.last_entry_ts_ms
         if elapsed < cfg.cooldown_seconds * 1000:
-            return _skip(
-                f"cooldown: {elapsed}ms since last entry < {cfg.cooldown_seconds * 1000}ms",
-                "cooldown")
+            shared.append(("cooldown",
+                           f"cooldown: {elapsed}ms since last entry < "
+                           f"{cfg.cooldown_seconds * 1000}ms"))
 
     # (4)(6)(7) side-specific gates; funding None/non-finite => fail-open (no veto)
     fr = _as_float(funding_rate)
@@ -447,6 +518,15 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate) -> dict:
     else:
         short_veto = None
 
+    # all failing gates in evaluation order (shared -> long -> short), deduped
+    failed = []
+    for item in shared + [v for v in (long_veto, short_veto) if v is not None]:
+        if item[0] not in [name for name, _ in failed]:
+            failed.append(item)
+
+    if shared:  # a shared gate blocks entries on both sides
+        return _skip(shared[0][1], [name for name, _ in failed], decision_id)
+
     # (8) pick a side; prefer long when pump >= dump
     prefer_long = pump >= dump
     if long_veto is None and (short_veto is not None or prefer_long):
@@ -459,12 +539,12 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate) -> dict:
         first, other = (long_veto, short_veto) if prefer_long else (short_veto, long_veto)
         weak = ("low_pump", "low_dump")
         tag, why = other if (first[0] in weak and other[0] not in weak) else first
-        return _skip(why, tag)
+        return _skip(why, [name for name, _ in failed], decision_id)
 
     size = round(cfg.max_margin_fraction * conf, 4)
     return _res(
         f"enter_{side}",
         f"all gates passed ({side}): pump={pump} dump={dump} whipsaw={whip} "
         f"exhaustion={exh} confidence={conf} funding={'na' if fr is None else fr}",
-        size, cfg.max_leverage, None,
+        size, cfg.max_leverage, [], decision_id,
     )

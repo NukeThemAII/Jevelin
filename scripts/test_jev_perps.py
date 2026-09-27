@@ -15,6 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from jev_config import VetoFlags
 from jev_gates import RiskConfig
 from jev_paper import PaperPortfolio
 from jev_perps import (
@@ -25,6 +26,15 @@ from paper_loop import parse_args, run_cycle
 NOW = 1_800_000_000_000
 CFG = PerpsConfig()
 SYM = "BTC/USDT"
+EXPECTED_FLAG = {
+    "high_whipsaw": VetoFlags.WHIPSAW,
+    "high_exhaustion": VetoFlags.EXHAUSTION,
+    "low_confidence": VetoFlags.LOW_CONFIDENCE,
+    "low_pump": VetoFlags.LOW_PUMP,
+    "low_dump": VetoFlags.LOW_DUMP,
+    "daily_loss_kill": VetoFlags.DAILY_LOSS_KILL,
+    "cooldown": VetoFlags.COOLDOWN,
+}
 
 
 def _verdict(**overrides):
@@ -79,7 +89,7 @@ class EnterSizing(_TmpCase):
         self.assertEqual(act["action"], "enter_long")
         self.assertEqual(act["size_fraction"], 0.09)  # round(0.10 * 0.9, 4)
         self.assertEqual(act["leverage"], 3.0)
-        self.assertIsNone(act["vetoed_by"])
+        self.assertEqual(act["vetoed_by"], [])
 
         pf = self._pf()
         act = dict(act, leverage=10.0)  # attempt to exceed the cap
@@ -90,12 +100,16 @@ class EnterSizing(_TmpCase):
         self.assertEqual(pos["leverage"], 3.0)  # clamped, never exceeds
         self.assertAlmostEqual(pos["margin_usd"], 900.0)  # 0.09 * 10000
         self.assertAlmostEqual(pos["notional_usd"], 2700.0)  # 900 * 3
-        self.assertAlmostEqual(pos["qty"], 27.0)  # 2700 / 100
-        self.assertAlmostEqual(pos["stop_price"], 98.0)  # 100*(1-0.02)
-        self.assertAlmostEqual(pos["liq_price"], 100.0 * (1 - 0.95 / 3))
+        self.assertAlmostEqual(pos["qty"], 26.986506746626688)  # 2700 / 100.05 fill
+        self.assertAlmostEqual(pos["entry_price"], 100.05)  # buy-side entry fills UP
+        self.assertAlmostEqual(pos["stop_price"], 98.049)  # 100.05*(1-0.02)
+        self.assertAlmostEqual(pos["liq_price"], 100.05 * (1 - 0.95 / 3))
         self.assertEqual(pos["funding_rate_at_entry"], 0.00005)
         self.assertEqual(pf.last_entry_ts_ms, NOW)
-        self.assertAlmostEqual(pf.mark_to_market(110.0), 10270.0)  # +10*27
+        self.assertAlmostEqual(res["fees"], 1.35)  # 0.0005 taker * 2700 notional
+        self.assertAlmostEqual(res["slippage"], 1.3493253373312577)  # (100.05-100) * qty
+        self.assertAlmostEqual(pf.equity, 9998.65)  # entry fee charged immediately
+        self.assertAlmostEqual(pf.mark_to_market(110.0), 10267.165742128935)
 
     def test_size_fraction_hard_capped(self):
         pf = self._pf()
@@ -112,15 +126,16 @@ class EnterSizing(_TmpCase):
         pf.apply_action(act, SYM, 100.0, NOW)
         pos = pf.position
         self.assertEqual(pos["side"], "short")
-        self.assertAlmostEqual(pos["qty"], 27.0)
-        self.assertAlmostEqual(pos["stop_price"], 102.0)
-        self.assertAlmostEqual(pos["liq_price"], 100.0 * (1 + 0.95 / 3))
-        self.assertAlmostEqual(pf.mark_to_market(90.0), 10270.0)  # (100-90)*27
-        self.assertAlmostEqual(pf.mark_to_market(101.0), 9973.0)  # (100-101)*27
+        self.assertAlmostEqual(pos["qty"], 27.01350675337669)  # 2700 / 99.95 fill
+        self.assertAlmostEqual(pos["entry_price"], 99.95)  # sell-side entry fills DOWN
+        self.assertAlmostEqual(pos["stop_price"], 101.949)  # 99.95*1.02
+        self.assertAlmostEqual(pos["liq_price"], 99.95 * (1 + 0.95 / 3))
+        self.assertAlmostEqual(pf.mark_to_market(90.0), 10267.434392196097)
+        self.assertAlmostEqual(pf.mark_to_market(101.0), 9970.285817908954)
         res = pf.apply_action({"action": "exit"}, SYM, 90.0, NOW + 1000)
         self.assertEqual(res["executed"], "exit")
-        self.assertAlmostEqual(res["realized_pnl"], 270.0)
-        self.assertAlmostEqual(pf.equity, 10270.0)
+        self.assertAlmostEqual(res["realized_pnl"], 265.00256878439217, places=6)  # net of fees
+        self.assertAlmostEqual(pf.equity, 10265.002568784392, places=6)
         self.assertIsNone(pf.position)
 
 
@@ -131,8 +146,8 @@ class AutomaticExits(_TmpCase):
         res = pf.apply_action({"action": "skip"}, SYM, 97.9, NOW + 1000)  # below 98
         self.assertEqual(res["executed"], "exit")
         self.assertEqual(res["detail"], "stop_loss")
-        self.assertAlmostEqual(res["realized_pnl"], -2.1 * 27)
-        self.assertAlmostEqual(pf.equity, 10000.0 - 2.1 * 27)
+        self.assertAlmostEqual(res["realized_pnl"], -62.01230802098903, places=6)  # net of fees
+        self.assertAlmostEqual(pf.equity, 9937.987691979011, places=6)
         self.assertIsNone(pf.position)
 
     def test_stop_loss_short(self):
@@ -140,7 +155,7 @@ class AutomaticExits(_TmpCase):
         pf.apply_action({"action": "enter_short", "size_fraction": 0.09}, SYM, 100.0, NOW)
         res = pf.apply_action({"action": "skip"}, SYM, 102.5, NOW + 1000)  # above 102
         self.assertEqual(res["detail"], "stop_loss")
-        self.assertAlmostEqual(res["realized_pnl"], -2.5 * 27)
+        self.assertAlmostEqual(res["realized_pnl"], -73.00401888444203, places=6)  # net of fees
         self.assertIsNone(pf.position)
         self.assertEqual(self._trades()[-1]["action"], "stop_loss")
 
@@ -161,8 +176,11 @@ class AutomaticExits(_TmpCase):
                 res = pf.apply_action({"action": "exit"}, SYM, gap_price, NOW + 1000)
                 self.assertEqual(res["executed"], "exit")
                 self.assertEqual(res["detail"], "liquidated")
-                self.assertAlmostEqual(res["realized_pnl"], -900.0)
-                self.assertAlmostEqual(pf.equity, 9100.0)
+                # whole margin lost + both fill fees (liq fill = computed liq price, as-is)
+                realized, equity = {"long": (-902.2725, 9097.727499999999),
+                                   "short": (-903.1275, 9096.8725)}[side]
+                self.assertAlmostEqual(res["realized_pnl"], realized, places=6)
+                self.assertAlmostEqual(pf.equity, equity, places=6)
                 self.assertIsNone(pf.position)
 
 
@@ -176,23 +194,24 @@ class Funding(_TmpCase):
     def test_long_pays_positive_funding_three_periods(self):
         pf, res = self._hold("long", 0.0001, 3 * FUNDING_PERIOD_MS + 5000)
         self.assertAlmostEqual(res["funding_paid"], 0.0001 * 2700 * 3)  # 0.81 paid
-        self.assertAlmostEqual(pf.equity, 10000.0 - 0.81)
+        # round trip at quote 100 with fees+slippage, minus 0.81 funding
+        self.assertAlmostEqual(pf.equity, 9993.792698650675, places=6)
         self.assertAlmostEqual(self._trades()[-1]["funding_paid"], 0.81)
 
     def test_short_receives_positive_funding_three_periods(self):
         pf, res = self._hold("short", 0.0001, 3 * FUNDING_PERIOD_MS + 5000)
         self.assertAlmostEqual(res["funding_paid"], -0.81)  # negative paid = received
-        self.assertAlmostEqual(pf.equity, 10000.0 + 0.81)
+        self.assertAlmostEqual(pf.equity, 9995.407298649325, places=6)
 
     def test_no_funding_under_8h(self):
         pf, res = self._hold("long", 0.0001, FUNDING_PERIOD_MS - 1)
         self.assertEqual(res["funding_paid"], 0.0)
-        self.assertAlmostEqual(pf.equity, 10000.0)
+        self.assertAlmostEqual(pf.equity, 9994.602698650675, places=6)  # costs only
 
     def test_funding_veto_long(self):
         act = decide_perps(_long_v(), _flat(), CFG, NOW, 0.0002)
         self.assertEqual(act["action"], "skip")
-        self.assertEqual(act["vetoed_by"], "funding")
+        self.assertEqual(act["vetoed_by"], ["funding", "low_dump"])  # all failing gates
         self.assertEqual(decide_perps(_long_v(), _flat(), CFG, NOW, 0.0001)["action"],
                          "enter_long")  # exactly at threshold is allowed
         self.assertEqual(decide_perps(_long_v(), _flat(), CFG, NOW, -0.0005)["action"],
@@ -201,7 +220,7 @@ class Funding(_TmpCase):
     def test_funding_veto_short(self):
         act = decide_perps(_short_v(), _flat(), CFG, NOW, -0.0002)
         self.assertEqual(act["action"], "skip")
-        self.assertEqual(act["vetoed_by"], "funding")
+        self.assertEqual(act["vetoed_by"], ["low_pump", "funding"])  # all failing gates
         self.assertEqual(decide_perps(_short_v(), _flat(), CFG, NOW, -0.0001)["action"],
                          "enter_short")
         self.assertEqual(decide_perps(_short_v(), _flat(), CFG, NOW, 0.0005)["action"],
@@ -217,14 +236,16 @@ class DecisionRules(unittest.TestCase):
     def test_short_requires_dump_60(self):
         act = decide_perps(_short_v(dump_0_100=59.9), _flat(), CFG, NOW, None)
         self.assertEqual(act["action"], "skip")
-        self.assertIn(act["vetoed_by"], ("low_dump", "low_pump"))
+        self.assertEqual(act["vetoed_by"], ["low_pump", "low_dump"])  # both sides blocked
+        self.assertEqual(act["veto_bitmask"],
+                         int(VetoFlags.LOW_PUMP | VetoFlags.LOW_DUMP))
         self.assertEqual(decide_perps(_short_v(dump_0_100=60.0), _flat(), CFG, NOW)["action"],
                          "enter_short")
 
     def test_capitulation_blocks_long_only(self):
         act = decide_perps(_long_v(phase="capitulation"), _flat(), CFG, NOW, None)
         self.assertEqual(act["action"], "skip")
-        self.assertEqual(act["vetoed_by"], "capitulation")
+        self.assertEqual(act["vetoed_by"], ["capitulation", "low_dump"])
         act = decide_perps(_short_v(phase="capitulation"), _flat(), CFG, NOW, None)
         self.assertEqual(act["action"], "enter_short")
         # both signals high + capitulation -> long blocked, short taken
@@ -239,16 +260,24 @@ class DecisionRules(unittest.TestCase):
                                       CFG, NOW)["action"], "enter_short")
 
     def test_shared_entry_gates(self):
+        # F-P1-4: ALL failing gates are recorded — the shared gate first, then the
+        # side gate that blocks the opposite candidate side.
         for kw, veto in (({"whipsaw_prob": 0.51}, "high_whipsaw"),
                          ({"exhaustion_prob": 0.61}, "high_exhaustion"),
                          ({"confidence": 0.59}, "low_confidence")):
-            for maker in (_long_v, _short_v):
-                act = decide_perps(maker(**kw), _flat(), CFG, NOW)
-                self.assertEqual((act["action"], act["vetoed_by"]), ("skip", veto))
+            act = decide_perps(_long_v(**kw), _flat(), CFG, NOW)
+            self.assertEqual((act["action"], act["vetoed_by"]),
+                             ("skip", [veto, "low_dump"]))
+            self.assertEqual(act["veto_bitmask"],
+                             int(EXPECTED_FLAG[veto] | VetoFlags.LOW_DUMP))
+            act = decide_perps(_short_v(**kw), _flat(), CFG, NOW)
+            self.assertEqual((act["action"], act["vetoed_by"]),
+                             ("skip", [veto, "low_pump"]))
         act = decide_perps(_long_v(), _flat(last_entry_ts_ms=NOW - 1000), CFG, NOW)
-        self.assertEqual(act["vetoed_by"], "cooldown")
+        self.assertEqual(act["vetoed_by"], ["cooldown", "low_dump"])
         act = decide_perps(_long_v(), _flat(last_entry_ts_ms=NOW - 900_000), CFG, NOW)
         self.assertEqual(act["action"], "enter_long")
+        self.assertEqual(act["veto_bitmask"], 0)  # an entry is never vetoed
 
     def test_no_flip(self):
         # holding long, strong short signal: exit only, never enter_short
@@ -277,9 +306,12 @@ class DecisionRules(unittest.TestCase):
             self.assertEqual(pf.position["side"], "long")
 
     def test_daily_loss_kill_blocks_entries_not_exits(self):
-        for maker in (_long_v, _short_v):
-            act = decide_perps(maker(), _flat(daily_pnl_pct=-5.0), CFG, NOW)
-            self.assertEqual((act["action"], act["vetoed_by"]), ("skip", "daily_loss_kill"))
+        act = decide_perps(_long_v(), _flat(daily_pnl_pct=-5.0), CFG, NOW)
+        self.assertEqual((act["action"], act["vetoed_by"]),
+                         ("skip", ["daily_loss_kill", "low_dump"]))
+        act = decide_perps(_short_v(), _flat(daily_pnl_pct=-5.0), CFG, NOW)
+        self.assertEqual((act["action"], act["vetoed_by"]),
+                         ("skip", ["daily_loss_kill", "low_pump"]))
         act = decide_perps(_short_v(), _held("long", daily_pnl_pct=-7.0), CFG, NOW)
         self.assertEqual(act["action"], "exit")
         act = decide_perps(_long_v(), _held("short", daily_pnl_pct=-7.0), CFG, NOW)
@@ -301,9 +333,9 @@ class DecisionRules(unittest.TestCase):
         cases.append((v, "malformed"))
         for verdict, veto in cases:
             act = decide_perps(verdict, _flat(), CFG, NOW, None)
-            self.assertEqual((act["action"], act["vetoed_by"]), ("skip", veto), verdict)
+            self.assertEqual((act["action"], act["vetoed_by"]), ("skip", [veto]), verdict)
         act = decide_perps(_long_v(), None, CFG, NOW)  # broken pf -> never raises
-        self.assertEqual((act["action"], act["vetoed_by"]), ("skip", "malformed"))
+        self.assertEqual((act["action"], act["vetoed_by"]), ("skip", ["malformed"]))
 
     def test_apply_action_bad_input_never_raises(self):
         with tempfile.TemporaryDirectory() as d:
@@ -330,7 +362,7 @@ class Persistence(_TmpCase):
         self.assertFalse(Path(self.state_path + ".tmp").exists())  # atomic replace
         raw = json.loads(Path(self.state_path).read_text())
         self.assertEqual(set(raw), {"equity", "position", "last_entry_ts_ms", "day",
-                                    "day_start_equity"})
+                                    "day_start_equity", "fees_paid", "slippage_paid"})
 
         pf2 = PerpsPortfolio(555.0, self.state_path)
         self.assertTrue(pf2.load())
@@ -342,10 +374,13 @@ class Persistence(_TmpCase):
         self.assertEqual(pf2.to_pf_state(100.0).side, "short")
 
         t = self._trades()[0]
-        self.assertEqual(set(t), {"ts_ms", "symbol", "side", "action", "price", "qty",
-                                  "notional", "leverage", "realized_pnl", "funding_paid",
-                                  "reason"})
+        self.assertEqual(set(t), {"ts_ms", "decision_id", "book", "symbol", "side", "action",
+                                  "price", "qty", "notional", "leverage", "realized_pnl",
+                                  "funding_paid", "fees", "slippage", "reason"})
         self.assertEqual((t["side"], t["action"], t["leverage"]), ("short", "enter_short", 3.0))
+        self.assertEqual(t["book"], "perps")
+        self.assertAlmostEqual(t["fees"], 1.2)  # 0.0005 * 2400 notional
+        self.assertAlmostEqual(t["slippage"], 1.2006003001500751)  # (100-99.95) * qty
 
     def test_load_restores_missing_stop(self):
         Path(self.state_path).write_text(json.dumps({
@@ -398,7 +433,21 @@ class DualBookCycle(unittest.TestCase):
         self.assertIn("spot: ", text)
         self.assertIn("perps: ", text)
         self.assertIn("funding=0.000050", text)
+        self.assertIn("decision=", text)  # M0: decision_id on every cycle line
         self.assertTrue(Path(self.perps.state_path).exists())
+
+        # M0: ONE decision_id per cycle flows through both books' logs and trade rows.
+        rows = [json.loads(l) for l in
+                Path(self.tmp.name, "paper_decisions.jsonl").read_text().splitlines()]
+        self.assertEqual([r["book"] for r in rows], ["spot", "perps"])
+        self.assertEqual(len({r["decision_id"] for r in rows}), 1)
+        spot_trades = [json.loads(l) for l in
+                       Path(self.spot.state_path + ".trades.jsonl").read_text().splitlines()]
+        perps_trades = [json.loads(l) for l in
+                        Path(self.perps.state_path + ".trades.jsonl").read_text().splitlines()]
+        self.assertEqual(spot_trades[0]["decision_id"], rows[0]["decision_id"])
+        self.assertEqual(perps_trades[0]["decision_id"], rows[0]["decision_id"])
+        self.assertEqual(rows[0]["veto_bitmask"], 0)
 
     def test_funding_failure_fails_open(self):
         scorer = mock.Mock()
@@ -431,9 +480,34 @@ class DualBookCycle(unittest.TestCase):
         self.assertTrue(a.perps)
         self.assertEqual(a.perps_state, "runtime/perps_btc.json")
         self.assertEqual(a.state, "runtime/paper_btc.json")
+        self.assertIsNone(a.fee_rate)  # default -> built-in cost constants
+        self.assertIsNone(a.slippage_rate)
         a = parse_args(["--no-perps", "--perps-state", "/tmp/x.json"])
         self.assertFalse(a.perps)
         self.assertEqual(a.perps_state, "/tmp/x.json")
+        a = parse_args(["--fee-rate", "0.002", "--slippage-rate", "0.0"])
+        self.assertEqual(a.fee_rate, 0.002)  # M0 override path
+        self.assertEqual(a.slippage_rate, 0.0)
+
+    def test_summary_shows_both_books(self):
+        import jev_summary
+
+        scorer = mock.Mock()
+        scorer.score.return_value = _long_v()
+        exchange = mock.Mock()
+        exchange.fetch_ticker.return_value = {"last": 100.0}
+        funding = mock.Mock()
+        funding.fetch_funding_rate.return_value = {"fundingRate": 0.00005}
+        with redirect_stdout(io.StringIO()):
+            run_cycle(scorer, self.spot, RiskConfig(), exchange, SYM, NOW,
+                      self.perps, CFG, funding)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            jev_summary.main(["--runtime-dir", self.tmp.name])
+        text = out.getvalue()
+        self.assertIn("spot", text)
+        self.assertIn("perps", text)
+        self.assertIn("round trips:", text)
 
 
 if __name__ == "__main__":

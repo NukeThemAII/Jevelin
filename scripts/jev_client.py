@@ -56,8 +56,12 @@ class JevClient:
     def __repr__(self) -> str:  # never expose the key
         return f"JevClient(model={self.model!r}, calls={self.calls})"
 
-    def ask(self, state: str, questions: dict) -> dict:
-        """One decision call. Returns ok/answers/error/usage/raw/latency_ms."""
+    def ask(self, state: str, questions: dict, decision_id: Optional[str] = None) -> dict:
+        """One decision call. Returns ok/answers/error/usage/raw/latency_ms.
+
+        ``decision_id`` is recorded in the audit log so verdict rows join to
+        trades and gate decisions (M0 / F-P1-3).
+        """
         started = time.monotonic()
         self.calls += 1
         body = json.dumps(
@@ -101,7 +105,8 @@ class JevClient:
             result["error"] = error
 
         result["latency_ms"] = round((time.monotonic() - started) * 1000.0, 3)
-        self._write_log(state, questions, result)
+        result["decision_id"] = decision_id
+        self._write_log(state, questions, result, decision_id)
         return result
 
     # -- internals ---------------------------------------------------------
@@ -126,10 +131,12 @@ class JevClient:
                     return None, last_error
         return None, last_error
 
-    def _write_log(self, state: str, questions: dict, result: dict) -> None:
+    def _write_log(self, state: str, questions: dict, result: dict,
+                   decision_id: Optional[str] = None) -> None:
         """Append one JSONL line per ask. Logging must never break a call."""
         line = {
             "ts": time.time(),
+            "decision_id": decision_id,
             "state_sha256": hashlib.sha256(state.encode("utf-8")).hexdigest(),
             "questions": questions,
             "raw": result["raw"],

@@ -6,10 +6,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from jev_config import VetoFlags, bit_names, bitmask_for
 from jev_gates import PortfolioState, RiskConfig, decide
 
 NOW = 1_800_000_000_000
 CFG = RiskConfig()
+RESULT_KEYS = {"action", "reason", "size_fraction", "vetoed_by", "veto_bitmask", "decision_id"}
+# Independent expectation map: gate name -> its single flag bit.
+EXPECTED_FLAG = {
+    "no_verdict": VetoFlags.NO_VERDICT,
+    "malformed": VetoFlags.MALFORMED,
+    "daily_loss_kill": VetoFlags.DAILY_LOSS_KILL,
+    "capitulation": VetoFlags.CAPITULATION_BLOCK,
+    "high_whipsaw": VetoFlags.WHIPSAW,
+    "high_exhaustion": VetoFlags.EXHAUSTION,
+    "low_confidence": VetoFlags.LOW_CONFIDENCE,
+    "cooldown": VetoFlags.COOLDOWN,
+    "low_pump": VetoFlags.LOW_PUMP,
+    "low_dump": VetoFlags.LOW_DUMP,
+    "funding": VetoFlags.FUNDING_VETO,
+}
 
 
 def _verdict(**overrides):
@@ -44,9 +60,11 @@ class EnterTests(unittest.TestCase):
     def test_enter_happy_path(self):
         d = decide(_verdict(), _flat(), CFG, NOW)
         self.assertEqual(d["action"], "enter")
-        self.assertIsNone(d["vetoed_by"])
+        self.assertEqual(d["vetoed_by"], [])  # no gate vetoed an entry
+        self.assertEqual(d["veto_bitmask"], 0)
+        self.assertIsNone(d["decision_id"])
         self.assertEqual(d["size_fraction"], round(0.20 * 0.86, 4))
-        self.assertEqual(set(d), {"action", "reason", "size_fraction", "vetoed_by"})
+        self.assertEqual(set(d), RESULT_KEYS)
 
     def test_enter_at_exact_thresholds(self):
         v = _verdict(pump_0_100=60.0, whipsaw_prob=0.5, exhaustion_prob=0.6, confidence=0.6)
@@ -58,7 +76,8 @@ class EnterTests(unittest.TestCase):
 class VetoTests(unittest.TestCase):
     def assertVeto(self, d, gate):
         self.assertEqual(d["action"], "skip")
-        self.assertEqual(d["vetoed_by"], gate)
+        self.assertEqual(d["vetoed_by"], [gate])
+        self.assertEqual(d["veto_bitmask"], int(EXPECTED_FLAG[gate]))
         self.assertEqual(d["size_fraction"], 0.0)
         self.assertIn(gate if gate != "no_verdict" else "no verdict", d["reason"])
 
@@ -117,7 +136,8 @@ class ExitTests(unittest.TestCase):
         d = decide(_verdict(dump_0_100=60.0), _long(), CFG, NOW)
         self.assertEqual(d["action"], "exit")
         self.assertEqual(d["size_fraction"], 0.0)
-        self.assertIsNone(d["vetoed_by"])
+        self.assertEqual(d["vetoed_by"], [])
+        self.assertEqual(d["veto_bitmask"], 0)  # an exit is never vetoed
 
     def test_exit_on_exhaustion(self):
         d = decide(_verdict(exhaustion_prob=0.8), _long(), CFG, NOW)
@@ -129,7 +149,7 @@ class ExitTests(unittest.TestCase):
         self.assertEqual(d["action"], "skip")
         self.assertEqual(d["reason"], "hold")
         self.assertEqual(d["size_fraction"], 0.0)
-        self.assertIsNone(d["vetoed_by"])
+        self.assertEqual(d["vetoed_by"], [])  # hold is not a veto
 
     def test_no_entry_when_holding(self):
         d = decide(_verdict(), _long(), CFG, NOW)
@@ -138,11 +158,50 @@ class ExitTests(unittest.TestCase):
     def test_exit_allowed_under_daily_loss_kill(self):
         d = decide(_verdict(dump_0_100=83.3), _long(daily_pnl_pct=-12.0), CFG, NOW)
         self.assertEqual(d["action"], "exit")
-        self.assertIsNone(d["vetoed_by"])
+        self.assertEqual(d["vetoed_by"], [])
 
     def test_exit_allowed_under_capitulation(self):
         d = decide(_verdict(phase="capitulation", dump_0_100=100.0), _long(), CFG, NOW)
         self.assertEqual(d["action"], "exit")
+
+
+class BitmaskTests(unittest.TestCase):
+    def test_multi_gate_failure_sets_every_bit(self):
+        # 7 entry gates fail at once: every failing gate must be recorded, not just the first.
+        v = _verdict(phase="capitulation", pump_0_100=10.0, whipsaw_prob=0.9,
+                     exhaustion_prob=0.9, confidence=0.1)
+        pf = _flat(daily_pnl_pct=-6.0, last_entry_ts_ms=NOW - 1000)
+        d = decide(v, pf, CFG, NOW)
+        self.assertEqual(d["action"], "skip")
+        self.assertEqual(d["vetoed_by"],
+                         ["daily_loss_kill", "capitulation", "low_pump", "high_whipsaw",
+                          "high_exhaustion", "low_confidence", "cooldown"])
+        expected = int(VetoFlags.DAILY_LOSS_KILL | VetoFlags.CAPITULATION_BLOCK
+                       | VetoFlags.LOW_PUMP | VetoFlags.WHIPSAW | VetoFlags.EXHAUSTION
+                       | VetoFlags.LOW_CONFIDENCE | VetoFlags.COOLDOWN)
+        self.assertEqual(d["veto_bitmask"], expected)  # 7 bits set
+        self.assertEqual(bin(d["veto_bitmask"]).count("1"), 7)
+        self.assertIn("daily_loss_kill", d["reason"])  # reason stays readable/first-gate
+
+    def test_two_gate_failure(self):
+        d = decide(_verdict(pump_0_100=10.0, confidence=0.2), _flat(), CFG, NOW)
+        self.assertEqual(d["vetoed_by"], ["low_pump", "low_confidence"])
+        self.assertEqual(d["veto_bitmask"],
+                         int(VetoFlags.LOW_PUMP | VetoFlags.LOW_CONFIDENCE))
+        self.assertEqual(bin(d["veto_bitmask"]).count("1"), 2)
+
+    def test_bit_names_round_trip(self):
+        self.assertEqual(bitmask_for([]), 0)
+        self.assertEqual(int(bitmask_for(["low_pump"])), int(VetoFlags.LOW_PUMP))
+        mask = bitmask_for(["low_pump", "cooldown"])
+        self.assertEqual(set(bit_names(mask)), {"low_pump", "cooldown"})
+
+    def test_decision_id_flows_into_result(self):
+        d = decide(_verdict(), _flat(), CFG, NOW, decision_id="abc123def456")
+        self.assertEqual(d["decision_id"], "abc123def456")
+        v = _verdict()
+        v["decision_id"] = "fromverdict01"
+        self.assertEqual(decide(v, _flat(), CFG, NOW)["decision_id"], "fromverdict01")
 
 
 if __name__ == "__main__":

@@ -42,7 +42,9 @@ class ShadowScorer:
             exchange if exchange is not None else ccxt.binance({"enableRateLimit": True})
         )
 
-    def score(self, symbol: str) -> dict:
+    def score(self, symbol: str, decision_id: Optional[str] = None) -> dict:
+        """Verdict dict for one cycle. ``decision_id`` flows into the verdict and
+        the client's audit log (M0 / F-P1-3)."""
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, "1m", limit=10)
             raw_trades = self.exchange.fetch_trades(symbol, limit=200)
@@ -55,12 +57,13 @@ class ShadowScorer:
             state = build_state(symbol, closes, trades, now_ms)
             state_str = json.dumps(state, separators=(",", ":"), sort_keys=True)
 
-            result = self.client.ask(state_str, QUESTIONS)
+            result = self.client.ask(state_str, QUESTIONS, decision_id=decision_id)
             if not result.get("ok"):
                 return {
                     "ok": False,
                     "error": str(result.get("error") or "jev ask failed"),
                     "symbol": symbol,
+                    "decision_id": decision_id,
                 }
 
             answers = result.get("answers") or {}
@@ -70,6 +73,7 @@ class ShadowScorer:
                 "ok": True,
                 "error": None,
                 "symbol": symbol,
+                "decision_id": decision_id,
                 "pump_0_100": normalize_score(pump_raw, CRITERIA_SIZES["pump"]),
                 "dump_0_100": normalize_score(dump_raw, CRITERIA_SIZES["dump"]),
                 "phase": str(answers["phase"]["choice"]),
@@ -81,4 +85,5 @@ class ShadowScorer:
             }
             return verdict
         except Exception as exc:  # fail-open: never fabricate values
-            return {"ok": False, "error": str(exc), "symbol": symbol}
+            return {"ok": False, "error": str(exc), "symbol": symbol,
+                    "decision_id": decision_id}

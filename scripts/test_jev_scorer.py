@@ -118,6 +118,19 @@ class VerdictMappingTests(unittest.TestCase):
             self.assertIn(q["type"], ("choice", "noul", "score"))
             self.assertIn("instructions", q)
 
+    def test_decision_id_flows_into_verdict_and_client(self):
+        # M0 / F-P1-3: state record -> verdict record carries the decision id.
+        client = _mock_client(answers=FULL_ANSWERS)
+        scorer = ShadowScorer(client, exchange=_mock_exchange())
+        v = scorer.score("BTC/USDT", decision_id="decid0000042")
+        self.assertEqual(v["decision_id"], "decid0000042")
+        self.assertEqual(client.ask.call_args.kwargs.get("decision_id"), "decid0000042")
+        # fail-open verdicts carry the id too (never fabricated fields, only the id)
+        scorer = ShadowScorer(_mock_client(ok=False, error="timeout"),
+                              exchange=_mock_exchange())
+        v = scorer.score("BTC/USDT", decision_id="decid0000043")
+        self.assertEqual(v["decision_id"], "decid0000043")
+
 
 class FailOpenTests(unittest.TestCase):
     def test_client_error_no_fabrication(self):

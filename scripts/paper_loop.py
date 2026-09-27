@@ -25,6 +25,13 @@ from pathlib import Path
 # Make sibling modules importable when this file is run/imported directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from jev_config import (  # noqa: E402
+    PERPS_TAKER_FEE_RATE,
+    SLIPPAGE_RATE,
+    SPOT_FEE_RATE,
+    append_jsonl,
+    new_decision_id,
+)
 from jev_client import JevClient, load_api_key  # noqa: E402
 from jev_gates import RiskConfig, decide  # noqa: E402
 from jev_paper import PaperPortfolio  # noqa: E402
@@ -39,6 +46,46 @@ def _ts_iso(ts_ms) -> str:
         return str(ts_ms)
 
 
+def _veto_status(action: dict) -> str:
+    """Readable reason / veto block for a cycle log line (M0 / F-P1-4)."""
+    failed = action.get("vetoed_by") or []
+    if failed:
+        return (f"veto_bitmask={action.get('veto_bitmask', 0)} "
+                f"vetoed_by={','.join(failed)} reason={action['reason']}")
+    return f"reason={action['reason']}"
+
+
+def _decision_row(book, decision_id, symbol, ts_ms, price, action, result, verdict, equity):
+    """One gate-decision record per book per cycle (M0 / F-P1-3 + F-P1-4)."""
+    v = verdict if isinstance(verdict, dict) else {}
+    return {
+        "ts_ms": int(ts_ms),
+        "decision_id": decision_id,
+        "book": book,
+        "symbol": symbol,
+        "price": float(price),
+        "action": action.get("action"),
+        "executed": result.get("executed"),
+        "veto_bitmask": int(action.get("veto_bitmask") or 0),
+        "vetoed_by": list(action.get("vetoed_by") or []),
+        "reason": action.get("reason"),
+        "equity": float(equity),
+        "fees": float(result.get("fees") or 0.0),
+        "slippage": float(result.get("slippage") or 0.0),
+        "realized_pnl": float(result.get("realized_pnl") or 0.0),
+        "funding_paid": float(result.get("funding_paid") or 0.0),
+        "verdict": {
+            "ok": v.get("ok"),
+            "pump_0_100": v.get("pump_0_100"),
+            "dump_0_100": v.get("dump_0_100"),
+            "phase": v.get("phase"),
+            "exhaustion_prob": v.get("exhaustion_prob"),
+            "whipsaw_prob": v.get("whipsaw_prob"),
+            "confidence": v.get("confidence"),
+        },
+    }
+
+
 def fetch_funding_rate(funding_exchange, symbol):
     """Public funding rate (float) or None on any failure / missing handle. Never raises."""
     if funding_exchange is None:
@@ -51,28 +98,31 @@ def fetch_funding_rate(funding_exchange, symbol):
 
 
 def run_perps_cycle(verdict, perps_portfolio, perps_cfg, funding_exchange, symbol, price,
-                    now_ms) -> dict:
+                    now_ms, decision_id=None, decision_log_path=None) -> dict:
     """Drive the paper perps book from an existing verdict. Never raises (KeyboardInterrupt excepted)."""
     try:
         funding_rate = fetch_funding_rate(funding_exchange, symbol)
         pf = perps_portfolio.to_pf_state(price)  # pre-trade state drives the decision
-        action = decide_perps(verdict, pf, perps_cfg, now_ms, funding_rate)
-        result = perps_portfolio.apply_action(action, symbol, price, now_ms, funding_rate)
+        action = decide_perps(verdict, pf, perps_cfg, now_ms, funding_rate,
+                              decision_id=decision_id)
+        result = perps_portfolio.apply_action(action, symbol, price, now_ms, funding_rate,
+                                              decision_id=decision_id)
         perps_portfolio.save()
         pf_line = perps_portfolio.to_pf_state(price)
 
-        if action.get("vetoed_by"):
-            status = f"vetoed_by={action['vetoed_by']} reason={action['reason']}"
-        else:
-            status = f"reason={action['reason']}"
         funding_str = "na" if funding_rate is None else f"{funding_rate:.6f}"
         print(
-            f"perps: {_ts_iso(now_ms)} {symbol} price={price:.4f} funding={funding_str} "
-            f"action={action['action']} executed={result['executed']} "
-            f"detail={result['detail']} {status} "
+            f"perps: {_ts_iso(now_ms)} decision={decision_id} {symbol} price={price:.4f} "
+            f"funding={funding_str} action={action['action']} executed={result['executed']} "
+            f"detail={result['detail']} {_veto_status(action)} "
+            f"fees={result.get('fees', 0.0):.6f} slippage={result.get('slippage', 0.0):.6f} "
             f"equity={pf_line.equity_usd:.2f} side={pf_line.side} "
             f"daily_pnl_pct={pf_line.daily_pnl_pct:.4f}"
         )
+        if decision_log_path is not None:
+            append_jsonl(decision_log_path, _decision_row(
+                "perps", decision_id, symbol, now_ms, price, action, result, verdict,
+                pf_line.equity_usd))
         return {
             "funding_rate": funding_rate,
             "action": action,
@@ -83,38 +133,47 @@ def run_perps_cycle(verdict, perps_portfolio, perps_cfg, funding_exchange, symbo
             "daily_pnl_pct": pf_line.daily_pnl_pct,
         }
     except Exception as exc:  # fail-open: perps problems never break the spot book
-        print(f"perps: cycle error: {type(exc).__name__}: {exc}")
+        print(f"perps: cycle error: {type(exc).__name__}: {exc} decision={decision_id}")
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def run_cycle(scorer, portfolio, cfg, exchange, symbol, now_ms, perps_portfolio=None,
-              perps_cfg=None, funding_exchange=None) -> dict:
+              perps_cfg=None, funding_exchange=None, decision_id=None,
+              decision_log_path=None) -> dict:
     """Run one paper cycle (spot book, plus perps book when ``perps_portfolio`` is given).
 
-    Fail-open: returns a dict, never raises (KeyboardInterrupt excepted).
+    Fail-open: returns a dict, never raises (KeyboardInterrupt excepted). Each
+    cycle gets one unique ``decision_id`` flowing through verdict -> gate
+    decision -> trade rows -> every log line (M0 / F-P1-3).
     """
+    decision_id = decision_id or new_decision_id()
+    if decision_log_path is None:
+        decision_log_path = str(Path(portfolio.state_path).parent / "paper_decisions.jsonl")
     try:
-        verdict = scorer.score(symbol)
+        verdict = scorer.score(symbol, decision_id=decision_id)
         price = float(exchange.fetch_ticker(symbol)["last"])
         pf = portfolio.to_pf_state(price)  # pre-trade state drives the decision
-        action = decide(verdict, pf, cfg, now_ms)
-        result = portfolio.apply_action(action, symbol, price, now_ms)
+        action = decide(verdict, pf, cfg, now_ms, decision_id=decision_id)
+        result = portfolio.apply_action(action, symbol, price, now_ms,
+                                        decision_id=decision_id)
         portfolio.save()
         pf_line = portfolio.to_pf_state(price)  # post-trade status for the line
 
-        if action.get("vetoed_by"):
-            status = f"vetoed_by={action['vetoed_by']} reason={action['reason']}"
-        else:
-            status = f"reason={action['reason']}"
         line = (
-            f"spot: {_ts_iso(now_ms)} {symbol} price={price:.4f} "
-            f"action={action['action']} executed={result['executed']} {status} "
+            f"spot: {_ts_iso(now_ms)} decision={decision_id} {symbol} price={price:.4f} "
+            f"action={action['action']} executed={result['executed']} "
+            f"{_veto_status(action)} "
+            f"fees={result.get('fees', 0.0):.6f} slippage={result.get('slippage', 0.0):.6f} "
             f"equity={pf_line.equity_usd:.2f} has_position={pf_line.has_position} "
             f"daily_pnl_pct={pf_line.daily_pnl_pct:.4f}"
         )
         print(line)
+        append_jsonl(decision_log_path, _decision_row(
+            "spot", decision_id, symbol, now_ms, price, action, result, verdict,
+            pf_line.equity_usd))
         out = {
             "ts_ms": now_ms,
+            "decision_id": decision_id,
             "symbol": symbol,
             "price": price,
             "verdict": verdict,
@@ -127,11 +186,13 @@ def run_cycle(scorer, portfolio, cfg, exchange, symbol, now_ms, perps_portfolio=
         if perps_portfolio is not None:  # same verdict + price drive the perps book
             out["perps"] = run_perps_cycle(
                 verdict, perps_portfolio, perps_cfg or PerpsConfig(), funding_exchange,
-                symbol, price, now_ms)
+                symbol, price, now_ms, decision_id=decision_id,
+                decision_log_path=decision_log_path)
         return out
     except Exception as exc:  # fail-open: the loop must never crash
-        print(f"cycle error: {type(exc).__name__}: {exc}")
-        return {"ts_ms": now_ms, "symbol": symbol, "error": f"{type(exc).__name__}: {exc}"}
+        print(f"cycle error: {type(exc).__name__}: {exc} decision={decision_id}")
+        return {"ts_ms": now_ms, "decision_id": decision_id, "symbol": symbol,
+                "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _build_exchange():
@@ -170,6 +231,16 @@ def parse_args(argv=None):
         "--perps", action=argparse.BooleanOptionalAction, default=True,
         help="also drive the paper perps book (long+short) from the same verdict (default: on)",
     )
+    p.add_argument(
+        "--fee-rate", type=float, default=None,
+        help="per-side fee rate override for BOTH books "
+             "(default: spot 0.001, perps taker 0.0005)",
+    )
+    p.add_argument(
+        "--slippage-rate", type=float, default=None,
+        help="per-side slippage rate override for BOTH books "
+             "(default 0.0005; 0 = perfect limit fills)",
+    )
     return p.parse_args(argv)
 
 
@@ -180,11 +251,15 @@ def main(argv=None) -> int:
     exchange = _build_exchange()
     scorer = ShadowScorer(client, exchange)
     cfg = RiskConfig()
-    portfolio = PaperPortfolio(initial_equity_usd=args.initial_equity, state_path=args.state)
+    fee_rate = args.fee_rate if args.fee_rate is not None else SPOT_FEE_RATE
+    slippage_rate = args.slippage_rate if args.slippage_rate is not None else SLIPPAGE_RATE
+    portfolio = PaperPortfolio(initial_equity_usd=args.initial_equity, state_path=args.state,
+                               fee_rate=fee_rate, slippage_rate=slippage_rate)
     portfolio.load()  # resume from prior state when present
     perps_portfolio = perps_cfg = funding_exchange = None
     if args.perps:
-        perps_cfg = PerpsConfig()
+        perps_fee = args.fee_rate if args.fee_rate is not None else PERPS_TAKER_FEE_RATE
+        perps_cfg = PerpsConfig(taker_fee_rate=perps_fee, slippage_rate=slippage_rate)
         perps_portfolio = PerpsPortfolio(
             initial_equity_usd=args.initial_equity, state_path=args.perps_state, cfg=perps_cfg)
         perps_portfolio.load()

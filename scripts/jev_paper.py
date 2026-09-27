@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +21,7 @@ from typing import Optional
 # Make sibling modules importable when this file is run/imported directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from jev_config import SLIPPAGE_RATE, SPOT_FEE_RATE, atomic_write_json
 from jev_gates import PortfolioState  # noqa: E402  (path bootstrap above)
 
 
@@ -45,6 +45,8 @@ class PaperPortfolio:
         self,
         initial_equity_usd: float = 10000.0,
         state_path: str = "runtime/paper_state.json",
+        fee_rate: float = SPOT_FEE_RATE,
+        slippage_rate: float = SLIPPAGE_RATE,
     ) -> None:
         self.state_path = str(state_path)
         self.initial_equity_usd = float(initial_equity_usd)
@@ -53,6 +55,13 @@ class PaperPortfolio:
         self.day: str = _utc_today()
         self.day_start_equity: float = float(initial_equity_usd)
         self.last_entry_ts_ms: Optional[int] = None
+        # Execution costs (M0 / F-P0-1): per-side fee + adverse slippage.
+        fr = _finite(fee_rate)
+        self.fee_rate: float = fr if fr is not None and fr >= 0 else float(SPOT_FEE_RATE)
+        sr = _finite(slippage_rate)
+        self.slippage_rate: float = sr if sr is not None and sr >= 0 else float(SLIPPAGE_RATE)
+        self.fees_paid: float = 0.0
+        self.slippage_paid: float = 0.0
 
     # -- accounting helpers ---------------------------------------------
 
@@ -93,12 +102,15 @@ class PaperPortfolio:
 
     # -- actions ---------------------------------------------------------
 
-    def apply_action(self, action: dict, symbol: str, price: float, ts_ms: int) -> dict:
+    def apply_action(self, action: dict, symbol: str, price: float, ts_ms: int,
+                     decision_id: Optional[str] = None) -> dict:
         """Apply a decide() action locally. Returns executed/qty/usd/realized_pnl/detail.
 
         Never raises: bad input or a defensive mismatch yields ``executed: None``.
+        ``decision_id`` (or ``action["decision_id"]``) flows into every trade row.
         """
-        out = {"executed": None, "qty": 0.0, "usd": 0.0, "realized_pnl": 0.0, "detail": ""}
+        out = {"executed": None, "qty": 0.0, "usd": 0.0, "realized_pnl": 0.0,
+               "fees": 0.0, "slippage": 0.0, "detail": ""}
         try:
             if not isinstance(action, dict):
                 out["detail"] = "bad action"
@@ -111,18 +123,20 @@ class PaperPortfolio:
                 out["detail"] = "bad ts_ms"
                 return out
             ts = int(ts_ms)
+            did = decision_id if decision_id is not None else action.get("decision_id")
+            reason = str(action.get("reason") or "")
             kind = action.get("action")
             if kind == "enter":
-                return self._enter(action, symbol, p, ts, out)
+                return self._enter(action, symbol, p, ts, out, did, reason)
             if kind == "exit":
-                return self._exit(symbol, p, ts, out)
+                return self._exit(symbol, p, ts, out, did, reason)
             out["detail"] = f"no-op action={kind!r}"
             return out
         except Exception as exc:  # defensive: never raise into the loop
             out["detail"] = f"error: {type(exc).__name__}: {exc}"
             return out
 
-    def _enter(self, action, symbol, price, ts_ms, out):
+    def _enter(self, action, symbol, price, ts_ms, out, decision_id=None, reason=""):
         if self.position is not None:
             out["detail"] = "enter while holding"
             return out
@@ -131,49 +145,72 @@ class PaperPortfolio:
             out["detail"] = "bad size_fraction"
             return out
         equity = self.mark_to_market(price)  # flat => cash
-        usd = size_fraction * equity
-        qty = usd / price
+        usd = size_fraction * equity  # target notional at quote price
+        fill = price * (1.0 + self.slippage_rate)  # buys fill UP
+        qty = usd / fill
         if usd <= 0 or qty <= 0:
             out["detail"] = "non-positive size"
             return out
-        self.cash -= usd
+        fee = usd * self.fee_rate
+        slippage = (fill - price) * qty
+        self.cash -= usd + fee  # fee reduces equity immediately
+        self.fees_paid += fee
+        self.slippage_paid += slippage
         self.position = {
             "symbol": symbol,
             "qty": qty,
-            "entry_price": price,
+            "entry_price": fill,  # fill price: all PnL math uses fills
             "entry_ts_ms": ts_ms,
+            "entry_fee": fee,
         }
         self.last_entry_ts_ms = ts_ms
-        out.update(executed="enter", qty=qty, usd=usd, realized_pnl=0.0, detail="entered")
-        self._append_trade(ts_ms, symbol, "buy", price, qty, usd, 0.0)
+        out.update(executed="enter", qty=qty, usd=usd, realized_pnl=0.0,
+                   fees=fee, slippage=slippage, detail="entered")
+        self._append_trade(ts_ms, symbol, "buy", fill, qty, usd, 0.0, fee, slippage,
+                           decision_id, reason or "entered")
         return out
 
-    def _exit(self, symbol, price, ts_ms, out):
+    def _exit(self, symbol, price, ts_ms, out, decision_id=None, reason=""):
         if self.position is None:
             out["detail"] = "exit while flat"
             return out
         pos = self.position
         qty = float(pos["qty"])
         entry_price = float(pos["entry_price"])
-        proceeds = qty * price
-        realized_pnl = (price - entry_price) * qty
-        self.cash += proceeds
+        entry_fee = _finite(pos.get("entry_fee")) or 0.0
+        fill = price * (1.0 - self.slippage_rate)  # sells fill DOWN
+        proceeds = qty * fill
+        fee = proceeds * self.fee_rate
+        slippage = (price - fill) * qty
+        # Realized is net of BOTH fill fees (slippage is in the fill prices).
+        realized_pnl = (fill - entry_price) * qty - entry_fee - fee
+        self.cash += proceeds - fee
+        self.fees_paid += fee
+        self.slippage_paid += slippage
         self.position = None
         out.update(
-            executed="exit", qty=qty, usd=proceeds, realized_pnl=realized_pnl, detail="exited"
+            executed="exit", qty=qty, usd=proceeds, realized_pnl=realized_pnl,
+            fees=fee, slippage=slippage, detail="exited"
         )
-        self._append_trade(ts_ms, symbol, "sell", price, qty, proceeds, realized_pnl)
+        self._append_trade(ts_ms, symbol, "sell", fill, qty, proceeds, realized_pnl, fee,
+                           slippage, decision_id, reason or "exited")
         return out
 
-    def _append_trade(self, ts_ms, symbol, side, price, qty, usd, realized_pnl):
+    def _append_trade(self, ts_ms, symbol, side, price, qty, usd, realized_pnl,
+                      fees, slippage, decision_id, reason):
         line = {
             "ts_ms": int(ts_ms),
+            "decision_id": decision_id,
+            "book": "spot",
             "symbol": symbol,
             "side": side,
             "price": float(price),
             "qty": float(qty),
             "usd": float(usd),
             "realized_pnl": float(realized_pnl),
+            "fees": float(fees),
+            "slippage": float(slippage),
+            "reason": reason,
         }
         try:
             path = self._trade_log_path()
@@ -192,15 +229,13 @@ class PaperPortfolio:
             "day": self.day,
             "day_start_equity": self.day_start_equity,
             "last_entry_ts_ms": self.last_entry_ts_ms,
+            "fees_paid": self.fees_paid,
+            "slippage_paid": self.slippage_paid,
         }
 
     def save(self) -> None:
-        """Atomic write: serialize to a tmp file in the same dir, then os.replace."""
-        path = Path(self.state_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = Path(str(path) + ".tmp")
-        tmp.write_text(json.dumps(self._state_dict(), indent=2))
-        os.replace(tmp, path)
+        """Atomic write (tmp in the same dir + os.replace); see jev_config."""
+        atomic_write_json(self.state_path, self._state_dict())
 
     def load(self) -> bool:
         """Load state from disk. Returns False (keeps current state) if unusable."""
@@ -225,6 +260,7 @@ class PaperPortfolio:
                 "qty": float(qty),
                 "entry_price": float(entry_price),
                 "entry_ts_ms": int(pos.get("entry_ts_ms") or 0),
+                "entry_fee": _finite(pos.get("entry_fee")) or 0.0,
             }
         else:
             self.position = None
@@ -237,4 +273,8 @@ class PaperPortfolio:
 
         le = _finite(data.get("last_entry_ts_ms"))
         self.last_entry_ts_ms = int(le) if le is not None else None
+        fees = _finite(data.get("fees_paid"))
+        self.fees_paid = fees if fees is not None and fees >= 0 else 0.0
+        slip = _finite(data.get("slippage_paid"))
+        self.slippage_paid = slip if slip is not None and slip >= 0 else 0.0
         return True
