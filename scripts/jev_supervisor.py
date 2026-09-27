@@ -63,6 +63,7 @@ from jev_gates import RiskConfig, decide  # noqa: E402
 from jev_perps import decide_perps  # noqa: E402
 from jev_questions import QUESTIONS  # noqa: E402
 from jev_regime import classify  # noqa: E402
+from jev_risk import PortfolioRisk  # noqa: E402
 from jev_scorer import ShadowScorer  # noqa: E402
 from jev_state import build_state  # noqa: E402
 # Reused v1 cycle plumbing (paper_loop is imported, never modified).
@@ -112,6 +113,36 @@ class MarketData:
             return self.last_price(symbol)
         self._price_buf(symbol).append((int(now_ms), price))
         return price
+
+    def poll_tickers(self, symbols, now_ms):
+        """One fetch_tickers call marking ALL pairs (M5: no per-pair hammering).
+
+        Returns {symbol: price}; per-symbol problems fall back to the last
+        known price. Returns None on a batch failure so the caller can fall
+        back to per-symbol poll_ticker. Never raises.
+        """
+        try:
+            tickers = self.exchange.fetch_tickers([str(s) for s in symbols])
+        except Exception as exc:  # caller falls back to per-symbol polling
+            print(f"market: tickers error: {type(exc).__name__}: {exc}")
+            return None
+        # ccxt keys tickers by UNIFIED symbol ("BTC/USDT") while the app-level
+        # symbol is the raw market id ("BTCUSDT") — index both forms.
+        by_norm = {str(k).replace("/", "").upper(): v for k, v in tickers.items()}
+        prices = {}
+        for symbol in symbols:
+            try:
+                ticker = by_norm.get(str(symbol).replace("/", "").upper())
+                price = float(ticker["last"])
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError(f"bad ticker price {price!r}")
+            except Exception as exc:  # fail-open: reuse the last known price
+                print(f"market: ticker error {symbol}: {type(exc).__name__}: {exc}")
+                price = self.last_price(symbol)
+            if price is not None:
+                self._price_buf(symbol).append((int(now_ms), price))
+                prices[symbol] = price
+        return prices
 
     def refresh(self, symbol, now_ms):
         """1m closes + recent trades for the state builder (slow cycle)."""
@@ -226,11 +257,16 @@ class LogTailer:
 
 
 def _m3_decision_row(book, decision_id, symbol, now_ms, price, action, result, verdict,
-                     equity, regime):
-    """paper_loop._decision_row + M3 fields: regime + fan-out audit trail."""
+                     equity, regime, risk_flags=None):
+    """paper_loop._decision_row + M3 fields: regime + fan-out audit trail.
+
+    M5 adds ``risk_flags``: active portfolio-risk flag names for the pair
+    (global_daily_kill / drawdown_halt / pair_cap / basket_long / basket_short).
+    """
     row = _decision_row(book, decision_id, symbol, now_ms, price, action, result,
                         verdict, equity)
     row["regime"] = regime
+    row["risk_flags"] = list(risk_flags or [])
     v = verdict if isinstance(verdict, dict) else {}
     row["fan_out"] = int(v.get("fan_out") or 0)
     if "whipsaw_prob_2" in v:
@@ -259,7 +295,8 @@ class Supervisor:
                  clock=time.time, decision_log_path: str = "runtime/paper_decisions.jsonl",
                  once: bool = False, max_cycles: Optional[int] = None,
                  risk_cfg=None, regime_cfg=None, fanout_cfg=None,
-                 market_cfg=None) -> None:
+                 market_cfg=None, portfolio_cfg=None,
+                 risk_state_path: str = "runtime/risk_state.json") -> None:
         self.symbols = list(symbols)
         self.market = market
         self.client = client
@@ -285,6 +322,12 @@ class Supervisor:
         self.regime_cfg = regime_cfg if regime_cfg is not None else RegimeConfig()
         self.fanout_cfg = fanout_cfg if fanout_cfg is not None else FanoutConfig()
         self.market_cfg = market_cfg if market_cfg is not None else MarketConfig()
+        # M5 portfolio risk (jev_risk): None = v1 behavior (no portfolio layer)
+        self.risk = (PortfolioRisk(cfg=portfolio_cfg, state_path=risk_state_path,
+                                   pairs=self.symbols)
+                     if portfolio_cfg is not None else None)
+        self._risk_error = None      # set on risk computation failure (fail-closed)
+        self._risk_saved = None      # last persisted risk state (change-detector)
         self.scorer = ShadowScorer(client, exchange=getattr(market, "exchange", None),
                                    fanout=self.fanout_cfg)
         self.slow_results = []  # per-symbol result dicts, appended per cycle
@@ -347,10 +390,11 @@ class Supervisor:
             "hit_exact": exact,
             "hit_stale_price": stale,
             "cost_usd": float(getattr(self.client, "cost_usd", 0.0) or 0.0),
+            "risk_events": int(self.risk.risk_events) if self.risk is not None else 0,
         }
 
     def shutdown(self) -> dict:
-        """Graceful stop: save books, flush rows, close DB, print summary."""
+        """Graceful stop: save books + risk state, flush rows, close DB, summary."""
         if self._closed:
             return self.summary()
         self._closed = True
@@ -362,6 +406,8 @@ class Supervisor:
                     book.save()
                 except Exception as exc:
                     print(f"shutdown: save error {symbol}: {type(exc).__name__}: {exc}")
+        if self.risk is not None:
+            self._save_risk_state()
         self._capture_trade_rows()
         if self.conn is not None:
             try:
@@ -376,7 +422,9 @@ class Supervisor:
             f"jev_calls={summary['jev_calls']} cost_usd={summary['cost_usd']:.6f} "
             f"cache_hits={summary['cache_hits']} (exact={summary['hit_exact']} "
             f"stale_price={summary['hit_stale_price']}) "
-            f"cache_misses={summary['cache_misses']} pairs={','.join(self.symbols)}"
+            f"cache_misses={summary['cache_misses']} "
+            f"risk_events={summary['risk_events']} "
+            f"pairs={','.join(self.symbols)}"
         )
         return summary
 
@@ -409,6 +457,105 @@ class Supervisor:
                 on = ",".join(name for name, on_ in flags.items() if on_)
                 print(f"risk: {_ts_iso(self.now_ms())} {symbol} flagged={on}")
         return flags
+
+    # -- M5 portfolio risk (jev_risk) --------------------------------------
+
+    def _books_snapshot(self):
+        """({pair: {book: {notional, margin, side}}}, {pair: {book: equity}}).
+
+        Notionals at current marks: spot qty x mark (always long), perps
+        qty x mark + posted margin + side. Equities are the marked book
+        equities (realized + unrealized).
+        """
+        books_state, equity_by_book = {}, {}
+        for symbol, pair in self.books.items():
+            price = self.market.last_price(symbol)
+            bs, eq = {}, {}
+            for name, book in (("spot", pair.spot), ("perps", pair.perps)):
+                if book is None:
+                    continue
+                position = book.position or {}
+                qty = float(position.get("qty") or 0.0)
+                mark = (float(price) if price is not None
+                        else float(position.get("entry_price") or 0.0))
+                if name == "spot":
+                    side = "long" if book.position else None
+                    margin = 0.0
+                else:
+                    side = position.get("side")
+                    margin = float(position.get("margin_usd") or 0.0)
+                bs[name] = {"notional": qty * mark, "margin": margin, "side": side}
+                eq[name] = book.mark_to_market(price)
+            books_state[symbol] = bs
+            equity_by_book[symbol] = eq
+        return books_state, equity_by_book
+
+    def portfolio_risk_update(self):
+        """Refresh the M5 portfolio risk state from current marks (fail-open).
+
+        On a computation error the failure is remembered and every entry
+        budget fails CLOSED until the next successful update; exits are never
+        affected.
+        """
+        if self.risk is None:
+            return None
+        try:
+            books_state, equity_by_book = self._books_snapshot()
+            flags = self.risk.update(books_state, equity_by_book, self._time())
+            self._risk_error = None
+            return flags
+        except Exception as exc:
+            self._risk_error = f"{type(exc).__name__}: {exc}"
+            print(f"risk: update error: {self._risk_error}")
+            return None
+
+    def _save_risk_state(self) -> None:
+        """Persist risk state when it changed (M0 atomic write, never raises)."""
+        if self.risk is None:
+            return
+        state = self.risk._state_dict()
+        if state == self._risk_saved:
+            return
+        if self.risk.save():
+            self._risk_saved = state
+
+    def _entry_budget(self, symbol, book, price, leverage=1.0):
+        """M5 risk dict for the gate layer. Fail-CLOSED on error (entries only).
+
+        None when the portfolio layer is off (v1 behavior). On any risk
+        failure the returned dict has no capacities -> the gates veto
+        pair_cap/basket_cap (entries blocked, exits unaffected).
+        """
+        if self.risk is None:
+            return None
+        if self._risk_error is not None:
+            return {"error": self._risk_error, "global_daily_kill": False,
+                    "drawdown_halt": False, "pair_remaining": None,
+                    "basket_remaining_long": None,
+                    "basket_remaining_short": None, "min_position_pct": None}
+        try:
+            pair = self.books[symbol]
+            portfolio = pair.spot if book == "spot" else pair.perps
+            equity = portfolio.mark_to_market(price)
+            return self.risk.entry_budget(book, symbol, equity, leverage=leverage)
+        except Exception as exc:
+            print(f"risk: budget error {symbol} {book}: {type(exc).__name__}: {exc}")
+            return {"error": f"{type(exc).__name__}: {exc}",
+                    "global_daily_kill": False, "drawdown_halt": False,
+                    "pair_remaining": None, "basket_remaining_long": None,
+                    "basket_remaining_short": None, "min_position_pct": None}
+
+    def _risk_flags_for(self, symbol) -> list:
+        """Active portfolio-risk flag names for the pair (cycle lines + rows)."""
+        if self.risk is None:
+            return []
+        flags = self.risk.flags
+        names = [name for name in ("global_daily_kill", "drawdown_halt",
+                                   "basket_long", "basket_short")
+                 if flags.get(name)]
+        if flags.get("pair_cap", {}).get(symbol):
+            names.append("pair_cap")
+        return names
 
     def check_burst(self, symbol, now_ms) -> bool:
         """|1-min return| > burst_threshold OR 1-min trades > burst_trades."""
@@ -456,14 +603,40 @@ class Supervisor:
                                "decision_id": decision_id})
         return closed
 
+    def _poll_prices(self, now_ms) -> dict:
+        """Marks for ALL pairs: one fetch_tickers call when available (M5).
+
+        Falls back to per-symbol poll_ticker when the market duck-type has no
+        batch method (tests) or the batch call fails. Returns {symbol: price}.
+        """
+        batch = getattr(self.market, "poll_tickers", None)
+        if callable(batch):
+            try:
+                result = batch(self.symbols, now_ms)
+                if result is not None:
+                    return dict(result)
+            except Exception as exc:  # fall back to per-symbol polling
+                print(f"market: tickers error: {type(exc).__name__}: {exc}")
+        prices = {}
+        for symbol in self.symbols:
+            try:
+                price = self.market.poll_ticker(symbol, now_ms)
+            except Exception as exc:  # fail-open: the fast loop must never die
+                print(f"fast: tick error {symbol}: {type(exc).__name__}: {exc}")
+                continue
+            if price is not None:
+                prices[symbol] = price
+        return prices
+
     def fast_tick(self) -> dict:
         """One fast-loop iteration: mark, stops/liq, flags, burst detect."""
         now_ms = self.now_ms()
         self._counts["fast_ticks"] += 1
         out = {"ts_ms": now_ms, "prices": {}, "closed": [], "flags": {}}
+        prices = self._poll_prices(now_ms)
         for symbol in self.symbols:
             try:
-                price = self.market.poll_ticker(symbol, now_ms)
+                price = prices.get(symbol)
                 if price is None:
                     continue
                 out["prices"][symbol] = price
@@ -476,6 +649,9 @@ class Supervisor:
                           f"spike detected -> force-score")
             except Exception as exc:  # fail-open: the fast loop must never die
                 print(f"fast: tick error {symbol}: {type(exc).__name__}: {exc}")
+        if self.risk is not None:  # M5: refresh + persist portfolio risk flags
+            out["risk"] = self.portfolio_risk_update()
+            self._save_risk_state()
         if out["closed"]:
             self._capture_trade_rows()
         return out
@@ -553,6 +729,7 @@ class Supervisor:
         pair = self.books[symbol]
         self._burst_trigger.clear()  # consumed by this cycle
         try:
+            self.portfolio_risk_update()  # M5: fresh flags/capacities per pair
             self.market.refresh(symbol, now_ms)
             state = build_state(symbol, self.market.closes(symbol),
                                 self.market.trades(symbol), now_ms)
@@ -651,15 +828,18 @@ class Supervisor:
             portfolio = pair.spot
             cfg = self.risk_cfg
             pf = portfolio.to_pf_state(price)  # pre-trade state drives the decision
+            budget = self._entry_budget(symbol, "spot", price)  # M5 (None = v1)
             action = decide(verdict, pf, cfg, now_ms, decision_id=decision_id,
-                            regime=regime)
+                            regime=regime, risk=budget)
             result = portfolio.apply_action(action, symbol, price, now_ms,
                                             decision_id=decision_id)
             portfolio.save()
             pf_line = portfolio.to_pf_state(price)  # post-trade status for the line
+            risk_names = self._risk_flags_for(symbol)
             print(
                 f"spot: {_ts_iso(now_ms)} decision={decision_id} {symbol} "
                 f"price={price:.4f} regime={regime} "
+                f"risk={','.join(risk_names) if risk_names else 'ok'} "
                 f"fan_out={int((verdict or {}).get('fan_out') or 0)} "
                 f"action={action['action']} "
                 f"executed={result['executed']} {_veto_status(action)} "
@@ -671,7 +851,7 @@ class Supervisor:
             )
             append_jsonl(self.decision_log_path, _m3_decision_row(
                 "spot", decision_id, symbol, now_ms, price, action, result,
-                verdict, pf_line.equity_usd, regime))
+                verdict, pf_line.equity_usd, regime, risk_flags=risk_names))
             return {"action": action, "result": result,
                     "equity": pf_line.equity_usd,
                     "has_position": pf_line.has_position,
@@ -691,8 +871,11 @@ class Supervisor:
             perps_cfg = perps_portfolio.cfg
             funding_rate = fetch_funding_rate(self.funding_exchange, symbol)
             pf = perps_portfolio.to_pf_state(price)  # pre-trade state drives the decision
+            budget = self._entry_budget(symbol, "perps", price,  # M5 (None = v1)
+                                        leverage=perps_cfg.max_leverage)
             action = decide_perps(verdict, pf, perps_cfg, now_ms, funding_rate,
-                                  decision_id=decision_id, regime=regime)
+                                  decision_id=decision_id, regime=regime,
+                                  risk=budget)
             result = perps_portfolio.apply_action(action, symbol, price, now_ms,
                                                   funding_rate,
                                                   decision_id=decision_id)
@@ -700,9 +883,11 @@ class Supervisor:
             pf_line = perps_portfolio.to_pf_state(price)
 
             funding_str = "na" if funding_rate is None else f"{funding_rate:.6f}"
+            risk_names = self._risk_flags_for(symbol)
             print(
                 f"perps: {_ts_iso(now_ms)} decision={decision_id} {symbol} "
                 f"price={price:.4f} regime={regime} "
+                f"risk={','.join(risk_names) if risk_names else 'ok'} "
                 f"fan_out={int((verdict or {}).get('fan_out') or 0)} "
                 f"funding={funding_str} action={action['action']} "
                 f"executed={result['executed']} detail={result['detail']} "
@@ -715,7 +900,7 @@ class Supervisor:
             )
             append_jsonl(self.decision_log_path, _m3_decision_row(
                 "perps", decision_id, symbol, now_ms, price, action, result,
-                verdict, pf_line.equity_usd, regime))
+                verdict, pf_line.equity_usd, regime, risk_flags=risk_names))
             return {"funding_rate": funding_rate, "action": action,
                     "result": result, "equity": pf_line.equity_usd,
                     "has_position": pf_line.has_position, "side": pf_line.side,

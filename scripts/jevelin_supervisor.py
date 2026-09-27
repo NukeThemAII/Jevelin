@@ -4,8 +4,10 @@
 Entry point for scripts/jev_supervisor.py. Public Binance data + local JSON
 state only: NEVER calls an exchange private API and NEVER places orders.
 
-  --config config/v2.yaml       M3 threshold source (see scripts/jev_config.py)
-  --pairs BTCUSDT[,ETHUSDT...]  one spot+perps book pair per symbol
+  --config config/v2.yaml       M3/M5 threshold source (scripts/jev_config.py)
+  --pairs BTCUSDT[,ETHUSDT...]  pair universe (default: config pairs =
+                                BTCUSDT,ETHUSDT,SOLUSDT); one spot+perps book
+                                pair per symbol (BTC keeps paper_btc.json)
   --fast-interval 5             fast risk loop seconds (marks, stops/liq, flags)
   --slow-interval 300           slow Jev loop seconds (+ burst trigger)
   --burst-threshold 0.003       |1-min return| above this forces a score
@@ -90,8 +92,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Jevelin split-cadence supervisor (M2): fast risk loop + "
                     "slow Jev loop + decision cache. Paper only, no orders.")
-    p.add_argument("--pairs", default="BTCUSDT",
-                   help="comma-separated market symbols (default: BTCUSDT)")
+    p.add_argument("--pairs", default=None,
+                   help="comma-separated market symbols (default: config pairs = "
+                        "BTCUSDT,ETHUSDT,SOLUSDT)")
     p.add_argument("--config", default=str(DEFAULT_CONFIG_PATH),
                    help="config/v2.yaml path (M3 thresholds; dataclass defaults "
                         "when keys are omitted)")
@@ -161,7 +164,9 @@ def main(argv=None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}")
         return 2
-    symbols = [s.strip().upper() for s in args.pairs.split(",") if s.strip()]
+    symbols = ([s.strip().upper() for s in args.pairs.split(",") if s.strip()]
+               if args.pairs
+               else [str(s).strip().upper() for s in cfg.pairs])
     if not symbols:
         print("error: --pairs produced no symbols")
         return 2
@@ -194,7 +199,9 @@ def main(argv=None) -> int:
         decision_log_path=str(Path(args.runtime_dir) / "paper_decisions.jsonl"),
         once=args.once, max_cycles=args.max_cycles,
         risk_cfg=cfg.spot, regime_cfg=cfg.regime, fanout_cfg=cfg.fanout,
-        market_cfg=cfg.market)
+        market_cfg=cfg.market,
+        portfolio_cfg=cfg.portfolio,  # M5 portfolio risk layer
+        risk_state_path=str(Path(args.runtime_dir) / "risk_state.json"))
     asyncio.run(sup.run())
     return 0
 

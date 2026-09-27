@@ -1,13 +1,31 @@
-# Jevelin config v2 (M3) — every gate/regime/cost threshold lives here.
+# Jevelin config v2 (M3) + M5 portfolio risk — every gate/regime/cost threshold
+# lives here.
 #
 # Rules (scripts/jev_config.py load_config):
 #   * dataclass defaults == these values (single source of truth; parity-tested);
 #   * keys may be omitted (the dataclass default applies);
 #   * unknown keys warn to stderr, bad types/values abort startup;
-#   * config_version must be 2.
-# Supervisor CLI flags (--fee-rate, --slippage-rate, --whipsaw, ...) override
-# this file at runtime. Design numbers: docs/V2-DESIGN.md B.3 (AS WRITTEN).
-config_version: 2
+#   * config_version must be 3.
+# Supervisor CLI flags (--fee-rate, --slippage-rate, --whipsaw, --pairs, ...)
+# override this file at runtime. Design numbers: docs/V2-DESIGN.md B.3 (AS
+# WRITTEN) + the M5 portfolio-risk spec.
+config_version: 3
+
+# M5 default pair universe; --pairs overrides at the CLI.
+pairs: [BTCUSDT, ETHUSDT, SOLUSDT]
+
+# M5 portfolio risk (scripts/jev_risk.py) — deterministic, Jev never touches it.
+# Caps are fractions of equity; entries are blocked at/over the cap, exits and
+# stops are NEVER blocked.
+portfolio:
+  pair_spot_cap: 0.30            # per-pair spot notional <= 30% of that pair's book equity
+  pair_perps_margin_cap: 0.10    # per-pair perps margin <= 10% of that pair's book equity
+  basket_long_cap: 0.40          # TOTAL long notional (all pairs) <= 40% of total equity
+  basket_short_cap: 0.20         # TOTAL short notional (all pairs) <= 20% of total equity
+  global_daily_loss: -0.05       # portfolio-wide daily PnL <= -5% -> block ALL entries
+  drawdown_halt: 0.10            # equity drawdown from running peak >= 10% -> block ALL entries
+  drawdown_recover: 0.05         # halt clears when drawdown recovers below 5% (hysteresis)
+  min_position_pct: 0.01         # remaining capacity < 1% equity -> veto (no dust positions)
 
 # M0 execution costs (F-P0-1): per-side fee + adverse slippage.
 execution:

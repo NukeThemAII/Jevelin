@@ -41,6 +41,8 @@ from jev_gates import (  # noqa: E402
     PortfolioState,
     _as_counter,
     _as_float,
+    risk_capacities,
+    risk_clamp_size,
     sizing_tier,
     whipsaw_gate_name,
 )
@@ -449,25 +451,28 @@ def _skip(reason: str, failed: list, decision_id: Optional[str] = None,
 def decide_perps(verdict: dict, pf: PortfolioState, cfg: PerpsConfig, now_ms: int,
                  funding_rate: Optional[float] = None,
                  decision_id: Optional[str] = None,
-                 regime: Optional[str] = None) -> dict:
+                 regime: Optional[str] = None,
+                 risk: Optional[dict] = None) -> dict:
     """Map a Jev verdict + perps book state to enter_long/enter_short/exit/skip.
 
     Never raises. M3 (B.3) semantics: regime/phase/whipsaw-fanout entry gates,
     dump/pump exit hysteresis with min hold, confidence sizing tiers. See the
     module docstring for the exit rule (no separate exhaustion exit in v2).
     ``regime`` None = caller has no regime data (deprecated v1 fallback).
+    ``risk`` is the M5 entry-budget dict (jev_risk.entry_budget) or None.
     """
     try:
         did = decision_id
         if did is None and isinstance(verdict, dict):
             did = verdict.get("decision_id")
-        return _decide_perps(verdict, pf, cfg, now_ms, funding_rate, did, regime)
+        return _decide_perps(verdict, pf, cfg, now_ms, funding_rate, did, regime,
+                             risk)
     except Exception as exc:  # defensive: never raise into the trading loop
         return _skip(f"malformed: {type(exc).__name__}: {exc}", ["malformed"], decision_id)
 
 
 def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
-                  decision_id=None, regime=None) -> dict:
+                  decision_id=None, regime=None, risk=None) -> dict:
     # (1) fail-open validation — same contract as jev_gates.decide
     if not isinstance(verdict, dict):
         return _skip("malformed: verdict is not a dict", ["malformed"], decision_id)
@@ -522,8 +527,34 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
         return _skip("hold", [], decision_id, streak, age_now)
 
     # ENTRY path — evaluate ALL gates (F-P1-4): shared, long-side, short-side.
-    # Every failing gate is recorded; ``reason`` stays the first in check order.
+    # Every failing gate is recorded; ``reason`` stays the first in check order:
+    # kill/halt -> pair cap -> basket cap -> daily_loss_kill -> regime -> phase
+    # -> Jev gates -> cooldown (M5; perps basket caps are side-specific).
     shared = []  # (gate name, readable reason) in check order
+    # M5 portfolio risk (entries only — exits/stops above are never risk-blocked)
+    pair_rem, bask_long_rem, bask_short_rem, min_pct = risk_capacities(risk)
+    long_risk, short_risk = [], []
+    if pair_rem is not None:
+        if risk.get("global_daily_kill"):
+            shared.append(("global_daily_kill",
+                           "global_daily_kill: portfolio daily PnL at/over "
+                           "the loss limit"))
+        if risk.get("drawdown_halt"):
+            shared.append(("drawdown_halt",
+                           "drawdown_halt: portfolio drawdown halt active"))
+        if pair_rem <= 0:
+            shared.append(("pair_cap",
+                           f"pair_cap: pair margin capacity {pair_rem} exhausted"))
+        if bask_long_rem <= 0:
+            long_risk.append(("basket_cap",
+                              f"basket_cap: long basket capacity "
+                              f"{bask_long_rem} exhausted"))
+        if bask_short_rem <= 0:
+            short_risk.append(("basket_cap",
+                               f"basket_cap: short basket capacity "
+                               f"{bask_short_rem} exhausted"))
+        if long_risk and short_risk:
+            shared.append(("basket_cap", "basket_cap: both side baskets exhausted"))
     if pf.daily_pnl_pct <= -cfg.daily_loss_limit_pct:
         shared.append(("daily_loss_kill",
                        f"daily_loss_kill: daily pnl {pf.daily_pnl_pct}% <= "
@@ -561,7 +592,7 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
     # fail-open (no veto)
     fr = _as_float(funding_rate)
     thr = cfg.max_abs_funding_pct / 100.0  # 0.01% per 8h -> 0.0001
-    long_failed = []
+    long_failed = list(long_risk)
     if regime == "trend_down" and cfg.counter_trend == "block":
         long_failed.append(("regime_counter",
                             "regime_counter: trend_down blocks long entries"))
@@ -569,7 +600,7 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
         long_failed.append(("low_pump", f"low_pump: {pump} < {cfg.entry_min_pump}"))
     if fr is not None and fr > thr:
         long_failed.append(("funding", f"funding: {fr} > {thr} blocks long"))
-    short_failed = []
+    short_failed = list(short_risk)
     if regime == "trend_up" and cfg.counter_trend == "block":
         short_failed.append(("regime_counter",
                              "regime_counter: trend_up blocks short entries"))
@@ -606,6 +637,14 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
 
     frac, tier = sizing_tier(conf, cfg)
     size = round(cfg.max_margin_fraction * frac, 4)
+    if pair_rem is not None:  # M5: clamp margin by pair cap + side basket cap
+        bask_rem = bask_long_rem if side == "long" else bask_short_rem
+        size_usd, veto = risk_clamp_size(size * pf.equity_usd, pair_rem, bask_rem,
+                                         min_pct, pf.equity_usd)
+        if veto is not None:
+            return _skip(f"{veto}: deployable capacity below min_position_pct "
+                         f"{min_pct}", [veto], decision_id)
+        size = round(size_usd / pf.equity_usd, 4) if pf.equity_usd > 0 else 0.0
     return _res(
         f"enter_{side}",
         f"all gates passed ({side}): pump={pump} dump={dump} whipsaw={whip} "

@@ -69,6 +69,7 @@ jev_paper.PaperPortfolio         jev_perps.PerpsPortfolio
 | `scripts/jev_gates.py` | spot decision layer (verdict → action + risk vetoes) |
 | `scripts/jev_paper.py` | spot paper portfolio (PnL, persistence, trade log) |
 | `scripts/jev_perps.py` | perps paper book (long+short, stops, liq, funding) |
+| `scripts/jev_risk.py` | M5 portfolio risk (per-pair/basket caps, global kill, drawdown halt) |
 | `scripts/paper_loop.py` | dual-book cycle loop (one verdict → both books) |
 
 The original RSI/EMA engine (`cabbage/` + vendored framework, below) remains as the runtime base.
@@ -94,18 +95,31 @@ reason, never fabricate a verdict.
 ### Entry/exit gates (both books, M3 numbers — all in `config/v2.yaml`)
 1. No/broken verdict (`ok=False`, `confidence=None`, NaN/missing keys) → **skip** (`no_verdict`/`malformed`)
 2. Position held → exit rules only (**no flip** same cycle): `dump≥65` × 2 consecutive cycles OR one cycle `dump≥75` (pump mirrored on shorts); min hold 3 cycles before signal exits; stops/liq fire automatically in the portfolio and always bypass
-3. Daily loss ≤ −5% → block entries only (`daily_loss_kill`); exits and stops always allowed
-4. Regime (deterministic `jev_regime`, computed before Jev): `chop` → ALL entries blocked (`regime_chop`); `trend_down` blocks longs / `trend_up` blocks shorts (`regime_counter`; `counter_trend: allow` re-enables by config)
-5. `phase ∈ {breakout, accumulation}` (`phase_not_in_entry_set`; `capitulation` keeps its own flag for attribution)
-6. Shared entry gates: `whipsaw≤0.45` (2-sample fan-out majority vote when raw noul ∈ 0.40–0.60; split → `whipsaw_fanout_tie` fail-closed), `exhaustion≤0.55`, `confidence≥0.65`, 15-min cooldown
-7. Long needs `pump≥65`; short needs `dump≥65`; funding veto per book table
-8. Both sides qualify → prefer the stronger (`pump≥dump` → long, else short)
+3. **Portfolio risk (M5, entries only — exits/stops never risk-blocked)**: portfolio daily PnL ≤ −5% → `global_daily_kill`; drawdown ≥ 10% from running peak → `drawdown_halt` (clears only below 5%); per-pair caps → `pair_cap`; basket caps → `basket_cap`; remaining capacity < 1% equity → dust veto `pair_cap`/`basket_cap`. Risk computation error → entries fail CLOSED. See the caps table below (`scripts/jev_risk.py`)
+4. Daily loss ≤ −5% → block entries only (`daily_loss_kill`); exits and stops always allowed
+5. Regime (deterministic `jev_regime`, computed before Jev): `chop` → ALL entries blocked (`regime_chop`); `trend_down` blocks longs / `trend_up` blocks shorts (`regime_counter`; `counter_trend: allow` re-enables by config)
+6. `phase ∈ {breakout, accumulation}` (`phase_not_in_entry_set`; `capitulation` keeps its own flag for attribution)
+7. Shared entry gates: `whipsaw≤0.45` (2-sample fan-out majority vote when raw noul ∈ 0.40–0.60; split → `whipsaw_fanout_tie` fail-closed), `exhaustion≤0.55`, `confidence≥0.65`, 15-min cooldown
+8. Long needs `pump≥65`; short needs `dump≥65`; funding veto per book table
+9. Both sides qualify → prefer the stronger (`pump≥dump` → long, else short)
+
+**Portfolio risk caps (M5, `config/v2.yaml` `portfolio:` / `runtime/risk_state.json`):**
+
+| cap | limit | base | veto flag |
+|---|---|---|---|
+| pair spot | 30% | that pair's spot book equity (notional at mark) | `pair_cap` |
+| pair perps | 10% margin | that pair's perps book equity | `pair_cap` |
+| basket long | 40% | total equity (all books), notional at mark | `basket_cap` |
+| basket short | 20% | total equity (all books), notional at mark | `basket_cap` |
+| global daily loss | −5% (UTC-midnight reset) | portfolio total equity | `global_daily_kill` |
+| drawdown halt | ≥10% from running peak (<5% clears) | portfolio total equity | `drawdown_halt` |
+| dust floor | <1% book equity deployable | book equity | `pair_cap`/`basket_cap` |
 
 Sizing is decided by code — confidence tiers: [0.65, 0.70) → 60% of cap, [0.70, 0.85) → 80%, ≥0.85 →
-100% (caps unchanged: spot 20%, perps 10% margin / 3x; `size_tier` logged on every fill). Every
-threshold lives in `config/v2.yaml` (`config_version: 2`, loader in `scripts/jev_config.py`;
-CLI flags override the yaml). Jev never chooses amounts. Change caps by changing config — nothing
-can exceed them.
+100% (caps unchanged: spot 20%, perps 10% margin / 3x; `size_tier` logged on every fill), then
+clamped by the remaining pair/basket capacity (M5). Every threshold lives in `config/v2.yaml`
+(`config_version: 3`, loader in `scripts/jev_config.py`; CLI flags override the yaml). Jev never
+chooses amounts. Change caps by changing config — nothing can exceed them.
 
 **Fill model (M0, live since 2026-09-27):** every fill pays a fee + slippage per side —
 spot `fee_rate=0.001` (operator's real Binance rate 0.10%), perps `taker_fee_rate=0.0005`
@@ -232,6 +246,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 # Jev decision system (our layer)
 .venv/bin/python scripts/shadow_scorer.py --once               # live Jev score, no trading
 .venv/bin/python scripts/jevelin_supervisor.py --once          # M2 supervisor: 1 slow cycle + fast ticks
+.venv/bin/python scripts/jevelin_supervisor.py --once --pairs BTCUSDT,ETHUSDT,SOLUSDT  # M5: explicit universe
 .venv/bin/python scripts/jevelin_supervisor.py --max-cycles 12 # bounded live supervisor run
 .venv/bin/python scripts/paper_loop.py --once                  # deprecated fallback: one dual-book cycle
 .venv/bin/python scripts/paper_loop.py --interval 300          # deprecated fallback loop
@@ -242,11 +257,11 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 .venv/bin/python scripts/jev_calibrate.py --out report.md      # M4: calibration report, on-demand (no cron)
 .venv/bin/python scripts/jev_calibrate.py --since 2026-09-27   #   (optional: filter data from a date)
 
-# tests — all 14 script suites must stay green
+# tests — all 15 script suites must stay green
 for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
          test_jev_store test_jev_import test_jev_replay test_jev_radar \
          test_jev_cache test_jev_supervisor test_jev_regime test_jev_config \
-         test_jev_calibrate; do
+         test_jev_calibrate test_jev_risk; do
   .venv/bin/python scripts/$t.py; done
 
 # original engine (upstream RSI/EMA app layer, unchanged)
@@ -297,7 +312,7 @@ vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net P
 | 4 | M0: instrument v1 (fees/slippage, ids, bitmask, atomic writes) | ✅ done 2026-09-27 (commit 39a175a, 94/94 tests; `jev_summary.py`) |
 | 5 | M1: SQLite store + JSONL importer + replay utilities | ✅ done 2026-09-27 (commit 70858a6; `jev_replay.py --summary` cross-check) |
 | 6 | M2: split-cadence supervisor + decision cache (`jevelin_supervisor.py`) | ✅ done 2026-09-27 (24h sim 73/288 Jev calls = 25.3% ≤ 40%; stops ≤10s; 32/32 new tests) |
-| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4 ✅ done 2026-09-28 (commit `2814ab5`; `jev_calibrate.py`: counterfactual veto-value engine + per-gate attribution/confidence curve/fan-out + hysteresis stats/re-tune proposals, `gate_decisions`+`calibration_runs` store tables; 304 tests / 14 suites) — **M5 is next**; M6–M7 queued |
+| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4 ✅ done 2026-09-28 (commit `2814ab5`; `jev_calibrate.py`: counterfactual veto-value engine + per-gate attribution/confidence curve/fan-out + hysteresis stats/re-tune proposals, `gate_decisions`+`calibration_runs` store tables; 304 tests / 14 suites); M5 ✅ done 2026-09-28 (`jev_risk.py` portfolio risk: per-pair/basket caps, global daily kill, drawdown halt w/ hysteresis, dust floor; config `config_version: 3` with `pairs`/`portfolio`; 3-pair supervisor default universe + batch `fetch_tickers` marks + `risk_state.json`; symbol-aware trades dedup key; 368 tests / 15 suites) — **M6 is next**; M7 queued |
 | 8 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
 | 9 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
 | 10 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #9 |

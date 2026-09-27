@@ -24,7 +24,8 @@ verbatim source line (lossless import) wherever the source row carries fields
 beyond the schema.
 
 Deterministic upsert keys (idempotent re-imports never duplicate):
-  trades   — UNIQUE (book, ts, side, COALESCE(reason, ''))   # the M1 trade key
+  trades   — UNIQUE (book, COALESCE(symbol, ''), ts, side, COALESCE(reason, ''))
+             # M1 trade key, symbol-aware since M5 (multi-pair collision fix)
   decisions — UNIQUE (decision_id, ts)
   gate_decisions — UNIQUE (decision_id, book, ts)            # the M4 gate key
   radar_candidates — UNIQUE (run_id, coingecko_id)
@@ -76,7 +77,7 @@ CREATE TABLE IF NOT EXISTS trades (
     raw_json TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedup
-    ON trades (book, ts, side, COALESCE(reason, ''));
+    ON trades (book, COALESCE(symbol, ''), ts, side, COALESCE(reason, ''));
 
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY,
@@ -164,9 +165,32 @@ def connect(db_path=DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 
 def create_schema(conn) -> None:
-    """Idempotent schema creation."""
+    """Idempotent schema creation (+ the M5 trades-key migration)."""
     conn.executescript(_SCHEMA)
+    _migrate_trades_key(conn)
     conn.commit()
+
+
+_TRADES_KEY_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedup ON trades "
+    "(book, COALESCE(symbol, ''), ts, side, COALESCE(reason, ''))")
+
+
+def _migrate_trades_key(conn) -> None:
+    """M5: the trades dedup key becomes symbol-aware (multi-pair collision fix).
+
+    The legacy key (book, ts, side, reason) silently dropped same-timestamp
+    fills from DIFFERENT pairs. Detect the legacy index by its SQL text and
+    replace it in place; idempotent (no-op on new/migrated DBs). Safe for
+    legacy rows: with a constant/NULL symbol the new key dedupes exactly like
+    the old one.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_trades_dedup'").fetchone()
+    if row is not None and "COALESCE(symbol" not in (row[0] or ""):
+        conn.execute("DROP INDEX idx_trades_dedup")
+        conn.execute(_TRADES_KEY_INDEX_SQL)
 
 
 _DECISION_COLS = ("ts", "decision_id", "symbol", "state_json", "verdict_json",
@@ -214,11 +238,17 @@ def upsert_decision(conn, row: dict) -> bool:
 
 
 def upsert_trade(conn, row: dict) -> bool:
-    """Upsert one trades row; key = (book, ts, side, COALESCE(reason, ''))."""
-    return _upsert(conn, "trades", _TRADE_COLS, ("book", "ts", "side", "reason"),
-                   "book = ? AND ts = ? AND side = ? AND COALESCE(reason, '') = ?",
-                   (row.get("book"), row.get("ts"), row.get("side"),
-                    row.get("reason") or ""), row)
+    """Upsert one trades row; key = (book, symbol, ts, side, COALESCE(reason, '')).
+
+    M5: the key is symbol-aware so same-timestamp fills from different pairs
+    never collide (single-pair dedup semantics are unchanged).
+    """
+    return _upsert(conn, "trades", _TRADE_COLS,
+                   ("book", "symbol", "ts", "side", "reason"),
+                   "book = ? AND COALESCE(symbol, '') = ? AND ts = ? "
+                   "AND side = ? AND COALESCE(reason, '') = ?",
+                   (row.get("book"), row.get("symbol") or "", row.get("ts"),
+                    row.get("side"), row.get("reason") or ""), row)
 
 
 def upsert_radar_candidate(conn, row: dict) -> bool:

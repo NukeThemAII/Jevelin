@@ -19,9 +19,12 @@ M3 (docs/V2-DESIGN.md B.3; every number lives in RiskConfig / config/v2.yaml):
     >= 0.85 -> 100% (cap = max_position_fraction).
 
 Entry check order (``reason`` = first failing gate; the bitmask records ALL
-failing gates): daily_loss_kill, regime (chop/counter), capitulation,
-phase_not_in_entry_set, low_pump, whipsaw (high_whipsaw / whipsaw_fanout_tie),
-high_exhaustion, low_confidence, cooldown.
+failing gates): global_daily_kill, drawdown_halt, pair_cap, basket_cap (M5
+portfolio risk, entries only — exits/stops are never risk-blocked),
+daily_loss_kill, regime (chop/counter), capitulation, phase_not_in_entry_set,
+low_pump, whipsaw (high_whipsaw / whipsaw_fanout_tie), high_exhaustion,
+low_confidence, cooldown. Sizing is clamped by the remaining pair/basket
+capacity and vetoed as pair_cap/basket_cap below min_position_pct (dust).
 """
 from __future__ import annotations
 
@@ -114,25 +117,65 @@ def _as_counter(value) -> int:
     return value
 
 
+# -- M5 portfolio risk plumbing (jev_risk.entry_budget contract) -------------
+
+def risk_capacities(risk):
+    """Parse the M5 entry-budget dict.
+
+    Returns (pair_remaining, basket_remaining_long, basket_remaining_short,
+    min_position_pct), or (None, None, None, None) when ``risk`` is None (v1
+    path: no portfolio risk). Missing/non-numeric capacities count as 0.0 —
+    fail-CLOSED for entries; the exit path never consults this.
+    """
+    if not isinstance(risk, dict):
+        return None, None, None, None
+
+    def _cap(key):
+        f = _as_float(risk.get(key))
+        return 0.0 if f is None else f
+
+    return (_cap("pair_remaining"), _cap("basket_remaining_long"),
+            _cap("basket_remaining_short"), _cap("min_position_pct"))
+
+
+def risk_clamp_size(size_usd, pair_remaining, basket_remaining, min_pct, equity):
+    """M5 sizing clamp: min(tier target, pair cap, basket cap), dust-vetoed.
+
+    Returns (size_usd, None) when the deployable size is at/above the
+    ``min_position_pct`` floor, else (None, veto_gate) with the BINDING
+    constraint's gate name (pair_cap / basket_cap).
+    """
+    avail = min(pair_remaining, basket_remaining)
+    size_usd = min(size_usd, avail)
+    floor = min_pct * equity
+    if size_usd <= 0 or size_usd < floor:
+        return None, ("pair_cap" if pair_remaining <= basket_remaining
+                      else "basket_cap")
+    return size_usd, None
+
+
 def decide(verdict: dict, pf: PortfolioState, cfg: RiskConfig, now_ms: int,
-           decision_id: Optional[str] = None, regime: Optional[str] = None) -> dict:
-    """Map a Jev verdict + portfolio state (+ optional regime) to an action.
+           decision_id: Optional[str] = None, regime: Optional[str] = None,
+           risk: Optional[dict] = None) -> dict:
+    """Map a Jev verdict + portfolio state (+ optional regime/risk) to an action.
 
     Never raises. ``regime`` is "chop"/"trend_up"/"trend_down" or None (the
     caller has no regime data — deprecated v1 fallback — and the regime gates
-    are skipped; the M3 supervisor always passes one).
+    are skipped; the M3 supervisor always passes one). ``risk`` is the M5
+    entry-budget dict (jev_risk.entry_budget) or None (no portfolio risk).
     """
     try:
         did = decision_id
         if did is None and isinstance(verdict, dict):
             did = verdict.get("decision_id")
-        return _decide(verdict, pf, cfg, now_ms, did, regime)
+        return _decide(verdict, pf, cfg, now_ms, did, regime, risk)
     except Exception as exc:  # defensive: never raise into the trading loop
         return _skip(f"malformed: {type(exc).__name__}: {exc}", ["malformed"], decision_id)
 
 
 def _decide(verdict, pf: PortfolioState, cfg: RiskConfig, now_ms: int,
-            decision_id: Optional[str] = None, regime: Optional[str] = None) -> dict:
+            decision_id: Optional[str] = None, regime: Optional[str] = None,
+            risk: Optional[dict] = None) -> dict:
     if not isinstance(verdict, dict):
         return _skip("malformed: verdict is not a dict", ["malformed"], decision_id)
 
@@ -181,8 +224,26 @@ def _decide(verdict, pf: PortfolioState, cfg: RiskConfig, now_ms: int,
         return _result("skip", "hold", 0.0, None, [], decision_id, streak, age_now)
 
     # ENTER path — evaluate ALL gates (F-P1-4): record every failing gate, not
-    # just the first. ``reason`` remains the first failing gate in check order.
+    # just the first. ``reason`` remains the first failing gate in check order:
+    # kill/halt -> pair/basket caps -> daily_loss_kill -> regime -> phase ->
+    # Jev gates -> cooldown (M5; see the module docstring).
     failed = []  # (gate name, readable reason) in check order
+    # M5 portfolio risk (entries only — the exit path above never consults it)
+    pair_rem, bask_rem, _bask_short_rem, min_pct = risk_capacities(risk)
+    if pair_rem is not None:
+        if risk.get("global_daily_kill"):
+            failed.append(("global_daily_kill",
+                           "global_daily_kill: portfolio daily PnL at/over "
+                           "the loss limit"))
+        if risk.get("drawdown_halt"):
+            failed.append(("drawdown_halt",
+                           "drawdown_halt: portfolio drawdown halt active"))
+        if pair_rem <= 0:
+            failed.append(("pair_cap",
+                           f"pair_cap: pair capacity {pair_rem} exhausted"))
+        if bask_rem <= 0:
+            failed.append(("basket_cap",
+                           f"basket_cap: long basket capacity {bask_rem} exhausted"))
     if pf.daily_pnl_pct <= -cfg.daily_loss_limit_pct:
         failed.append(("daily_loss_kill",
                        f"daily_loss_kill: daily pnl {pf.daily_pnl_pct}% <= "
@@ -233,6 +294,13 @@ def _decide(verdict, pf: PortfolioState, cfg: RiskConfig, now_ms: int,
 
     frac, tier = sizing_tier(conf, cfg)
     size = round(cfg.max_position_fraction * frac, 4)
+    if pair_rem is not None:  # M5: clamp by remaining pair/basket capacity
+        size_usd, veto = risk_clamp_size(size * pf.equity_usd, pair_rem, bask_rem,
+                                         min_pct, pf.equity_usd)
+        if veto is not None:
+            return _skip(f"{veto}: deployable capacity below min_position_pct "
+                         f"{min_pct}", [veto], decision_id)
+        size = round(size_usd / pf.equity_usd, 4) if pf.equity_usd > 0 else 0.0
     return _result(
         "enter",
         f"all gates passed: pump={vals['pump_0_100']} whipsaw={vals['whipsaw_prob']} "

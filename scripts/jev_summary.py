@@ -56,6 +56,16 @@ def _book_of(row: dict, path: Path) -> str:
     return "perps" if "perps" in path.name else "spot"  # pre-M0 rows: filename heuristic
 
 
+def _symbol_of(row: dict, path: Path) -> str:
+    symbol = row.get("symbol")
+    return str(symbol) if symbol else "unknown"
+
+
+def _group_key(row: dict, path: Path) -> tuple:
+    """(book, symbol) group — M5: summary tables group by (book, symbol)."""
+    return _book_of(row, path), _symbol_of(row, path)
+
+
 def _is_closing(row: dict) -> bool:
     action = row.get("action")
     if action in ("exit", "exited", "stop_loss", "liquidated"):
@@ -92,15 +102,17 @@ def _equity_from_state(trades_path: Path, book: str):
 
 
 def _collect(runtime_dir: Path):
-    trades = {book: [] for book in BOOKS}
+    """{((book, symbol): [(path, row)])} for trades and {(book, symbol): [row]}
+    for gate decisions — one group per (book, symbol) (M5 multi-pair)."""
+    trades = {}
     for path in sorted(runtime_dir.glob("*.trades.jsonl")):
         for row in _read_jsonl(path):
-            trades[_book_of(row, path)].append((path, row))
-    decisions = {book: [] for book in BOOKS}
+            trades.setdefault(_group_key(row, path), []).append((path, row))
+    decisions = {}
     for path in sorted(runtime_dir.glob("*decisions*.jsonl")):
         for row in _read_jsonl(path):
             if isinstance(row.get("veto_bitmask"), int):
-                decisions[_book_of(row, path)].append(row)
+                decisions.setdefault(_group_key(row, path), []).append(row)
     return trades, decisions
 
 
@@ -120,13 +132,20 @@ def _book_stats(rows) -> dict:
             "funding": funding, "net": net}
 
 
-def _print_book(book: str, rows) -> None:
+def _group_order(key) -> tuple:
+    """Canonical group order: spot before perps, then symbol."""
+    book, symbol = key
+    return (BOOKS.index(book) if book in BOOKS else len(BOOKS), symbol)
+
+
+def _print_book(book: str, symbol: str, rows) -> None:
     stats = _book_stats(rows)
     paths = {path for path, _ in rows}
     equity, label = (None, "no state file")
     if paths:
         equity, label = _equity_from_state(sorted(paths)[0], book)
-    print(f"{book}:")
+    heading = f"{book} {symbol}:" if symbol and symbol != "unknown" else f"{book}:"
+    print(heading)
     print(f"  round trips:      {stats['trips']}")
     print(f"  gross PnL:        {stats['gross']:.2f} USD")
     print(f"  fees paid:        {stats['fees']:.2f} USD")
@@ -140,22 +159,31 @@ def _print_book(book: str, rows) -> None:
 
 
 def _print_veto_table(decisions) -> None:
+    """Per-gate veto counts, one column per (book, symbol) group (M5)."""
+    groups = sorted(decisions, key=_group_order)
+    if not groups:
+        groups = [(book, "unknown") for book in BOOKS]
+    labels = [f"{book}/{symbol}" if symbol != "unknown" else book
+              for book, symbol in groups]
     print("per-gate veto counts (from veto_bitmask):")
-    print("  gate".ljust(22) + "spot".rjust(8) + "perps".rjust(8) + "total".rjust(8))
+    print("  gate".ljust(22)
+          + "".join(label.rjust(14) for label in labels) + "total".rjust(8))
     for name in GATE_NAMES:
         bit = int(GATE_FLAG[name])
-        counts = [sum(1 for row in decisions[book]
-                      if int(row.get("veto_bitmask") or 0) & bit) for book in BOOKS]
-        total = counts[0] + counts[1]
+        counts = [sum(1 for row in decisions.get(group, [])
+                      if int(row.get("veto_bitmask") or 0) & bit)
+                  for group in groups]
+        total = sum(counts)
         print(f"  {name}".ljust(22)
-              + str(counts[0]).rjust(8) + str(counts[1]).rjust(8) + str(total).rjust(8))
+              + "".join(str(c).rjust(14) for c in counts)
+              + str(total).rjust(8))
 
 
 def _print_regime_distribution(decisions) -> None:
     """M3: counts by regime from the gate-decision records (cheap, read-only)."""
     counts = {}
-    for book in BOOKS:
-        for row in decisions[book]:
+    for rows in decisions.values():
+        for row in rows:
             regime = row.get("regime") or "n/a"
             counts[regime] = counts.get(regime, 0) + 1
     if not counts:
@@ -175,9 +203,11 @@ def main(argv=None) -> int:
     print(f"Jevelin M0 summary — {runtime_dir}/ (generated {stamp} Asia/Bangkok)")
     print("note: rows written before M0 carry no fee/slippage fields and count as 0.")
     print()
-    for book in BOOKS:
-        _print_book(book, trades[book])
-    print()
+    groups = sorted(trades, key=_group_order) or [
+        (book, "unknown") for book in BOOKS]
+    for book, symbol in groups:
+        _print_book(book, symbol, trades.get((book, symbol), []))
+        print()
     _print_veto_table(decisions)
     _print_regime_distribution(decisions)
     return 0

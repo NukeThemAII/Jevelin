@@ -382,5 +382,79 @@ class BitmaskTests(unittest.TestCase):
         self.assertEqual(decide(v, _flat(), CFG, NOW)["decision_id"], "fromverdict01")
 
 
+# -- M5 portfolio risk gates (jev_risk.entry_budget contract) ----------------
+
+def _risk(**overrides):
+    kw = dict(global_daily_kill=False, drawdown_halt=False,
+              pair_remaining=10_000.0, basket_remaining_long=10_000.0,
+              basket_remaining_short=10_000.0, min_position_pct=0.01)
+    kw.update(overrides)
+    return kw
+
+
+class PortfolioRiskGates(unittest.TestCase):
+    """M5: kill/halt/pair/basket caps veto entries; exits are never blocked."""
+
+    def test_kill_and_halt_flags(self):
+        d = decide(_verdict(), _flat(), CFG, NOW, regime="trend_up",
+                   risk=_risk(global_daily_kill=True, drawdown_halt=True))
+        self.assertEqual(d["action"], "skip")
+        self.assertEqual(d["vetoed_by"][0], "global_daily_kill")
+        self.assertIn("drawdown_halt", d["vetoed_by"])
+        self.assertEqual(d["veto_bitmask"],
+                         int(VetoFlags.GLOBAL_DAILY_KILL | VetoFlags.DRAWDOWN_HALT))
+
+    def test_exhausted_caps_veto_with_bits(self):
+        d = decide(_verdict(), _flat(), CFG, NOW, regime="trend_up",
+                   risk=_risk(pair_remaining=0.0, basket_remaining_long=0.0))
+        self.assertEqual(d["vetoed_by"], ["pair_cap", "basket_cap"])
+        self.assertEqual(d["veto_bitmask"],
+                         int(VetoFlags.PAIR_CAP | VetoFlags.BASKET_CAP))
+
+    def test_check_order_kill_first(self):
+        d = decide(_verdict(pump_0_100=10.0), _flat(), CFG, NOW,
+                   regime="chop", risk=_risk(global_daily_kill=True,
+                                             pair_remaining=0.0))
+        self.assertEqual(d["vetoed_by"][0], "global_daily_kill")
+
+    def test_fail_closed_on_unavailable_risk(self):
+        # missing capacities count as 0 (fail-closed): entries blocked
+        d = decide(_verdict(), _flat(), CFG, NOW, regime="trend_up", risk={})
+        self.assertEqual(d["action"], "skip")
+        self.assertEqual(d["vetoed_by"], ["pair_cap", "basket_cap"])
+
+    def test_size_clamped_by_pair_cap(self):
+        # tier target 0.20 (conf 0.86 -> 100% tier); pair remaining 500 of
+        # 10000 equity -> 0.05; tier label unchanged, size clamped.
+        d = decide(_verdict(), _flat(), CFG, NOW, regime="trend_up",
+                   risk=_risk(pair_remaining=500.0))
+        self.assertEqual(d["action"], "enter")
+        self.assertEqual(d["size_fraction"], 0.05)
+        self.assertEqual(d["size_tier"], 100)
+
+    def test_size_clamped_by_basket_cap(self):
+        d = decide(_verdict(), _flat(), CFG, NOW, regime="trend_up",
+                   risk=_risk(basket_remaining_long=300.0))
+        self.assertEqual(d["size_fraction"], 0.03)
+
+    def test_dust_veto_binding_flag(self):
+        # 50 deployable < 1% x 10000 = 100 floor -> the binding constraint name
+        d = decide(_verdict(), _flat(), CFG, NOW, regime="trend_up",
+                   risk=_risk(pair_remaining=50.0, basket_remaining_long=5000.0))
+        self.assertEqual(d["action"], "skip")
+        self.assertEqual(d["vetoed_by"], ["pair_cap"])
+        d = decide(_verdict(), _flat(), CFG, NOW, regime="trend_up",
+                   risk=_risk(pair_remaining=5000.0, basket_remaining_long=50.0))
+        self.assertEqual(d["vetoed_by"], ["basket_cap"])
+
+    def test_exits_never_risk_blocked(self):
+        d = decide(_verdict(dump_0_100=80.0), _long(cycles_held=3), CFG, NOW,
+                   regime="trend_up",
+                   risk=_risk(global_daily_kill=True, drawdown_halt=True))
+        self.assertEqual(d["action"], "exit")
+        self.assertEqual(d["vetoed_by"], [])
+        self.assertEqual(d["veto_bitmask"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

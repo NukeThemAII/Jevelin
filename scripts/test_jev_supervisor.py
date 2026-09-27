@@ -15,10 +15,12 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import jev_store  # noqa: E402
+from jev_config import PortfolioConfig  # noqa: E402
 from jev_paper import PaperPortfolio  # noqa: E402
 from jev_perps import PerpsConfig, PerpsPortfolio  # noqa: E402
 from jev_supervisor import BookPair, Supervisor  # noqa: E402
@@ -433,9 +435,11 @@ class LiveStoreWriteTests(unittest.TestCase):
         self.assertEqual(set(decisions[0]), {
             "ts_ms", "decision_id", "book", "symbol", "price", "action", "executed",
             "veto_bitmask", "vetoed_by", "reason", "equity", "fees", "slippage",
-            "realized_pnl", "funding_paid", "verdict", "regime", "fan_out"})
+            "realized_pnl", "funding_paid", "verdict", "regime", "fan_out",
+            "risk_flags"})
         self.assertEqual(decisions[0]["regime"], "trend_up")  # M3 regime on the row
         self.assertEqual(decisions[0]["fan_out"], 0)
+        self.assertEqual(decisions[0]["risk_flags"], [])  # M5: no portfolio layer
 
 
 BAND_ANSWERS = {
@@ -563,6 +567,176 @@ class Simulated24hTests(unittest.TestCase):
             print(f"\n24h sim: {client.calls} Jev calls / 288 cycles = "
                   f"{client.calls / 288 * 100:.1f}% (budget 40%)")
             self.assertLessEqual(client.calls / 288, 0.40)
+
+
+# -- M5: multi-pair supervisor + portfolio-risk fault injection ---------------
+
+SYMBOLS3 = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+
+
+def make_pair_books(tmp, symbol, initial=10000.0):
+    """One BookPair per symbol, production naming (paper_{tag}.json, BTC same)."""
+    tag = symbol[:-4].lower() if symbol.endswith("USDT") else symbol.lower()
+    spot = PaperPortfolio(initial_equity_usd=initial,
+                          state_path=str(Path(tmp) / f"paper_{tag}.json"))
+    perps = PerpsPortfolio(initial_equity_usd=initial,
+                           state_path=str(Path(tmp) / f"perps_{tag}.json"),
+                           cfg=PerpsConfig())
+    return BookPair(spot=spot, perps=perps)
+
+
+class PortfolioRiskFaultTests(unittest.TestCase):
+    """Fault injection: bad portfolio states veto entries across ALL pairs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.clock = FakeClock()
+        self.market = FakeMarket(price=100.0, regime="trend_up")
+
+    def _sup(self):
+        books = {s: make_pair_books(self.tmp.name, s) for s in SYMBOLS3}
+        sup = Supervisor(list(SYMBOLS3), self.market, FakeClient(), books,
+                         conn=None, clock=self.clock.now,
+                         decision_log_path=str(Path(self.tmp.name) / "paper_decisions.jsonl"),
+                         portfolio_cfg=PortfolioConfig(),
+                         risk_state_path=str(Path(self.tmp.name) / "risk_state.json"))
+        self.addCleanup(sup.restore_signal_handlers)
+        return sup, books
+
+    def _rows(self):
+        return read_jsonl(Path(self.tmp.name) / "paper_decisions.jsonl")
+
+    def test_six_pct_daily_loss_kills_all_three_pairs(self):
+        sup, books = self._sup()
+        sup.portfolio_risk_update()  # daily base = 60000 (3 pairs x 2 books)
+        # fault injection: every book -6% on the day -> portfolio -6%
+        for pair in books.values():
+            pair.spot.cash = 9400.0
+            pair.perps.equity = 9400.0
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            sup.slow_cycle()
+        rows = self._rows()
+        self.assertEqual(len(rows), 6)  # 3 pairs x 2 books, all vetoed
+        for row in rows:
+            self.assertEqual(row["action"], "skip")
+            self.assertEqual(row["vetoed_by"][0], "global_daily_kill")
+            self.assertIn("global_daily_kill", row["risk_flags"])
+        self.assertIn("risk=global_daily_kill", out.getvalue())
+        for pair in books.values():  # no entries anywhere
+            self.assertIsNone(pair.spot.position)
+            self.assertIsNone(pair.perps.position)
+
+    def test_drawdown_halt_vetoes_all_three_pairs(self):
+        sup, books = self._sup()
+        sup.portfolio_risk_update()
+        # fault injection: a bogus 67000 peak -> dd = 7000/67000 = 10.4%
+        sup.risk.equity_peak = 67000.0
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup.slow_cycle()
+        rows = self._rows()
+        self.assertEqual(len(rows), 6)
+        for row in rows:
+            self.assertEqual(row["vetoed_by"][0], "drawdown_halt")
+            self.assertIn("drawdown_halt", row["risk_flags"])
+            if row["book"] == "spot":  # perps rows also record their side gates
+                self.assertEqual(row["vetoed_by"], ["drawdown_halt"])
+        for pair in books.values():
+            self.assertIsNone(pair.spot.position)
+            self.assertIsNone(pair.perps.position)
+
+
+    def test_risk_computation_error_fails_closed(self):
+        sup, books = self._sup()
+        sup.portfolio_risk_update()
+        # fault injection: the risk computation itself breaks
+        with mock.patch.object(sup, "_books_snapshot",
+                               side_effect=RuntimeError("injected")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                sup.slow_cycle()
+        rows = self._rows()
+        self.assertEqual(len(rows), 6)
+        for row in rows:
+            self.assertEqual(row["action"], "skip")
+            self.assertEqual(row["vetoed_by"][:2], ["pair_cap", "basket_cap"])
+            if row["book"] == "spot":  # perps rows also record their side gates
+                self.assertEqual(row["vetoed_by"], ["pair_cap", "basket_cap"])
+        for pair in books.values():
+            self.assertIsNone(pair.spot.position)
+            self.assertIsNone(pair.perps.position)
+
+    def test_risk_state_persists_across_restart(self):
+        sup, books = self._sup()
+        sup.portfolio_risk_update()
+        sup.risk.equity_peak = 67000.0  # a halted-state field
+        sup._save_risk_state()
+        back = Supervisor(list(SYMBOLS3), self.market, FakeClient(), books,
+                          conn=None, clock=self.clock.now,
+                          decision_log_path=str(Path(self.tmp.name) / "x.jsonl"),
+                          portfolio_cfg=PortfolioConfig(),
+                          risk_state_path=str(Path(self.tmp.name) / "risk_state.json"))
+        self.addCleanup(back.restore_signal_handlers)
+        self.assertEqual(back.risk.equity_peak, 67000.0)
+
+
+class MultiPairStopTests(unittest.TestCase):
+    """Fast loop closes EVERY pair's stop breach in one tick (0 Jev calls)."""
+
+    def test_two_pairs_stop_close_same_tick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = FakeClock()
+            market = FakeMarket(price=97.9)  # below the ~98.0 stop on both pairs
+            client = FakeClient()
+            books = {s: make_pair_books(tmp, s) for s in ("BTCUSDT", "ETHUSDT")}
+            for pair in books.values():
+                enter_long(pair.perps, price=100.0)  # stop ~= 98.0, liq ~= 68.3
+            sup = Supervisor(["BTCUSDT", "ETHUSDT"], market, client, books,
+                             conn=None, clock=clock.now,
+                             decision_log_path=str(Path(tmp) / "paper_decisions.jsonl"))
+            self.addCleanup(sup.restore_signal_handlers)
+            out = sup.fast_tick()
+            self.assertEqual(len(out["closed"]), 2)  # one close per pair
+            self.assertEqual(client.calls, 0)        # stops are free and fast
+            for pair in books.values():
+                self.assertIsNone(pair.perps.position)
+
+
+class Simulated24hThreePairs(unittest.TestCase):
+    """M5 acceptance: 3-pair 24h tape -> Jev calls <= 40% of 864 (3 x 288)."""
+
+    def test_24h_tape_call_budget_three_pairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = FakeClock()
+            market = FakeMarket(price=100.0)
+            client = FakeClient()
+            books = {s: make_pair_books(tmp, s) for s in SYMBOLS3}
+            sup = Supervisor(list(SYMBOLS3), market, client, books, conn=None,
+                             clock=clock.now,
+                             decision_log_path=str(Path(tmp) / "paper_decisions.jsonl"),
+                             portfolio_cfg=PortfolioConfig(),
+                             risk_state_path=str(Path(tmp) / "risk_state.json"))
+            self.addCleanup(sup.restore_signal_handlers)
+
+            # 4-cycle block: quiet +1bp, quiet -1bp, quiet +2bp, normal +8bp.
+            moves = [1.0001, 0.9999, 1.0002, 1.0008]
+            price = 100.0
+            calls_expected_max = int(0.40 * 864)
+            for i in range(288):
+                price *= moves[i % 4]
+                market.price = price
+                sup.fast_tick()
+                sup.slow_cycle()
+                clock.advance(300)
+
+            self.assertLessEqual(client.calls, calls_expected_max)
+            self.assertGreaterEqual(client.calls, 3)
+            stats = sup.summary()
+            self.assertEqual(stats["slow_cycles"], 288)
+            total = stats["cache_hits"] + stats["cache_misses"]
+            self.assertEqual(total, 288 * 3)  # one cache decision per pair-cycle
+            print(f"\n24h sim (3 pairs): {client.calls} Jev calls / 864 = "
+                  f"{client.calls / 864 * 100:.1f}% (budget 40%)")
+            self.assertLessEqual(client.calls / 864, 0.40)
 
 
 if __name__ == "__main__":

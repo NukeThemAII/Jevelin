@@ -698,20 +698,28 @@ def build_report(gate_rows, trades, cfg, db_label="runtime/jevelin.db",
                f"({sum(1 for r in gate_rows if r.get('book') == 'spot')} spot / "
                f"{sum(1 for r in gate_rows if r.get('book') == 'perps')} perps)"
                f" · Jev verdict rows: {jev_verdicts} · trade fills: {len(trades)}")
-    # cross-check: same rows, M1 accounting (the numbers jev_replay.py --summary
-    # prints on the store side)
+    # cross-check: same rows, M1 accounting per (book, symbol) (the numbers
+    # jev_replay.py --summary prints on the store side)
+    stats_by_group = {}
+    for t in trades:
+        stats_by_group.setdefault(
+            (t.get("book"), str(t.get("symbol") or "unknown")), []).append(t)
+    stats_by_group = {g: trade_stats(rows) for g, rows in stats_by_group.items()}
+    groups = sorted(set(stats_by_group) | set(replay_stats or {})) \
+        or [(book, "unknown") for book in BOOKS]
     compared = 0
     matched = 0
-    for book in BOOKS:
-        replay = (replay_stats or {}).get(book) or {}
+    for group in groups:
+        replay = (replay_stats or {}).get(group) or {}
+        s = stats_by_group.get(group) or trade_stats([])
         for key in ("trips", "gross", "fees", "slippage", "funding", "net"):
             compared += 1
             if key in replay and abs(float(replay[key])
-                                     - float(stats[book][key])) <= 1e-6:
+                                     - float(s[key])) <= 1e-6:
                 matched += 1
     verdict = "OK" if compared and matched == compared else "DIFF"
     out.append(f"cross-check vs jev_replay.py --summary accounting "
-               f"(same rows): {matched}/{compared} values {verdict}")
+               f"(same rows, per book/symbol): {matched}/{compared} values {verdict}")
     out.append("")
 
     # -- 2. regime distribution ------------------------------------------
@@ -913,15 +921,17 @@ def run(db_path, cfg, out_path=None, since=None) -> int:
                 "SELECT COUNT(*) FROM decisions").fetchone()[0]
         except Exception:
             jev_verdicts = 0
-        raw_by_book = {book: [] for book in BOOKS}
+        raw_by_group = {}
         for r in jev_store.list_trades(conn):
             ts = _f(r.get("ts"))
             if cutoff is not None and (ts is None or ts < cutoff):
                 continue
-            if r.get("book") in raw_by_book:
-                raw_by_book[r["book"]].append(r)
-        replay_stats = {book: jev_replay._stats_from_rows(rows)
-                        for book, rows in raw_by_book.items()}
+            key = (r.get("book"), str(r.get("symbol") or "unknown"))
+            raw_by_group.setdefault(key, []).append(r)
+        if not raw_by_group:  # legacy empty-data semantics: both books, zero rows
+            raw_by_group = {(book, "unknown"): [] for book in BOOKS}
+        replay_stats = {group: jev_replay._stats_from_rows(rows)
+                        for group, rows in raw_by_group.items()}
         text, metrics = build_report(gate_rows, trades, cfg, db_label=str(db),
                                      replay_stats=replay_stats, since=since,
                                      jev_verdicts=jev_verdicts)

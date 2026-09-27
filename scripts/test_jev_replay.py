@@ -83,7 +83,7 @@ class ReplayMath(unittest.TestCase):
         jev_import.import_all(self.runtime, self.conn)
 
     def test_spot_math_matches_hand_computed(self):
-        s = jev_replay.store_book_stats(self.conn)["spot"]
+        s = jev_replay.store_book_stats(self.conn)[("spot", "BTCUSDT")]
         self.assertEqual(s["trips"], 1)
         self.assertAlmostEqual(s["fees"], SPOT_ENTRY_FEE + SPOT_EXIT_FEE, places=9)
         self.assertAlmostEqual(s["slippage"], SPOT_ENTRY_SLIP + SPOT_EXIT_SLIP, places=9)
@@ -92,7 +92,7 @@ class ReplayMath(unittest.TestCase):
         self.assertAlmostEqual(s["net"], SPOT_REALIZED, places=9)
 
     def test_perps_math_matches_hand_computed(self):
-        s = jev_replay.store_book_stats(self.conn)["perps"]
+        s = jev_replay.store_book_stats(self.conn)[("perps", "BTCUSDT")]
         # both rows are side=long; the action (enter_long/exited) counts the trip
         self.assertEqual(s["trips"], 1)
         self.assertAlmostEqual(s["fees"], PERPS_ENTRY_FEE + PERPS_EXIT_FEE, places=9)
@@ -104,7 +104,7 @@ class ReplayMath(unittest.TestCase):
     def test_cross_check_agrees_with_jsonl(self):
         rows = jev_replay.compare_summary(self.conn, self.runtime)
         self.assertTrue(rows)
-        self.assertTrue(all(match for _b, _m, _s, _j, match in rows))
+        self.assertTrue(all(match for _b, _sym, _m, _s, _j, match in rows))
 
     def test_print_summary_exit_zero_on_match(self):
         buf = io.StringIO()
@@ -144,6 +144,51 @@ class ReplayMath(unittest.TestCase):
                                     "--db", str(self.db),
                                     "--runtime-dir", str(self.runtime)])
         self.assertEqual(code, 0)
+
+
+class MultiPairReplay(unittest.TestCase):
+    """M5: cross-check rows are per (book, symbol); groups never bleed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = Path(self.tmp.name)
+        self.db = self.runtime / "jevelin.db"
+        # BTC keeps the base fixture; ETH gets its own PnL (same row shapes).
+        (self.runtime / "paper_btc.json.trades.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in SPOT_LINES))
+        eth_spot = [dict(line, symbol="ETHUSDT") for line in SPOT_LINES]
+        eth_spot[1]["realized_pnl"] = SPOT_REALIZED + 5.0  # per-pair PnL differs
+        (self.runtime / "paper_eth.json.trades.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in eth_spot))
+        self.conn = jev_store.connect(str(self.db))
+        self.addCleanup(self.conn.close)
+        jev_import.import_all(self.runtime, self.conn)
+
+    def test_groups_are_per_symbol(self):
+        stats = jev_replay.store_book_stats(self.conn)
+        self.assertEqual(set(stats), {("spot", "BTCUSDT"), ("spot", "ETHUSDT")})
+        self.assertAlmostEqual(stats[("spot", "ETHUSDT")]["net"],
+                               SPOT_REALIZED + 5.0, places=9)
+        self.assertAlmostEqual(stats[("spot", "BTCUSDT")]["net"],
+                               SPOT_REALIZED, places=9)
+
+    def test_cross_check_per_book_symbol(self):
+        rows = jev_replay.compare_summary(self.conn, self.runtime)
+        self.assertTrue(rows)
+        self.assertTrue(all(match for _b, _sym, _m, _s, _j, match in rows))
+        self.assertEqual({(b, s) for b, s, _m, _a, _b2, _ok in rows},
+                         {("spot", "BTCUSDT"), ("spot", "ETHUSDT")})
+
+    def test_print_summary_shows_both_symbols(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = jev_replay.print_summary(str(self.db), self.runtime)
+        self.assertEqual(code, 0)
+        out = buf.getvalue()
+        self.assertIn("BTCUSDT", out)
+        self.assertIn("ETHUSDT", out)
+        self.assertIn("store replay == JSONL summary", out)
 
 
 if __name__ == "__main__":

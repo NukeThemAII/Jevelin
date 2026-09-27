@@ -35,7 +35,10 @@ SPOT_FEE_RATE = 0.001
 PERPS_TAKER_FEE_RATE = 0.0005
 SLIPPAGE_RATE = 0.0005
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
+
+# M5 default pair universe (config/v2.yaml ``pairs``; --pairs overrides).
+DEFAULT_PAIRS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 # Default config file (absolute: the CLI works from any cwd).
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "v2.yaml"
@@ -158,9 +161,27 @@ class PerpsConfig:
 
 
 @dataclass(frozen=True)
+class PortfolioConfig:
+    """M5 portfolio risk thresholds (scripts/jev_risk.py) — B.3 / M5 spec.
+
+    Every cap is a fraction; the portfolio risk layer enforces them in
+    deterministic code — Jev never sees them.
+    """
+    pair_spot_cap: float = 0.30           # per-pair spot notional <= 30% pair spot equity
+    pair_perps_margin_cap: float = 0.10   # per-pair perps margin <= 10% pair perps equity
+    basket_long_cap: float = 0.40         # total long notional <= 40% total equity
+    basket_short_cap: float = 0.20        # total short notional <= 20% total equity
+    global_daily_loss: float = -0.05      # portfolio daily PnL <= -5% -> block entries
+    drawdown_halt: float = 0.10           # dd from running peak >= 10% -> block entries
+    drawdown_recover: float = 0.05        # halt clears only below 5% dd (hysteresis)
+    min_position_pct: float = 0.01        # capacity < 1% equity -> veto (no dust)
+
+
+@dataclass(frozen=True)
 class V2Config:
     """Resolved v2 config: one frozen section per concern (config/v2.yaml)."""
     config_version: int = CONFIG_VERSION
+    pairs: tuple = DEFAULT_PAIRS
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     fanout: FanoutConfig = field(default_factory=FanoutConfig)
@@ -169,6 +190,7 @@ class V2Config:
     market: MarketConfig = field(default_factory=MarketConfig)
     spot: RiskConfig = field(default_factory=RiskConfig)
     perps: PerpsConfig = field(default_factory=PerpsConfig)
+    portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
 
     def to_dict(self) -> dict:
         """Nested plain dict (tuples -> lists) — the yaml-shape view."""
@@ -177,7 +199,8 @@ class V2Config:
                 return [plain(v) for v in value]
             return value
 
-        out = {"config_version": int(self.config_version)}
+        out = {"config_version": int(self.config_version),
+               "pairs": plain(self.pairs)}
         for name in _SECTION_CLASSES:
             section = getattr(self, name)
             out[name] = {f.name: plain(getattr(section, f.name))
@@ -215,6 +238,10 @@ class VetoFlags(IntFlag):
     PHASE_NOT_IN_ENTRY_SET = 4096
     REGIME_CHOP = 8192
     REGIME_COUNTER = 16384
+    PAIR_CAP = 32768            # M5: per-pair capacity exhausted (or dust)
+    BASKET_CAP = 65536          # M5: side basket capacity exhausted (or dust)
+    GLOBAL_DAILY_KILL = 131072  # M5: portfolio daily loss kill
+    DRAWDOWN_HALT = 262144      # M5: portfolio drawdown halt
 
 
 # gate name (as used in ``vetoed_by``) -> flag; order = canonical bit order.
@@ -234,6 +261,10 @@ GATE_FLAG = {
     "phase_not_in_entry_set": VetoFlags.PHASE_NOT_IN_ENTRY_SET,
     "regime_chop": VetoFlags.REGIME_CHOP,
     "regime_counter": VetoFlags.REGIME_COUNTER,
+    "pair_cap": VetoFlags.PAIR_CAP,
+    "basket_cap": VetoFlags.BASKET_CAP,
+    "global_daily_kill": VetoFlags.GLOBAL_DAILY_KILL,
+    "drawdown_halt": VetoFlags.DRAWDOWN_HALT,
 }
 GATE_NAMES = tuple(GATE_FLAG)
 
@@ -300,6 +331,7 @@ _SECTION_CLASSES = {
     "market": MarketConfig,
     "spot": RiskConfig,
     "perps": PerpsConfig,
+    "portfolio": PortfolioConfig,
 }
 
 # Inclusive numeric bounds per field name (None = unbounded). Every numeric
@@ -329,6 +361,11 @@ _RANGES = {
     "burst_cycles": (0, None),
     "ohlcv_ttl_seconds": (0.0, None), "ohlcv_15m_limit": (1, None),
     "ohlcv_1h_limit": (1, None),
+    "pair_spot_cap": (0.0, 1.0), "pair_perps_margin_cap": (0.0, 1.0),
+    "basket_long_cap": (0.0, 1.0), "basket_short_cap": (0.0, 1.0),
+    "global_daily_loss": (-1.0, 1.0),
+    "drawdown_halt": (0.0, 1.0), "drawdown_recover": (0.0, 1.0),
+    "min_position_pct": (0.0, 1.0),
 }
 _COUNTER_TREND = ("block", "allow")
 
@@ -420,6 +457,32 @@ def _validate_sections(cfg: V2Config) -> None:
             raise ConfigError(
                 f"config: {name}.entry_phases: expected non-empty phase names, "
                 f"got {list(section.entry_phases)!r}")
+    # M5: pair universe + portfolio risk caps (strictly positive, halt > recover)
+    if not cfg.pairs or any(not isinstance(p, str) or not p.strip()
+                            for p in cfg.pairs):
+        raise ConfigError(
+            f"config: pairs: expected non-empty symbol names, "
+            f"got {list(cfg.pairs)!r}")
+    p = cfg.portfolio
+    for key in ("pair_spot_cap", "pair_perps_margin_cap", "basket_long_cap",
+                "basket_short_cap", "min_position_pct"):
+        value = getattr(p, key)
+        if not (0.0 < value <= 1.0):
+            raise ConfigError(
+                f"config: portfolio.{key}: {value!r} outside allowed range "
+                f"(0, 1]")
+    if not (-1.0 <= p.global_daily_loss < 0.0):
+        raise ConfigError(
+            f"config: portfolio.global_daily_loss: {p.global_daily_loss!r} "
+            f"must be in [-1, 0)")
+    if not (0.0 < p.drawdown_halt <= 1.0):
+        raise ConfigError(
+            f"config: portfolio.drawdown_halt: {p.drawdown_halt!r} "
+            f"outside allowed range (0, 1]")
+    if not (0.0 <= p.drawdown_recover < p.drawdown_halt):
+        raise ConfigError(
+            f"config: portfolio.drawdown_recover: {p.drawdown_recover!r} "
+            f"must be in [0, drawdown_halt={p.drawdown_halt!r})")
 
 
 def load_config(path=None) -> V2Config:
@@ -459,6 +522,13 @@ def load_config(path=None) -> V2Config:
     overrides = {}
     for key, value in data.items():
         if key == "config_version":
+            continue
+        if key == "pairs":  # M5: root-level symbol list, not a mapping section
+            if not isinstance(value, (list, tuple)):
+                raise ConfigError(
+                    f"config: pairs: expected a list of symbols, "
+                    f"got {type(value).__name__}")
+            overrides["pairs"] = tuple(value)
             continue
         if key not in _SECTION_CLASSES:
             _warn(f"unknown key {key!r} ignored")

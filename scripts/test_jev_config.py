@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for jev_config v2 (M3): YAML config loader + dataclass parity.
+"""Tests for jev_config v2/v3 (M3+M5): YAML config loader + dataclass parity.
 
 No network. Run: .venv/bin/python scripts/test_jev_config.py -v
 """
@@ -18,6 +18,7 @@ from jev_config import (  # noqa: E402
     ExecutionConfig,
     FanoutConfig,
     PerpsConfig,
+    PortfolioConfig,
     RegimeConfig,
     RiskConfig,
     V2Config,
@@ -39,9 +40,9 @@ class DefaultsParityTests(unittest.TestCase):
         # Single source of truth: the shipped yaml values ARE the dataclass defaults.
         self.assertEqual(load_config(str(SHIPPED_YAML)), V2Config())
 
-    def test_config_version_default_is_2(self):
-        self.assertEqual(V2Config().config_version, 2)
-        self.assertEqual(CONFIG_VERSION, 2)
+    def test_config_version_default_is_3(self):
+        self.assertEqual(V2Config().config_version, 3)
+        self.assertEqual(CONFIG_VERSION, 3)
 
     def test_shipped_yaml_exists(self):
         self.assertTrue(SHIPPED_YAML.exists())
@@ -49,7 +50,7 @@ class DefaultsParityTests(unittest.TestCase):
 
 class YamlOverrideTests(unittest.TestCase):
     def test_partial_yaml_overrides_only_given_keys(self):
-        path = _write_cfg("config_version: 2\nspot:\n  entry_min_pump: 70.0\n")
+        path = _write_cfg("config_version: 3\nspot:\n  entry_min_pump: 70.0\n")
         cfg = load_config(path)
         self.assertEqual(cfg.spot.entry_min_pump, 70.0)
         self.assertEqual(cfg.spot.min_confidence, RiskConfig().min_confidence)
@@ -57,6 +58,8 @@ class YamlOverrideTests(unittest.TestCase):
         self.assertEqual(cfg.execution, ExecutionConfig())
         self.assertEqual(cfg.regime, RegimeConfig())
         self.assertEqual(cfg.fanout, FanoutConfig())
+        self.assertEqual(cfg.portfolio, PortfolioConfig())
+        self.assertEqual(cfg.pairs, V2Config().pairs)
 
     def test_yaml_list_coerces_to_tuple(self):
         path = _write_cfg("spot:\n  entry_phases: [breakout]\n"
@@ -147,22 +150,107 @@ class BadValueTests(unittest.TestCase):
 
 
 class ConfigVersionTests(unittest.TestCase):
-    def test_omitted_defaults_to_2(self):
-        self.assertEqual(load_config(_write_cfg("spot:\n  min_confidence: 0.7\n")).config_version, 2)
+    def test_omitted_defaults_to_3(self):
+        self.assertEqual(load_config(_write_cfg("spot:\n  min_confidence: 0.7\n")).config_version, 3)
 
-    def test_explicit_2_ok(self):
-        self.assertEqual(load_config(_write_cfg("config_version: 2\n")).config_version, 2)
+    def test_explicit_3_ok(self):
+        self.assertEqual(load_config(_write_cfg("config_version: 3\n")).config_version, 3)
 
     def test_unsupported_version_errors(self):
+        # M5 bumps cleanly: v2 files are rejected, never silently coerced.
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             with self.assertRaises(ConfigError) as ctx:
-                load_config(_write_cfg("config_version: 3\n"))
+                load_config(_write_cfg("config_version: 2\n"))
         self.assertIn("config_version", str(ctx.exception))
 
     def test_non_int_version_errors(self):
         with self.assertRaises(ConfigError):
             load_config(_write_cfg("config_version: two\n"))
+
+
+class PairsTests(unittest.TestCase):
+    """M5 default universe: pairs list at the yaml root, --pairs overrides."""
+
+    def assertConfigError(self, text, fragment):
+        path = _write_cfg(text)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(path)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_default_universe_is_three_majors(self):
+        self.assertEqual(V2Config().pairs, ("BTCUSDT", "ETHUSDT", "SOLUSDT"))
+
+    def test_pairs_override(self):
+        cfg = load_config(_write_cfg("pairs: [BTCUSDT, ETHUSDT]\n"))
+        self.assertEqual(cfg.pairs, ("BTCUSDT", "ETHUSDT"))
+
+    def test_pairs_scalar_errors(self):
+        self.assertConfigError("pairs: BTCUSDT\n", "pairs")
+
+    def test_pairs_empty_errors(self):
+        self.assertConfigError("pairs: []\n", "pairs")
+
+    def test_pairs_non_string_errors(self):
+        self.assertConfigError("pairs: [BTCUSDT, 7]\n", "pairs")
+
+    def test_pairs_unknown_key_still_warns(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            cfg = load_config(_write_cfg("portfolios:\n  x: 1\n"))
+        self.assertIn("portfolios", err.getvalue())
+        self.assertEqual(cfg, V2Config())
+
+
+class PortfolioSectionTests(unittest.TestCase):
+    """M5 portfolio risk thresholds (docs/V2-DESIGN.md B.3 / M5 spec)."""
+
+    def assertConfigError(self, text, fragment):
+        path = _write_cfg(text)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(path)
+        self.assertIn(fragment, str(ctx.exception))
+
+    def test_portfolio_defaults(self):
+        p = PortfolioConfig()
+        self.assertEqual(p.pair_spot_cap, 0.30)
+        self.assertEqual(p.pair_perps_margin_cap, 0.10)
+        self.assertEqual(p.basket_long_cap, 0.40)
+        self.assertEqual(p.basket_short_cap, 0.20)
+        self.assertEqual(p.global_daily_loss, -0.05)
+        self.assertEqual(p.drawdown_halt, 0.10)
+        self.assertEqual(p.drawdown_recover, 0.05)
+        self.assertEqual(p.min_position_pct, 0.01)
+
+    def test_portfolio_override(self):
+        cfg = load_config(_write_cfg("portfolio:\n  basket_long_cap: 0.5\n  "
+                                     "global_daily_loss: -0.08\n"))
+        self.assertEqual(cfg.portfolio.basket_long_cap, 0.5)
+        self.assertEqual(cfg.portfolio.global_daily_loss, -0.08)
+        self.assertEqual(cfg.portfolio.basket_short_cap,
+                         PortfolioConfig().basket_short_cap)
+
+    def test_caps_out_of_range_abort(self):
+        self.assertConfigError("portfolio:\n  pair_spot_cap: 1.5\n", "pair_spot_cap")
+        self.assertConfigError("portfolio:\n  basket_short_cap: -0.1\n", "basket_short_cap")
+        self.assertConfigError("portfolio:\n  min_position_pct: 0.0\n", "min_position_pct")
+
+    def test_global_daily_loss_must_be_negative(self):
+        self.assertConfigError("portfolio:\n  global_daily_loss: 0.05\n",
+                               "global_daily_loss")
+        self.assertConfigError("portfolio:\n  global_daily_loss: 0.0\n",
+                               "global_daily_loss")
+
+    def test_drawdown_recover_must_be_below_halt(self):
+        self.assertConfigError("portfolio:\n  drawdown_halt: 0.05\n  "
+                               "drawdown_recover: 0.05\n", "drawdown_recover")
+        self.assertConfigError("portfolio:\n  drawdown_halt: 0.05\n  "
+                               "drawdown_recover: 0.10\n", "drawdown_recover")
+
+    def test_bad_type_errors(self):
+        self.assertConfigError("portfolio:\n  basket_long_cap: wide\n", "basket_long_cap")
 
 
 class ResolvedYamlTests(unittest.TestCase):
@@ -173,7 +261,7 @@ class ResolvedYamlTests(unittest.TestCase):
         text = cfg.resolved_yaml_text()
         back = yaml.safe_load(text)
         self.assertEqual(back["spot"]["entry_min_pump"], 70.0)
-        self.assertEqual(back["config_version"], 2)
+        self.assertEqual(back["config_version"], 3)
         self.assertEqual(back["perps"]["entry_min_pump"], 65.0)  # defaults carried
 
 

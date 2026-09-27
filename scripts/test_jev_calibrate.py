@@ -609,6 +609,38 @@ class Proposals(StoreFixture):
         self.assertIn("HUMAN", out)
 
 
+class MultiPairReport(StoreFixture):
+    """M5: multi-pair data calibrates; the veto table shows the M5 risk flags."""
+
+    def test_multi_pair_report_and_new_flags(self):
+        rows_btc = [dict(r, symbol="BTCUSDT") for r in F1_ROWS]
+        rows_eth = [dict(r, symbol="ETHUSDT",
+                         decision_id="e" + str(r["decision_id"])[1:])
+                    for r in F1_ROWS]
+        # one ETH decision vetoed by the four M5 portfolio-risk gates
+        rows_eth.insert(0, _gate_line(
+            1800000000000, "e-m5", "spot", 100.0, "skip",
+            bitmask_for(["global_daily_kill", "drawdown_halt",
+                         "pair_cap", "basket_cap"]),
+            ["global_daily_kill", "drawdown_halt", "pair_cap", "basket_cap"],
+            _verdict(pump=70.0, dump=20.0, conf=0.72), symbol="ETHUSDT"))
+        self._write("paper_decisions.jsonl", rows_btc + rows_eth)
+        self._import()
+        code, out = self._run()
+        self.assertEqual(code, 0)
+        self.assertIn("per book/symbol", out)
+        line = [l for l in out.splitlines() if "cross-check" in l][0]
+        self.assertIn("OK", line)
+        # the 4 new flags appear in the veto table with their counts
+        for flag in ("pair_cap", "basket_cap", "global_daily_kill", "drawdown_halt"):
+            row = [l for l in out.splitlines() if l.startswith(f"| {flag} |")][0]
+            self.assertIn("| 1 |", row)
+        # counterfactual attribution is per (book, symbol): one cooldown veto
+        # per symbol -> 2 vetoes total
+        cooldown = [l for l in out.splitlines() if l.startswith("| cooldown |")][0]
+        self.assertIn("| 2 |", cooldown)
+
+
 if __name__ == "__main__":
     unittest.main()
 

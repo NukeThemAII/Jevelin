@@ -672,5 +672,72 @@ class DualBookCycle(unittest.TestCase):
         self.assertIn("round trips:", text)
 
 
+# -- M5 portfolio risk gates (perps) ----------------------------------------
+
+def _risk(**overrides):
+    kw = dict(global_daily_kill=False, drawdown_halt=False,
+              pair_remaining=10_000.0, basket_remaining_long=10_000.0,
+              basket_remaining_short=10_000.0, min_position_pct=0.01)
+    kw.update(overrides)
+    return kw
+
+
+class PortfolioRiskPerps(unittest.TestCase):
+    """M5: pair/basket caps are side-aware; exits never risk-blocked."""
+
+    def test_kill_blocks_both_sides(self):
+        for v in (_long_v(), _short_v()):
+            d = decide_perps(v, _flat(), CFG, NOW, None, regime="trend_up",
+                             risk=_risk(global_daily_kill=True))
+            self.assertEqual(d["action"], "skip")
+            self.assertIn("global_daily_kill", d["vetoed_by"])
+
+    def test_side_basket_caps(self):
+        # long basket dry -> short entries still allowed on a strong short
+        d = decide_perps(_short_v(), _flat(), CFG, NOW, None, regime="trend_down",
+                         risk=_risk(basket_remaining_long=0.0))
+        self.assertEqual(d["action"], "enter_short")
+        # ... and the long side is vetoed with the basket_cap bit
+        d = decide_perps(_long_v(), _flat(), CFG, NOW, None, regime="trend_up",
+                         risk=_risk(basket_remaining_long=0.0))
+        self.assertEqual(d["action"], "skip")
+        self.assertIn("basket_cap", d["vetoed_by"])
+        self.assertTrue(d["veto_bitmask"] & int(VetoFlags.BASKET_CAP))
+        # both baskets dry -> shared veto on both sides
+        for v in (_long_v(), _short_v()):
+            d = decide_perps(v, _flat(), CFG, NOW, None, regime="trend_up",
+                             risk=_risk(basket_remaining_long=0.0,
+                                        basket_remaining_short=0.0))
+            self.assertEqual(d["action"], "skip")
+            self.assertIn("basket_cap", d["vetoed_by"])
+
+    def test_margin_clamped_by_pair_cap(self):
+        # margin target 0.10 x 10000 = 1000; pair remaining 250 -> 0.025
+        d = decide_perps(_long_v(), _flat(), CFG, NOW, None, regime="trend_up",
+                         risk=_risk(pair_remaining=250.0))
+        self.assertEqual(d["action"], "enter_long")
+        self.assertEqual(d["size_fraction"], 0.025)
+
+    def test_margin_clamped_by_basket_cap(self):
+        d = decide_perps(_short_v(), _flat(), CFG, NOW, None, regime="trend_down",
+                         risk=_risk(basket_remaining_short=400.0))
+        self.assertEqual(d["action"], "enter_short")
+        self.assertEqual(d["size_fraction"], 0.04)
+
+    def test_dust_veto(self):
+        d = decide_perps(_long_v(), _flat(), CFG, NOW, None, regime="trend_up",
+                         risk=_risk(pair_remaining=50.0))
+        self.assertEqual(d["action"], "skip")
+        self.assertIn("pair_cap", d["vetoed_by"])
+
+    def test_exits_never_risk_blocked(self):
+        d = decide_perps(_verdict(dump_0_100=80.0), _held("long"), CFG, NOW, None,
+                         regime="trend_up",
+                         risk=_risk(global_daily_kill=True, drawdown_halt=True))
+        self.assertEqual(d["action"], "exit")
+        self.assertEqual(d["vetoed_by"], [])
+        self.assertEqual(d["veto_bitmask"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

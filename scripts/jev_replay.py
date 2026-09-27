@@ -73,30 +73,38 @@ def _stats_from_rows(rows) -> dict:
 
 
 def store_book_stats(conn) -> dict:
-    """Per-book M0 accounting over the stored trades table."""
-    stats = {book: _stats_from_rows([]) for book in BOOKS}
-    for book in BOOKS:
-        rows = jev_store.list_trades(conn, book=book)
-        stats[book] = _stats_from_rows(rows)
-    return stats
+    """Per (book, symbol) M0 accounting over the stored trades table (M5)."""
+    grouped = {}
+    for row in jev_store.list_trades(conn):
+        key = (row.get("book"), str(row.get("symbol") or "unknown"))
+        grouped.setdefault(key, []).append(row)
+    return {key: _stats_from_rows(rows) for key, rows in grouped.items()}
 
 
 def jsonl_book_stats(runtime_dir) -> dict:
-    """Per-book M0 accounting straight from the JSONL logs (via jev_summary)."""
+    """Per (book, symbol) M0 accounting straight from the JSONL logs (M5)."""
     trades, _decisions = jev_summary._collect(Path(runtime_dir))
-    return {book: jev_summary._book_stats(trades[book]) for book in BOOKS}
+    return {key: jev_summary._book_stats(rows) for key, rows in trades.items()}
+
+
+def _empty_stats() -> dict:
+    return {"trips": 0, "gross": 0.0, "fees": 0.0, "slippage": 0.0,
+            "funding": 0.0, "net": 0.0}
 
 
 def compare_summary(conn, runtime_dir) -> list:
-    """(book, metric, store, jsonl, match) rows over the six M0 stats."""
+    """(book, symbol, metric, store, jsonl, match) rows over the six M0 stats."""
     store = store_book_stats(conn)
     logged = jsonl_book_stats(runtime_dir)
+    groups = sorted(set(store) | set(logged), key=jev_summary._group_order)
     out = []
-    for book in BOOKS:
+    for group in groups:
+        s = store.get(group, _empty_stats())
+        j = logged.get(group, _empty_stats())
         for label, key in METRICS:
-            a, b = store[book][key], logged[book][key]
+            a, b = s[key], j[key]
             match = abs(float(a) - float(b)) < EPSILON
-            out.append((book, label, a, b, match))
+            out.append((group[0], group[1], label, a, b, match))
     return out
 
 def _fmt(value) -> str:
@@ -124,9 +132,9 @@ def print_summary(db_path, runtime_dir) -> int:
           "net = realized - funding")
     print("note: rows written before M0 carry no fee/slippage fields and count as 0.")
     print()
-    print(f"{'book':<8}{'metric':<14}{'store':>12}{'jsonl':>12}  match")
-    for book, label, a, b, match in rows:
-        print(f"{book:<8}{label:<14}{_fmt(a):>12}{_fmt(b):>12}"
+    print(f"{'book':<8}{'symbol':<10}{'metric':<14}{'store':>12}{'jsonl':>12}  match")
+    for book, symbol, label, a, b, match in rows:
+        print(f"{book:<8}{symbol:<10}{label:<14}{_fmt(a):>12}{_fmt(b):>12}"
               f"  {'OK' if match else 'DIFF'}")
     print()
     bad = sum(1 for *_x, match in rows if not match)

@@ -220,5 +220,50 @@ class EmptyRuntime(ImportTestBase):
         self.assertEqual(stats["totals"]["bad"], 0)
 
 
+class MultiPairTrades(ImportTestBase):
+    """M5: same-ts fills from DIFFERENT pairs must never collide in the store."""
+
+    def _write_three(self):
+        rows = [dict(M0_SPOT, symbol=s) for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT")]
+        self._write("paper_btc.json.trades.jsonl", [_line(rows[0])])
+        self._write("paper_eth.json.trades.jsonl", [_line(rows[1])])
+        self._write("paper_sol.json.trades.jsonl", [_line(rows[2])])
+
+    def test_same_ts_different_symbols_all_import(self):
+        self._write_three()
+        stats = self._import()
+        self.assertEqual(stats["totals"]["new"], 3)
+        self.assertEqual(stats["totals"]["bad"], 0)
+        self.assertEqual({r["symbol"] for r in jev_store.list_trades(self.conn)},
+                         {"BTCUSDT", "ETHUSDT", "SOLUSDT"})
+
+    def test_reimport_no_dupes_multi_pair(self):
+        self._write_three()
+        self._import()
+        second = self._import()
+        self.assertEqual(second["totals"]["new"], 0)
+        self.assertEqual(len(jev_store.list_trades(self.conn)), 3)
+
+    def test_same_symbol_same_ts_still_dedupes(self):
+        # unchanged single-pair semantics: the same row never duplicates
+        self._write("paper_btc.json.trades.jsonl", [_line(M0_SPOT)])
+        self._import()
+        self._import()
+        self.assertEqual(len(jev_store.list_trades(self.conn)), 1)
+
+    def test_legacy_dedup_index_is_migrated(self):
+        # simulate an M1-era DB whose unique key lacks the symbol column
+        self.conn.execute("DROP INDEX idx_trades_dedup")
+        self.conn.execute("CREATE UNIQUE INDEX idx_trades_dedup ON trades "
+                          "(book, ts, side, COALESCE(reason, ''))")
+        self.conn.commit()
+        jev_store.create_schema(self.conn)  # migration replaces the legacy key
+        self._write_three()
+        stats = self._import()
+        self.assertEqual(stats["totals"]["new"], 3)
+        second = self._import()
+        self.assertEqual(second["totals"]["new"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
