@@ -17,9 +17,10 @@ config_version: 4
 pairs: [BTCUSDT, ETHUSDT, SOLUSDT]
 
 # M6 CoinGecko discovery scout (scripts/jev_scout.py) — discovery only:
-# CoinGecko tells us WHERE to look, never WHAT to do. Two GETs per pass max,
-# plus per-candidate Binance calls. ``enabled`` is the kill-switch for the
-# scout and for the supervisor's --universe scout mode.
+# CoinGecko tells us WHERE to look, never WHAT to do. At most 3 CoinGecko
+# GETs per pass (trending + its market rows + the Pool B gainers scan), plus
+# per-candidate Binance calls. ``enabled`` is the kill-switch for the scout
+# and for the supervisor's --universe scout mode.
 scout:
   enabled: true
   quote: USDT
@@ -27,6 +28,11 @@ scout:
   min_listing_age_days: 30       # first daily candle must be >= 30 days old
   max_pairs: 5                   # cap on the final ranked list
   interval_seconds: 3600         # expected pass cadence (staleness = 2x)
+  gainers_enabled: true          # Pool B: market-movers scan (M6+)
+  gainers_per_page: 100          # Pool B pool width (fallback scan: top-250 by
+                                 # volume fetched, top min(this, 50) movers by
+                                 # |24h change| kept - junk-density lower than
+                                 # ideal; CG ignores the price-change order)
 
 # M5 portfolio risk (scripts/jev_risk.py) — deterministic, Jev never touches it.
 # Caps are fractions of equity; entries are blocked at/over the cap, exits and

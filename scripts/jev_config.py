@@ -178,6 +178,11 @@ class ScoutConfig:
     min_listing_age_days: float = 30.0     # first daily candle age floor
     max_pairs: int = 5                     # cap on the final ranked list
     interval_seconds: float = 3600.0       # expected pass cadence (staleness)
+    # M6+ Pool B (market-movers seed pool — spec fallback scan: top-250 by
+    # volume, top movers by |24h change| kept; junk-density lower than ideal);
+    # gainers_enabled=false -> Pool A only, exactly the M6 behavior.
+    gainers_enabled: bool = True
+    gainers_per_page: int = 100  # Pool B pool width (kept <= 50 in fallback)
 
 
 @dataclass(frozen=True)
@@ -390,6 +395,7 @@ _RANGES = {
     "min_position_pct": (0.0, 1.0),
     "min_24h_vol_usd": (0.0, None), "min_listing_age_days": (0.0, None),
     "max_pairs": (1, None), "interval_seconds": (0.0, None),
+    "gainers_per_page": (1, None),
 }
 _COUNTER_TREND = ("block", "allow")
 

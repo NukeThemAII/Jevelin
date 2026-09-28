@@ -9,6 +9,13 @@ malformed JSON -> keep last good list, never crash the trading loop), the
 opt-in supervisor scout universe (fresh/stale/empty/fallback/retention) and the
 scout config section.
 
+M6+ additions: Pool B market-gainers seed pool (merge + dedup + seed tags,
+exactly one extra GET, HTTP-failure fail-safe), the honest junk-rejection
+metric (``over_cap`` excluded - a capped survivor is NOT junk) and the hard
+filter-correctness gate (asserted at selection; boundary + NaN fault
+fixtures), plus byte-for-byte M6 compatibility when the gainers pool is
+off/absent.
+
 Run: .venv/bin/python scripts/test_jev_scout.py -v
 """
 import contextlib
@@ -37,13 +44,46 @@ SHIPPED_YAML = Path(__file__).resolve().parent.parent / "config" / "v2.yaml"
 PASS_TS = 1_800_000_000.0            # fixed pass timestamp (deterministic age math)
 DAY_MS = 86_400_000
 
+# M6 (commit cda71a5) reference bytes on poolb_fixture() with the gainers pool
+# OFF — produced by running the M6 module over these exact fixtures, never
+# hand-edited. The gainers_enabled:false / Pool-B-absent path must reproduce
+# them byte-for-byte.
+M6_DISABLED_CANDIDATES_JSON = (
+    '[{"binance_quote_volume_usd":400000000.0,"candidate_score":0.5,'
+    '"cg_symbol":"btc","cg_volume_24h_usd":900000000.0,'
+    '"change_rank_norm":0.0,"coingecko_id":"bitcoin",'
+    '"listing_age_days":120.0,"market_cap_usd":1000000.0,"name":"Bitcoin",'
+    '"price_change_24h_pct":2.0,"rank":1,"reject_reason":null,'
+    '"selected":true,"symbol":"BTCUSDT","vol_rank_norm":1.0},'
+    '{"binance_quote_volume_usd":300000000.0,"candidate_score":0.5,'
+    '"cg_symbol":"eth","cg_volume_24h_usd":600000000.0,'
+    '"change_rank_norm":1.0,"coingecko_id":"ethereum",'
+    '"listing_age_days":120.0,"market_cap_usd":1000000.0,"name":"Ethereum",'
+    '"price_change_24h_pct":-9.0,"rank":2,"reject_reason":null,'
+    '"selected":true,"symbol":"ETHUSDT","vol_rank_norm":0.0}]')
+M6_DISABLED_RANKED_JSON = M6_DISABLED_CANDIDATES_JSON  # identical bytes here
+M6_DISABLED_FUNNEL_JSON = (
+    '{"filtered":2,"mapped":2,"ranked":2,"reject_reasons":{},'
+    '"rejected":0,"rejected_junk_rate":0.0,"trending":2}')
+M6_DISABLED_REPORT = (
+    'scout pass 20270115T080000Z (2027-01-15T08:00:00Z)\n'
+    'coin         symbol     status   rank reject_reason             vol24h$'
+    '   chg24h%   age_d    score\n'
+    'btc          BTCUSDT    selected    1 -                       900000000'
+    '      2.00   120.0 0.500000\n'
+    'eth          ETHUSDT    selected    2 -                       600000000'
+    '     -9.00   120.0 0.500000\n'
+    'funnel: trending=2 mapped=2 filtered=2 ranked=2\n'
+    'rejected-junk rate: 0/2 = 0.0% (rejects / trending seeds)')
+
 # -- fixtures (raw CoinGecko/Binance inputs; never live) ----------------------
 
 class Fixture:
     """Assembles the exact raw-input dict evaluate_pass() consumes."""
 
     def __init__(self):
-        self.coins = []          # (cid, cg_symbol, name) trending seeds, in order
+        self.coins = []          # (cid, cg_symbol, name) Pool A trending seeds
+        self.gainers = []        # Pool B gainers seed cids, in scan order
         self.markets = {}        # cid -> coins/markets row
         self.tickers = {}        # "BASE/USDT" -> {"quoteVolume": ...}
         self.ohlcv = {}          # "BASEUSDT" -> first candle ts (ms)
@@ -52,11 +92,18 @@ class Fixture:
         self.coins.append((cid, sym, name if name is not None else cid.title()))
         return self
 
-    def market(self, cid, sym, volume, change, mcap=1_000_000.0):
-        self.markets[cid] = {"id": cid, "symbol": sym, "total_volume": volume,
+    def market(self, cid, sym, volume, change, mcap=1_000_000.0, name=None):
+        self.markets[cid] = {"id": cid, "symbol": sym,
+                             "name": name if name is not None else cid.title(),
+                             "total_volume": volume,
                              "price_change_percentage_24h": change,
                              "market_cap": mcap}
         return self
+
+    def gainer(self, cid, sym, volume, change, mcap=1_000_000.0, name=None):
+        """Pool B (market-gainers scan) row, appended in scan order."""
+        self.gainers.append(cid)
+        return self.market(cid, sym, volume, change, mcap=mcap, name=name)
 
     def listed(self, sym, quote_volume=10_000_000.0, age_days=60.0,
                pass_ts=PASS_TS):
@@ -71,9 +118,11 @@ class Fixture:
         trending = json.dumps({"coins": [
             {"item": {"id": cid, "symbol": sym, "name": name}}
             for cid, sym, name in self.coins]})
+        gainers = json.dumps([self.markets[cid] for cid in self.gainers])
         return {
             "search_trending": trending,
             "coins_markets": json.dumps(list(self.markets.values())),
+            "coins_markets_gainers": gainers,
             "binance_tickers": json.dumps(self.tickers),
             "binance_ohlcv": {pair: json.dumps(
                 [[ts + i * DAY_MS, 1.0, 1.0, 1.0, 1.0, 1.0] for i in range(2)])
@@ -106,6 +155,31 @@ def standard_fixture():
     return f
 
 
+def poolb_fixture():
+    """Pool A (2 trending) + Pool B (5 market-gainers, junk-heavy) -> 6 unique.
+
+    bitcoin rides BOTH pools (dedup -> one candidate, seed=trending+gainers).
+    Gainers-only junk: mooncoin -> young_listing, ghostcoin ->
+    not_binance_listed, pepecoin -> low_volume. Solana is the one clean
+    gainers survivor. Hand-computed funnel + junk metric in the metric tests.
+    """
+    f = Fixture()
+    f.seed("bitcoin", "btc").seed("ethereum", "eth")
+    f.market("bitcoin", "btc", 900_000_000.0, 2.0)
+    f.market("ethereum", "eth", 600_000_000.0, -9.0)
+    f.gainer("bitcoin", "btc", 900_000_000.0, 2.0)      # in BOTH pools
+    f.gainer("mooncoin", "moon", 50_000_000.0, 88.0)    # -> young_listing
+    f.gainer("ghostcoin", "ghost", 50_000_000.0, 77.0)  # -> not_binance_listed
+    f.gainer("pepecoin", "pepe", 50_000_000.0, 66.0)    # -> low_volume
+    f.gainer("solana", "sol", 300_000_000.0, 55.0)      # clean survivor
+    f.listed("BTC", 400_000_000.0, 120.0)
+    f.listed("ETH", 300_000_000.0, 120.0)
+    f.listed("SOL", 20_000_000.0, 120.0)
+    f.listed("MOON", 10_000_000.0, age_days=10.0)       # young listing
+    f.listed("PEPE", 4_000_000.0, 120.0)                # below the 5M floor
+    return f
+
+
 def by_symbol(candidates):
     return {c["symbol"] or c["cg_symbol"]: c for c in candidates}
 
@@ -123,6 +197,8 @@ class FakeFetcher:
             if key in url:
                 if isinstance(val, Exception):
                     raise val
+                if callable(val):        # param-aware routing (two /coins/markets)
+                    return val(params)
                 return val
         raise AssertionError(f"unexpected url {url}")
 
@@ -174,11 +250,26 @@ def ccxt_pair(bsym):
     return f"{bsym[:-4]}/USDT" if bsym.endswith("USDT") else bsym
 
 
+class MarketRouter:
+    """Routes the two /coins/markets GETs: Pool A (ids=) vs Pool B (order=)."""
+
+    def __init__(self, pool_a, pool_b):
+        self.pool_a = pool_a
+        self.pool_b = pool_b          # response text or Exception to raise
+
+    def __call__(self, params):
+        target = self.pool_b if (params and "order" in params) else self.pool_a
+        if isinstance(target, Exception):
+            raise target
+        return target
+
+
 def fixture_fetcher(f):
     raws = f.raws()
     return FakeFetcher({
         "search/trending": raws["search_trending"],
-        "coins/markets": raws["coins_markets"],
+        "coins/markets": MarketRouter(raws["coins_markets"],
+                                      raws["coins_markets_gainers"]),
     }), FakeExchange(
         tickers=json.loads(raws["binance_tickers"]),
         ohlcv={ccxt_pair(pair): json.loads(text)
@@ -363,24 +454,312 @@ class CapTests(unittest.TestCase):
         self.assertEqual(reasons["new"], "young_listing")
 
 
+class SeedPoolMergeTests(unittest.TestCase):
+    """M6+: Pool A u Pool B, deduped by CoinGecko id, tagged with ``seed``."""
+
+    def test_pool_a_and_pool_b_union_deduped_by_coingecko_id(self):
+        out = evaluate(poolb_fixture())
+        ids = [c["coingecko_id"] for c in out["candidates"]]
+        self.assertEqual(ids, ["bitcoin", "ethereum", "mooncoin",
+                               "ghostcoin", "pepecoin", "solana"])
+        self.assertEqual(len(ids), len(set(ids)))   # bitcoin counts ONCE
+
+    def test_seed_tags_mark_pool_membership(self):
+        tags = {c["coingecko_id"]: c["seed"]
+                for c in evaluate(poolb_fixture())["candidates"]}
+        self.assertEqual(tags["bitcoin"], "trending+gainers")
+        self.assertEqual(tags["ethereum"], "trending")
+        self.assertEqual(tags["mooncoin"], "gainers")
+
+    def test_gainers_only_coins_enter_the_funnel(self):
+        out = evaluate(poolb_fixture())
+        by = by_symbol(out["candidates"])
+        self.assertEqual(by["MOONUSDT"]["reject_reason"], "young_listing")
+        self.assertEqual(by["GHOSTUSDT"]["reject_reason"], "not_binance_listed")
+        self.assertEqual(by["PEPEUSDT"]["reject_reason"], "low_volume")
+        # the 3 survivors all score exactly 0.5 (vol rank mirrors |change|
+        # rank) -> the lexicographic tie-break decides: BTC, ETH, SOL
+        self.assertEqual([c["symbol"] for c in out["ranked"]],
+                         ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+
+    def test_pool_b_fetch_is_exactly_one_extra_request(self):
+        f = poolb_fixture()
+        fetcher, exchange = fixture_fetcher(f)
+        with tempfile.TemporaryDirectory() as tmp:
+            record = jev_scout.run_scout_pass(
+                ScoutConfig(), fetcher=fetcher, exchange=exchange,
+                now=PASS_TS, cache_dir=Path(tmp) / "cache", quiet=True)
+        self.assertTrue(record["ok"])
+        market_calls = [c for c in fetcher.calls if "coins/markets" in c[0]]
+        self.assertEqual(len(market_calls), 2)  # 1 pool A + 1 pool B, never more
+        gainers = [c for c in market_calls if c[1] and "order" in c[1]]
+        self.assertEqual(len(gainers), 1)
+        # the live-verified fallback request (CG ignores the price-change
+        # order values; volume_desc is honored — see the M6+ smoke report)
+        self.assertEqual(gainers[0][1],
+                         {"vs_currency": "usd", "order": "volume_desc",
+                          "per_page": "250", "page": "1"})
+
+    def test_gainers_disabled_makes_no_pool_b_request(self):
+        f = poolb_fixture()
+        fetcher, exchange = fixture_fetcher(f)
+        with tempfile.TemporaryDirectory() as tmp:
+            record = jev_scout.run_scout_pass(
+                ScoutConfig(gainers_enabled=False), fetcher=fetcher,
+                exchange=exchange, now=PASS_TS,
+                cache_dir=Path(tmp) / "cache", quiet=True)
+        self.assertTrue(record["ok"])
+        self.assertEqual(len(fetcher.calls), 2)  # trending + pool A markets only
+
+    def test_parse_gainers_keeps_top_movers_by_abs_change(self):
+        rows = [{"id": "pump", "symbol": "p",
+                 "price_change_percentage_24h": 250.0},
+                {"id": "dump", "symbol": "d",
+                 "price_change_percentage_24h": -180.0},
+                {"id": "calm", "symbol": "c",
+                 "price_change_percentage_24h": -2.0},
+                {"id": "flat", "symbol": "f",
+                 "price_change_percentage_24h": 1.0}]
+        seeds = jev_scout.parse_gainers(json.dumps(rows), 3)
+        self.assertEqual([s["id"] for s in seeds], ["pump", "dump", "calm"])
+
+    def test_parse_gainers_ties_broken_by_id_and_nulls_sort_last(self):
+        rows = [{"id": "b", "price_change_percentage_24h": 5.0},
+                {"id": "a", "price_change_percentage_24h": -5.0},
+                {"id": "z", "price_change_percentage_24h": None}]
+        seeds = jev_scout.parse_gainers(json.dumps(rows))
+        self.assertEqual([s["id"] for s in seeds], ["a", "b", "z"])
+
+    def test_parse_gainers_rejects_malformed(self):
+        with self.assertRaises(jev_scout.ScoutDataError):
+            jev_scout.parse_gainers("{\"nope\": 1}", 100)
+
+    def test_gainers_per_page_caps_the_kept_pool(self):
+        out = evaluate(poolb_fixture(), ScoutConfig(gainers_per_page=2))
+        self.assertEqual(out["funnel"]["gainers"], 2)   # top-2 movers kept
+        self.assertEqual([c["coingecko_id"] for c in out["candidates"]],
+                         ["bitcoin", "ethereum", "mooncoin", "ghostcoin"])
+
+
+class JunkMetricTests(unittest.TestCase):
+    """M6+: junk-rejection rate = junk rejects / unique candidates (honest).
+
+    ``over_cap`` rejects are qualified-but-capped survivors, NOT junk (see
+    REJECT_OVER_CAP), so they never count toward junk rejection — counting
+    them would make the metric mechanical cap arithmetic. Anti-gaming: the
+    definition is fixed here and reported as-is, never tuned upward.
+    """
+
+    def test_junk_rejection_formula_with_known_rejects(self):
+        out = evaluate(poolb_fixture(), ScoutConfig(max_pairs=1))
+        f = out["funnel"]
+        self.assertEqual(f["trending"], 2)
+        self.assertEqual(f["gainers"], 5)
+        self.assertEqual(f["unique_candidates"], 6)  # bitcoin deduped
+        self.assertEqual(f["mapped"], 6)
+        self.assertEqual(f["filtered"], 3)
+        self.assertEqual(f["ranked"], 1)
+        self.assertEqual(f["reject_reasons"],
+                         {"low_volume": 1, "not_binance_listed": 1,
+                          "young_listing": 1, "over_cap": 2})
+        self.assertEqual(f["rejected"], 5)        # incl. over_cap (bookkeeping)
+        self.assertEqual(f["junk_rejected"], 3)   # over_cap is NOT junk
+        self.assertEqual(f["junk_rejection_rate"], 0.5)  # 3 / 6 unique
+        self.assertTrue(f["filter_correctness"])
+
+    def test_format_report_shows_pools_separately_and_both_metrics(self):
+        f = poolb_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            record = run_pass(f, cache_dir=Path(tmp) / "cache")
+        text = jev_scout.format_report(record)
+        for needle in ("funnel: trending=2 gainers=5 unique_candidates=6",
+                       "mapped=6 filtered=3 ranked=3",
+                       "reject reasons: low_volume=1 not_binance_listed=1 "
+                       "young_listing=1",
+                       "junk-rejection rate: 3/6 = 50.0% "
+                       "(rejects / unique candidates)",
+                       "filter correctness: all 3 selected pass vol+age "
+                       "floors: YES   <- hard gate"):
+            self.assertIn(needle, text)
+
+
+class HardGateTests(unittest.TestCase):
+    """M6+ acceptance #1 (HARD): every selected pair clears vol+age floors."""
+
+    def entry(self, vol=5_000_000.0, age=30.0):
+        return {"symbol": "MOONUSDT", "binance_quote_volume_usd": vol,
+                "listing_age_days": age}
+
+    def test_boundary_exactly_at_both_floors_passes(self):
+        jev_scout.assert_filter_correctness([self.entry()], ScoutConfig())
+        self.assertTrue(
+            jev_scout.filter_correctness([self.entry()], ScoutConfig()))
+
+    def test_volume_just_below_floor_raises(self):
+        with self.assertRaises(jev_scout.ScoutHardGateError) as ctx:
+            jev_scout.assert_filter_correctness(
+                [self.entry(vol=4_999_999.99)], ScoutConfig())
+        self.assertIn("MOONUSDT", str(ctx.exception))
+
+    def test_age_just_below_floor_raises(self):
+        with self.assertRaises(jev_scout.ScoutHardGateError):
+            jev_scout.assert_filter_correctness(
+                [self.entry(age=29.999)], ScoutConfig())
+
+    def test_missing_and_nan_values_violate(self):
+        for bad in ({"symbol": "X", "binance_quote_volume_usd": None,
+                     "listing_age_days": 30.0},
+                    {"symbol": "X", "binance_quote_volume_usd": float("nan"),
+                     "listing_age_days": 30.0},
+                    {"symbol": "X", "binance_quote_volume_usd": 5_000_000.0,
+                     "listing_age_days": float("nan")}):
+            self.assertFalse(
+                jev_scout.filter_correctness([bad], ScoutConfig()))
+            with self.assertRaises(jev_scout.ScoutHardGateError):
+                jev_scout.assert_filter_correctness([bad], ScoutConfig())
+
+    def test_fault_fixture_nan_volume_fires_hard_gate(self):
+        # NaN slips the `<` volume filter but can never prove the floor.
+        f = Fixture().seed("mooncoin", "moon")
+        f.market("mooncoin", "moon", 50_000_000.0, 4.0)
+        f.listed("MOON", 10_000_000.0, 120.0)
+        f.tickers["MOON/USDT"] = {"quoteVolume": float("nan")}
+        with self.assertRaises(jev_scout.ScoutHardGateError):
+            evaluate(f)
+
+    def test_fault_fixture_nan_age_fires_hard_gate(self):
+        f = Fixture().seed("mooncoin", "moon")
+        f.market("mooncoin", "moon", 50_000_000.0, 4.0)
+        f.listed("MOON", 10_000_000.0, 120.0)
+        f.ohlcv["MOONUSDT"] = float("nan")   # unverifiable age -> gate fires
+        with self.assertRaises(jev_scout.ScoutHardGateError):
+            evaluate(f)
+
+    def test_hard_gate_fails_the_pass_loudly_without_crashing(self):
+        f = Fixture().seed("mooncoin", "moon")
+        f.market("mooncoin", "moon", 50_000_000.0, 4.0)
+        f.listed("MOON", 10_000_000.0, 120.0)
+        f.tickers["MOON/USDT"] = {"quoteVolume": float("nan")}
+        with tempfile.TemporaryDirectory() as tmp:
+            record = run_pass(f, cache_dir=Path(tmp) / "cache")
+        self.assertFalse(record["ok"])        # loud failure, never a crash
+        self.assertIn("filter-correctness gate", record["error"])
+
+    def test_report_renders_no_when_correctness_false(self):
+        record = {"run_id": "x", "ts": PASS_TS, "ok": True,
+                  "candidates": [], "ranked": [],
+                  "funnel": {"trending": 1, "gainers": 0,
+                             "unique_candidates": 1, "mapped": 1,
+                             "filtered": 1, "ranked": 1, "rejected": 0,
+                             "reject_reasons": {}, "junk_rejected": 0,
+                             "junk_rejection_rate": 0.0,
+                             "filter_correctness": False}}
+        self.assertIn("floors: NO   <- hard gate",
+                      jev_scout.format_report(record))
+
+
+class PoolBFailureTests(unittest.TestCase):
+    """M6+: a Pool B fetch failure must never take the scout/loop down."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self._tmp.name) / "scout_cache"
+        self.conn = jev_store.connect(":memory:")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_with_pool_b(self, pool_b, quiet=True):
+        f = poolb_fixture()
+        fetcher, exchange = fixture_fetcher(f)
+        fetcher.responses["coins/markets"].pool_b = pool_b
+        return jev_scout.run_scout_pass(
+            ScoutConfig(), fetcher=fetcher, exchange=exchange, now=PASS_TS,
+            cache_dir=self.cache, conn=self.conn, quiet=quiet)
+
+    def test_pool_b_http_failure_fails_safe(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            record = self.run_with_pool_b(
+                jev_scout.ScoutFetchError("429 rate limited"), quiet=False)
+        self.assertTrue(record["ok"])                  # pass stays valid
+        self.assertIn("429", record["pool_b_error"])   # error logged
+        self.assertIn("Pool A only", out.getvalue())
+        self.assertEqual(record["funnel"]["trending"], 2)
+        self.assertNotIn("unique_candidates", record["funnel"])
+        self.assertEqual([c["coingecko_id"] for c in record["ranked"]],
+                         ["bitcoin", "ethereum"])
+        self.assertEqual(jev_store.latest_scout_run(self.conn)["ok"], 1)
+
+    def test_pool_b_malformed_json_fails_the_pass_loudly(self):
+        record = self.run_with_pool_b("{not json!!")
+        self.assertFalse(record["ok"])
+        self.assertIn("malformed", record["error"])
+
+
+class GainersDisabledByteForByteTests(unittest.TestCase):
+    """gainers_enabled:false (or Pool B raw absent) == M6 (cda71a5) exactly."""
+
+    def disabled_out(self):
+        return evaluate(poolb_fixture(), ScoutConfig(gainers_enabled=False))
+
+    def absent_out(self):
+        f = poolb_fixture()
+        raws = f.raws()
+        raws.pop("coins_markets_gainers")  # pre-M6+ cached pass: no Pool B raw
+        return jev_scout.evaluate_pass(raws, PASS_TS, ScoutConfig())
+
+    def test_candidates_json_byte_identical_to_m6(self):
+        for out in (self.disabled_out(), self.absent_out()):
+            self.assertEqual(
+                jev_scout.candidates_json_text(out["candidates"]),
+                M6_DISABLED_CANDIDATES_JSON)
+
+    def test_ranked_json_byte_identical_to_m6(self):
+        for out in (self.disabled_out(), self.absent_out()):
+            self.assertEqual(jev_scout.ranked_json_text(out["ranked"]),
+                             M6_DISABLED_RANKED_JSON)
+
+    def test_funnel_byte_identical_to_m6(self):
+        for out in (self.disabled_out(), self.absent_out()):
+            self.assertEqual(json.dumps(out["funnel"], sort_keys=True,
+                                        separators=(",", ":")),
+                             M6_DISABLED_FUNNEL_JSON)
+
+    def test_report_byte_identical_to_m6(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = run_pass(poolb_fixture(),
+                              cfg=ScoutConfig(gainers_enabled=False),
+                              cache_dir=Path(tmp) / "cache")
+        self.assertEqual(jev_scout.format_report(record), M6_DISABLED_REPORT)
+
+
 class FunnelTests(unittest.TestCase):
     def test_funnel_counts(self):
         out = evaluate(standard_fixture())
         self.assertEqual(out["funnel"],
-                         {"trending": 7, "mapped": 6, "filtered": 4,
-                          "ranked": 4, "rejected": 3,
+                         {"trending": 7, "gainers": 0, "unique_candidates": 7,
+                          "mapped": 6, "filtered": 4, "ranked": 4,
+                          "rejected": 3,
                           "reject_reasons": {"trending_only": 1,
                                              "not_binance_listed": 1,
                                              "young_listing": 1},
-                          "rejected_junk_rate": 3 / 7})
+                          "junk_rejected": 3,
+                          "junk_rejection_rate": 3 / 7,
+                          "filter_correctness": True})
 
     def test_format_report_shows_funnel_and_junk_rate(self):
         f = standard_fixture()
         with tempfile.TemporaryDirectory() as tmp:
             record = run_pass(f, cache_dir=Path(tmp) / "cache")
         text = jev_scout.format_report(record)
-        for needle in ("trending=7", "mapped=6", "filtered=4", "ranked=4",
-                       "not_binance_listed", "rejected-junk rate"):
+        for needle in ("funnel: trending=7 gainers=0 unique_candidates=7",
+                       "mapped=6", "filtered=4", "ranked=4",
+                       "not_binance_listed",
+                       "junk-rejection rate: 3/7 = 42.9% "
+                       "(rejects / unique candidates)",
+                       "filter correctness: all 4 selected pass vol+age "
+                       "floors: YES   <- hard gate"):
             self.assertIn(needle, text)
 
 # -- raw cache + persistence + --replay reproducibility -----------------------
@@ -404,6 +783,7 @@ class CacheReplayTests(unittest.TestCase):
         self.assertTrue(any("-coins_markets.json" in n for n in files))
         self.assertTrue(any("-binance_tickers.json" in n for n in files))
         self.assertTrue(any("-binance_ohlcv_" in n for n in files))
+        self.assertTrue(any("-coins_markets_gainers.json" in n for n in files))
 
     def test_run_pass_persists_scout_run(self):
         record = run_pass(standard_fixture(), cache_dir=self.cache,
@@ -437,6 +817,17 @@ class CacheReplayTests(unittest.TestCase):
         one = jev_scout.replay_pass(record["run_id"], cache_dir=self.cache)
         two = jev_scout.replay_pass(record["run_id"], cache_dir=self.cache)
         self.assertEqual(one["ranked_json"], two["ranked_json"])
+
+    def test_replay_byte_identical_with_pool_tags(self):
+        record = run_pass(poolb_fixture(), cache_dir=self.cache,
+                          conn=self.conn)
+        out = jev_scout.replay_pass(record["run_id"], cache_dir=self.cache,
+                                    conn=self.conn)
+        self.assertIs(out["match_stored"], True)
+        self.assertIn('"seed":"trending+gainers"', record["candidates_json"])
+        again = jev_scout.replay_pass(record["run_id"], cache_dir=self.cache)
+        self.assertEqual(out["ranked_json"], again["ranked_json"])
+        self.assertEqual(out["candidates_json"], again["candidates_json"])
 
     def test_replay_cli_reports_reproducible(self):
         record = run_pass(standard_fixture(), cache_dir=self.cache,
@@ -823,6 +1214,8 @@ class ScoutConfigTests(unittest.TestCase):
         self.assertEqual(s.min_listing_age_days, 30.0)
         self.assertEqual(s.max_pairs, 5)
         self.assertEqual(s.interval_seconds, 3600.0)
+        self.assertTrue(s.gainers_enabled)
+        self.assertEqual(s.gainers_per_page, 100)
 
     def test_scout_yaml_overrides(self):
         cfg = load_config(_write_cfg(
@@ -833,6 +1226,21 @@ class ScoutConfigTests(unittest.TestCase):
         self.assertEqual(cfg.scout.quote, "USDC")
         self.assertEqual(cfg.scout.min_listing_age_days,
                          ScoutConfig().min_listing_age_days)
+
+    def test_gainers_yaml_overrides(self):
+        cfg = load_config(_write_cfg(
+            "config_version: 4\nscout:\n  gainers_enabled: false\n"
+            "  gainers_per_page: 50\n"))
+        self.assertFalse(cfg.scout.gainers_enabled)
+        self.assertEqual(cfg.scout.gainers_per_page, 50)
+
+    def test_gainers_enabled_must_be_bool(self):
+        self.assertConfigError("scout:\n  gainers_enabled: maybe\n",
+                               "gainers_enabled")
+
+    def test_gainers_per_page_must_be_positive(self):
+        self.assertConfigError("scout:\n  gainers_per_page: 0\n",
+                               "gainers_per_page")
 
     def assertConfigError(self, text, fragment):
         with self.assertRaises(ConfigError) as ctx:

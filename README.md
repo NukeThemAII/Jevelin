@@ -46,7 +46,7 @@ Key invariants:
 | Tests | 435/435 across 16 script suites + 18 upstream tests green |
 | Live pipeline | verified end-to-end on real Binance data |
 | Live decisions | e.g. `skip, vetoed_by=capitulation` — risk gates working on real state |
-| Pair discovery | M6 scout verified live + reproducible offline (`jev_scout.py --replay`) |
+| Pair discovery | M6+ scout: trending + market-movers seed pools, hard filter gate, reproducible offline (`jev_scout.py --replay`) |
 | Trading | **paper only** — no live orders, no profit claims yet |
 
 Numbers will come from accumulated paper stats. Until then, this page makes no PnL claims.
@@ -98,7 +98,7 @@ for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_
 - [x] Jev decision stack: client → questions → state → scorer → risk gates → paper books
 - [x] Dual-book paper loop (spot + perps) with full decision logging
 - [x] Multi-pair (BTC, ETH, SOL) + portfolio risk layer (caps, kill switches, drawdown halt)
-- [x] CoinGecko discovery scout (M6): reproducible pair-universe passes, opt-in `--universe scout`
+- [x] CoinGecko discovery scout (M6/M6+): dual seed pools + hard filter-correctness gate + honest junk-rejection metric, reproducible pair-universe passes, opt-in `--universe scout`
 - [ ] Telegram decision/trade feed
 - [ ] Analysis report: do Jev vetoes beat baseline? calibration check (M4 harness exists)
 - [ ] Promotion gate → live (tiny float, exchange-side stops, human-approved)
