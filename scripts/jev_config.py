@@ -35,7 +35,11 @@ SPOT_FEE_RATE = 0.001
 PERPS_TAKER_FEE_RATE = 0.0005
 SLIPPAGE_RATE = 0.0005
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
+# Loader accepts the previous schema too (v3 files predate the M6 scout
+# section and load with scout defaults); the file's declared version is
+# preserved as-is in V2Config.config_version.
+SUPPORTED_CONFIG_VERSIONS = (3, CONFIG_VERSION)
 
 # M5 default pair universe (config/v2.yaml ``pairs``; --pairs overrides).
 DEFAULT_PAIRS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
@@ -161,6 +165,22 @@ class PerpsConfig:
 
 
 @dataclass(frozen=True)
+class ScoutConfig:
+    """M6 CoinGecko discovery scout (B.4a) — WHERE to look, never WHAT to do.
+
+    ``enabled`` is the config-level kill-switch: the supervisor's opt-in
+    ``--universe scout`` mode and ``jev_scout.py`` refuse to run while it is
+    false (falling back to the static universe / exiting cleanly).
+    """
+    enabled: bool = True
+    quote: str = "USDT"
+    min_24h_vol_usd: float = 5_000_000.0   # Binance 24h quote volume floor
+    min_listing_age_days: float = 30.0     # first daily candle age floor
+    max_pairs: int = 5                     # cap on the final ranked list
+    interval_seconds: float = 3600.0       # expected pass cadence (staleness)
+
+
+@dataclass(frozen=True)
 class PortfolioConfig:
     """M5 portfolio risk thresholds (scripts/jev_risk.py) — B.3 / M5 spec.
 
@@ -191,6 +211,7 @@ class V2Config:
     spot: RiskConfig = field(default_factory=RiskConfig)
     perps: PerpsConfig = field(default_factory=PerpsConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
+    scout: ScoutConfig = field(default_factory=ScoutConfig)
 
     def to_dict(self) -> dict:
         """Nested plain dict (tuples -> lists) — the yaml-shape view."""
@@ -332,6 +353,7 @@ _SECTION_CLASSES = {
     "spot": RiskConfig,
     "perps": PerpsConfig,
     "portfolio": PortfolioConfig,
+    "scout": ScoutConfig,
 }
 
 # Inclusive numeric bounds per field name (None = unbounded). Every numeric
@@ -366,6 +388,8 @@ _RANGES = {
     "global_daily_loss": (-1.0, 1.0),
     "drawdown_halt": (0.0, 1.0), "drawdown_recover": (0.0, 1.0),
     "min_position_pct": (0.0, 1.0),
+    "min_24h_vol_usd": (0.0, None), "min_listing_age_days": (0.0, None),
+    "max_pairs": (1, None), "interval_seconds": (0.0, None),
 }
 _COUNTER_TREND = ("block", "allow")
 
@@ -376,7 +400,12 @@ def _warn(message: str) -> None:
 
 def _coerce_scalar(section: str, key: str, value, default):
     """Type-check + coerce one scalar to the dataclass field's type."""
-    if isinstance(default, bool) or isinstance(value, bool):
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        raise ConfigError(
+            f"config: {section}.{key}: expected a boolean, got {value!r}")
+    if isinstance(value, bool):
         raise ConfigError(f"config: {section}.{key}: booleans are not valid values")
     if isinstance(default, int):
         if isinstance(value, int):
@@ -483,6 +512,12 @@ def _validate_sections(cfg: V2Config) -> None:
         raise ConfigError(
             f"config: portfolio.drawdown_recover: {p.drawdown_recover!r} "
             f"must be in [0, drawdown_halt={p.drawdown_halt!r})")
+    # M6: scout quote currency must be a real non-empty string
+    quote = cfg.scout.quote
+    if not isinstance(quote, str) or not quote.strip():
+        raise ConfigError(
+            f"config: scout.quote: expected a non-empty string, "
+            f"got {quote!r}")
 
 
 def load_config(path=None) -> V2Config:
@@ -492,7 +527,8 @@ def load_config(path=None) -> V2Config:
     * unknown keys / sections warn to stderr and are ignored (not fatal);
     * bad types, bad values and unsupported ``config_version`` raise
       ``ConfigError`` with a clear message at startup;
-    * ``config_version`` must be 2 when present; absent -> 2.
+    * ``config_version`` must be 3 or 4 when present; absent -> 4 (v3 files
+      load with the M6 scout defaults).
     """
     import yaml  # local import: PyYAML is the only non-stdlib dependency
 
@@ -514,10 +550,10 @@ def load_config(path=None) -> V2Config:
     version = data.get("config_version", CONFIG_VERSION)
     if isinstance(version, bool) or not isinstance(version, int):
         raise ConfigError(f"config: config_version must be an integer, got {version!r}")
-    if version != CONFIG_VERSION:
+    if version not in SUPPORTED_CONFIG_VERSIONS:
         raise ConfigError(
             f"config: unsupported config_version {version} "
-            f"(this loader supports {CONFIG_VERSION})")
+            f"(this loader supports {' or '.join(map(str, SUPPORTED_CONFIG_VERSIONS))})")
 
     overrides = {}
     for key, value in data.items():

@@ -1,18 +1,32 @@
-# Jevelin config v2 (M3) + M5 portfolio risk — every gate/regime/cost threshold
-# lives here.
+# Jevelin config v2 (M3) + M5 portfolio risk + M6 discovery scout — every
+# gate/regime/cost threshold lives here.
 #
 # Rules (scripts/jev_config.py load_config):
 #   * dataclass defaults == these values (single source of truth; parity-tested);
 #   * keys may be omitted (the dataclass default applies);
 #   * unknown keys warn to stderr, bad types/values abort startup;
-#   * config_version must be 3.
+#   * config_version must be 4 (v3 files still load, with scout defaults).
 # Supervisor CLI flags (--fee-rate, --slippage-rate, --whipsaw, --pairs, ...)
 # override this file at runtime. Design numbers: docs/V2-DESIGN.md B.3 (AS
-# WRITTEN) + the M5 portfolio-risk spec.
-config_version: 3
+# WRITTEN) + the M5 portfolio-risk spec + the M6 scout spec.
+config_version: 4
 
-# M5 default pair universe; --pairs overrides at the CLI.
+# M5 default pair universe; --pairs overrides at the CLI. With
+# --universe scout (M6, opt-in) the latest scout pass replaces this list at
+# slow-cycle boundaries; stale/empty scout data falls back to it.
 pairs: [BTCUSDT, ETHUSDT, SOLUSDT]
+
+# M6 CoinGecko discovery scout (scripts/jev_scout.py) — discovery only:
+# CoinGecko tells us WHERE to look, never WHAT to do. Two GETs per pass max,
+# plus per-candidate Binance calls. ``enabled`` is the kill-switch for the
+# scout and for the supervisor's --universe scout mode.
+scout:
+  enabled: true
+  quote: USDT
+  min_24h_vol_usd: 5000000       # Binance 24h quote volume floor (USDT)
+  min_listing_age_days: 30       # first daily candle must be >= 30 days old
+  max_pairs: 5                   # cap on the final ranked list
+  interval_seconds: 3600         # expected pass cadence (staleness = 2x)
 
 # M5 portfolio risk (scripts/jev_risk.py) — deterministic, Jev never touches it.
 # Caps are fractions of equity; entries are blocked at/over the cap, exits and

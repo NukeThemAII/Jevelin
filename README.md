@@ -39,13 +39,14 @@ Key invariants:
 - **Hard risk caps.** Nothing can exceed configured exposure, leverage, or loss limits.
 - **Paper-first.** Promotion to live requires accumulated stats and explicit human approval.
 
-## Status (2026-09-25, verified)
+## Status (2026-09-28, verified)
 
 | | |
 |---|---|
-| Tests | 77/77 across 5 suites + 18 upstream tests green |
+| Tests | 435/435 across 16 script suites + 18 upstream tests green |
 | Live pipeline | verified end-to-end on real Binance data |
 | Live decisions | e.g. `skip, vetoed_by=capitulation` — risk gates working on real state |
+| Pair discovery | M6 scout verified live + reproducible offline (`jev_scout.py --replay`) |
 | Trading | **paper only** — no live orders, no profit claims yet |
 
 Numbers will come from accumulated paper stats. Until then, this page makes no PnL claims.
@@ -72,6 +73,9 @@ cp .env.example .env
 # see a live AI verdict on real market data (no trading):
 .venv/bin/python scripts/shadow_scorer.py --once
 
+# discover what is moving (CoinGecko scout pass, no trading; replayable):
+.venv/bin/python scripts/jev_scout.py --once
+
 # one paper cycle across both books (spot + perps):
 .venv/bin/python scripts/paper_loop.py --once
 
@@ -82,7 +86,10 @@ cp .env.example .env
 Tests:
 
 ```sh
-for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps; do
+for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
+         test_jev_store test_jev_import test_jev_replay test_jev_radar \
+         test_jev_cache test_jev_supervisor test_jev_regime test_jev_config \
+         test_jev_calibrate test_jev_risk test_jev_scout; do
   .venv/bin/python scripts/$t.py; done
 ```
 
@@ -90,9 +97,10 @@ for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_
 
 - [x] Jev decision stack: client → questions → state → scorer → risk gates → paper books
 - [x] Dual-book paper loop (spot + perps) with full decision logging
-- [ ] Multi-pair (BTC, ETH, SOL) + CoinGecko trending pair discovery
+- [x] Multi-pair (BTC, ETH, SOL) + portfolio risk layer (caps, kill switches, drawdown halt)
+- [x] CoinGecko discovery scout (M6): reproducible pair-universe passes, opt-in `--universe scout`
 - [ ] Telegram decision/trade feed
-- [ ] Analysis report: do Jev vetoes beat baseline? calibration check
+- [ ] Analysis report: do Jev vetoes beat baseline? calibration check (M4 harness exists)
 - [ ] Promotion gate → live (tiny float, exchange-side stops, human-approved)
 
 ## Provenance & license

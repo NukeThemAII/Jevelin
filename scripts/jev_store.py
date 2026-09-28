@@ -18,6 +18,8 @@ docs/V2-DESIGN.md B.5 plus the M1 radar table:
   radar_candidates(ts, run_id, rank, symbol, coingecko_id, price_usd,
                    volume_24h, mcap, ath_date, passed, rejections_json, raw_json)
   calibration_runs(id, params, metrics_json)    # M4: one row per calibrate run
+  scout_runs(id, run_id, ts, ok, error, raw_hashes_json, candidates_json,
+             ranked_json)                       # M6: one row per scout pass
 
 ``decision_id`` is TEXT and ``veto_bitmask`` is INTEGER. ``raw_json`` holds the
 verbatim source line (lossless import) wherever the source row carries fields
@@ -29,6 +31,7 @@ Deterministic upsert keys (idempotent re-imports never duplicate):
   decisions — UNIQUE (decision_id, ts)
   gate_decisions — UNIQUE (decision_id, book, ts)            # the M4 gate key
   radar_candidates — UNIQUE (run_id, coingecko_id)
+  scout_runs — UNIQUE (run_id)                               # the M6 pass key
 
 NOTE: ``trades.ts`` and ``gate_decisions.ts`` are epoch MILLISECONDS (the source
 rows carry ``ts_ms``); ``decisions.ts`` is epoch SECONDS (as ``jev_client`` logs
@@ -150,6 +153,19 @@ CREATE TABLE IF NOT EXISTS calibration_runs (
     params TEXT,
     metrics_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS scout_runs (
+    id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    ts REAL,
+    ok INTEGER,
+    error TEXT,
+    raw_hashes_json TEXT,
+    candidates_json TEXT,
+    ranked_json TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scout_runs_run_id
+    ON scout_runs (run_id);
 """
 
 
@@ -369,3 +385,47 @@ def delete_trade(conn, row_id) -> bool:
     cur = conn.execute("DELETE FROM trades WHERE id = ?", (row_id,))
     conn.commit()
     return cur.rowcount > 0
+
+
+# -- M6 scout passes (one row per pass) --------------------------------------
+
+_SCOUT_COLS = ("run_id", "ts", "ok", "error", "raw_hashes_json",
+               "candidates_json", "ranked_json")
+
+
+def insert_scout_run(conn, row: dict) -> bool:
+    """Upsert one scout_runs row; key = (run_id). True iff newly inserted.
+
+    ``ok`` is 1 for a full pass, 0 for a fail-safe pass record (the failed
+    pass NEVER replaces the last good list: lookups filter ok = 1).
+    """
+    return _upsert(conn, "scout_runs", _SCOUT_COLS, ("run_id",),
+                   "run_id = ?", (row.get("run_id"),), row)
+
+
+def get_scout_run(conn, run_id):
+    return _row_dict(conn.execute(
+        "SELECT * FROM scout_runs WHERE run_id = ?", (run_id,)).fetchone())
+
+
+def latest_scout_run(conn, ok_only: bool = True):
+    """Newest scout pass (by ts, id). ok_only=True -> newest full pass.
+
+    This is what the supervisor consumes as the pair universe; failed passes
+    (ok = 0) are skipped so the last good list survives outages.
+    """
+    sql = "SELECT * FROM scout_runs"
+    args = []
+    if ok_only:
+        sql += " WHERE ok = 1"
+    sql += " ORDER BY ts DESC, id DESC LIMIT 1"
+    return _row_dict(conn.execute(sql, args).fetchone())
+
+
+def list_scout_runs(conn, limit=None) -> list:
+    sql = "SELECT * FROM scout_runs ORDER BY ts, id"
+    args = []
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return [dict(r) for r in conn.execute(sql, args).fetchall()]

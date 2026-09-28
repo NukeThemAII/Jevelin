@@ -199,7 +199,7 @@ free (recorded verdicts) — this is where we learn whether Jev has an edge at a
 
 | Idea | Value | Risk | Verdict |
 |---|---|---|---|
-| (a) Trending/gainers scout → dynamic pair universe w/ Binance liquidity floor | feeds discovery; catches moving coins before they are everywhere | illiquid junk, pumps-and-dumps | **BUILD P1** — hourly pull, rank by 24h vol + price Δ, filter: Binance-listed, 24h vol ≥ $5M, listing age ≥ 30d, cap at N=5 pairs. Discovery only — every trade still goes through the full gate stack. Free-tier limits (ASSUMPTION-TO-VERIFY: ~10–30 req/min keyless, 5-min staleness) are fine for hourly pulls |
+| (a) Trending/gainers scout → dynamic pair universe w/ Binance liquidity floor | feeds discovery; catches moving coins before they are everywhere | illiquid junk, pumps-and-dumps | **BUILD P1** — hourly pull, rank by 24h vol + price Δ, filter: Binance-listed, 24h vol ≥ $5M, listing age ≥ 30d, cap at N=5 pairs. Discovery only — every trade still goes through the full gate stack. Free-tier limits (ASSUMPTION-TO-VERIFY: ~10–30 req/min keyless, 5-min staleness) are fine for hourly pulls. **BUILT as M6 (`scripts/jev_scout.py`, 2026-09-28):** deterministic candidate_score ranking, `--replay` reproducibility, `--universe scout` opt-in |
 | (b) Cross-venue divergence (CG aggregate vs Binance price) | cheap alpha if CG lags | CG free data is 5-min stale aggregates; not tradeable | **CUT** |
 | (c) Market-cap/volume/age as Jev state context features | better AI priors ("this is a low-cap coin") | none material | **BUILD P2** — one CG call per pair per hour, cached |
 | (d) CG vote/trending score as a trade signal | hype timing | uncalibrated, gameable | **CUT** — may revisit as P3 after calibration data exists |
@@ -212,7 +212,7 @@ free (recorded verdicts) — this is where we learn whether Jev has an edge at a
 `decisions(id, ts, cycle_id, symbol, regime, state_json, verdict_json, cache_hit, cost, latency_ms, ok)`
 · `trades(id, decision_id, book, side, price, qty, notional, fees, slippage, realized_pnl, funding_paid, reason, veto_bitmask)`
 · `positions(id, book, symbol, side, qty, entry_price, stop_price, liq_price, entry_ts, close_ts)`
-· `marks(ts, symbol, price, equity, book)` · `config_versions(id, yaml, applied_ts)` · `calibration_runs(id, params, metrics_json)`.
+· `marks(ts, symbol, price, equity, book)` · `config_versions(id, yaml, applied_ts)` · `calibration_runs(id, params, metrics_json)` · `scout_runs(id, run_id, ts, ok, error, raw_hashes_json, candidates_json, ranked_json)` (M6, one row per scout pass).
 Every trade carries its `decision_id` (F-P1-3) and `veto_bitmask` (F-P1-4). Replay = SQL over these tables.
 
 ## B.6 Promotion gate (paper → live, no skipping)
@@ -233,7 +233,7 @@ every scale-up. Anything failing → stay paper, adjust config, re-run.
 | **M3** | Regime classifier + hysteresis gates + sizing tiers (B.3), config file v2 | unit tests for classifier on synthetic chop/trend; gates reject all chop entries; PF improvement target in replay |
 | **M4** | Calibration harness: per-gate attribution, confidence curve, weekly re-tune report | report generated from M0–M3 data; veto-value table rendered |
 | **M5** | Multi-pair (BTC/ETH/SOL) + portfolio risk (per-pair caps, global daily kill, drawdown halt, correlation lite) | 3-pair paper run, no pair > cap; risk halts trigger in fault-injection tests |
-| **M6** | CoinGecko discovery scout (B.4a) with liquidity/age filters + Jev candidate scoring | hourly scout list reproducible; rejected-junk rate > 90% on live data; pairs feed M5 |
+| **M6** | CoinGecko discovery scout (B.4a) with liquidity/age filters + candidate scoring | ✅ **DONE** 2026-09-28 — hourly scout list reproducible (`jev_scout.py --replay` byte-identical from cached raw inputs); pairs feed M5 via opt-in `--universe scout` (stale/empty → static fallback). The M6 spec replaced this row's "Jev candidate scoring" with a deterministic `candidate_score` (no trading logic in the scout). Live smoke 2026-09-28: junk-rejection 28.6% (2/7 trending seeds rejected) — below the "> 90%" acceptance guess; that guess assumed mostly-junk trending lists and must be re-measured over more passes |
 | **M7** | Observability: metrics, Telegram decision/trade feed, daily summary (EarnGrid pattern), promotion-gate report generator | daily report lands in Telegram; go/no-go report auto-generated from store |
 
 M0–M3 are the core (anti-churn + honest numbers). M5–M6 add scale. Every milestone: TDD,

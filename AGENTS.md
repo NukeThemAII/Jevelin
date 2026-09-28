@@ -71,6 +71,7 @@ jev_paper.PaperPortfolio         jev_perps.PerpsPortfolio
 | `scripts/jev_perps.py` | perps paper book (long+short, stops, liq, funding) |
 | `scripts/jev_risk.py` | M5 portfolio risk (per-pair/basket caps, global kill, drawdown halt) |
 | `scripts/paper_loop.py` | dual-book cycle loop (one verdict → both books) |
+| `scripts/jev_scout.py` | M6 CoinGecko discovery scout (pair-universe discovery, reproducible passes) |
 
 The original RSI/EMA engine (`cabbage/` + vendored framework, below) remains as the runtime base.
 
@@ -118,7 +119,7 @@ reason, never fabricate a verdict.
 Sizing is decided by code — confidence tiers: [0.65, 0.70) → 60% of cap, [0.70, 0.85) → 80%, ≥0.85 →
 100% (caps unchanged: spot 20%, perps 10% margin / 3x; `size_tier` logged on every fill), then
 clamped by the remaining pair/basket capacity (M5). Every threshold lives in `config/v2.yaml`
-(`config_version: 3`, loader in `scripts/jev_config.py`; CLI flags override the yaml). Jev never
+(`config_version: 4`, loader in `scripts/jev_config.py`; CLI flags override the yaml). Jev never
 chooses amounts. Change caps by changing config — nothing can exceed them.
 
 **Fill model (M0, live since 2026-09-27):** every fill pays a fee + slippage per side —
@@ -136,7 +137,7 @@ and every decision record carries the full `veto_bitmask` of ALL failing gates.
 ### Pairs
 - **v1 (now):** BTCUSDT — clean single-stream stats.
 - **v1.5:** BTC, ETH, SOL (static liquid majors).
-- **v2 (dynamic universe):** CoinGecko `/search/trending` + `/coins/markets` (free) pick hot coins → filter to Binance-listed pairs with a liquidity floor → score those. CoinGecko supplies discovery, Binance supplies data/execution. Trending coins are where pump/dump questions shine — and where slippage bites; build after baseline stats exist.
+- **v2 (dynamic universe — BUILT as M6, 2026-09-28):** `scripts/jev_scout.py` pulls CoinGecko `/search/trending` + `/coins/markets`, maps to Binance USDT pairs, filters (Binance 24h quote volume ≥ $5M, listing age ≥ 30d, `not_binance_listed`/`low_volume`/`young_listing`/`trending_only` rejects), ranks deterministically (`candidate_score` = 0.5·vol rank-norm + 0.5·|24h change| rank-norm; ties lexicographic) and caps at 5. Hourly pass cadence; every pass is reproducible offline (`jev_scout.py --replay <pass-ts>`, byte-identical). Opt-in supervisor mode `--universe scout` re-reads the latest pass at slow-cycle boundaries (stale > 2× interval / empty / broken → static fallback, logged; pairs with open positions stay managed until flat). CoinGecko supplies discovery, Binance supplies data/execution — every trade still passes the full gate stack.
 
 ### Rollout doctrine (hard gates, no skipping)
 1. **Shadow/paper** — dual books running, everything logged ← *we are here*
@@ -256,12 +257,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 .venv/bin/python scripts/jev_replay.py --summary               # store vs JSONL cross-check
 .venv/bin/python scripts/jev_calibrate.py --out report.md      # M4: calibration report, on-demand (no cron)
 .venv/bin/python scripts/jev_calibrate.py --since 2026-09-27   #   (optional: filter data from a date)
+.venv/bin/python scripts/jev_scout.py --once                  # M6: one discovery scout pass (CoinGecko + Binance)
+.venv/bin/python scripts/jev_scout.py --replay <pass-ts>      # M6: reproduce a pass offline (byte-identical)
+.venv/bin/python scripts/jevelin_supervisor.py --once --universe scout  # M6: scout-driven pair universe (opt-in)
 
-# tests — all 15 script suites must stay green
+# tests — all 16 script suites must stay green
 for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
          test_jev_store test_jev_import test_jev_replay test_jev_radar \
          test_jev_cache test_jev_supervisor test_jev_regime test_jev_config \
-         test_jev_calibrate test_jev_risk; do
+         test_jev_calibrate test_jev_risk test_jev_scout; do
   .venv/bin/python scripts/$t.py; done
 
 # original engine (upstream RSI/EMA app layer, unchanged)
@@ -293,7 +297,7 @@ sessions implement it milestone by milestone — one milestone per session, in o
 | **M3** | Regime classifier (chop filter) + entry/exit hysteresis + confidence sizing tiers + config file | kills the churn the audit found (PF 0.613 in chop) |
 | **M4** | Calibration harness: per-gate attribution, confidence curve, weekly re-tune report | the machine that learns whether Jev has an edge |
 | **M5** | Multi-pair (BTC/ETH/SOL) + portfolio risk (per-pair caps, global kill, drawdown halt) | scale + portfolio-grade safety |
-| **M6** | CoinGecko discovery scout (trending → Binance liquidity/age filters) | dynamic universe (B.4a; CG = where to look, never what to do) |
+| **M6** | CoinGecko discovery scout (trending → Binance liquidity/age filters) | dynamic universe (B.4a; CG = where to look, never what to do) — ✅ built 2026-09-28, see roadmap #7 |
 | **M7** | Observability: Telegram feed, daily summary, promotion-gate report | operator visibility + go/no-go automation |
 
 Key v2 decisions already made (don't re-litigate): fees+slippage mandatory in all PnL; regime
@@ -312,7 +316,7 @@ vote-score signals are CUT. Promotion gate thresholds: ≥500 round trips, net P
 | 4 | M0: instrument v1 (fees/slippage, ids, bitmask, atomic writes) | ✅ done 2026-09-27 (commit 39a175a, 94/94 tests; `jev_summary.py`) |
 | 5 | M1: SQLite store + JSONL importer + replay utilities | ✅ done 2026-09-27 (commit 70858a6; `jev_replay.py --summary` cross-check) |
 | 6 | M2: split-cadence supervisor + decision cache (`jevelin_supervisor.py`) | ✅ done 2026-09-27 (24h sim 73/288 Jev calls = 25.3% ≤ 40%; stops ≤10s; 32/32 new tests) |
-| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4 ✅ done 2026-09-28 (commit `2814ab5`; `jev_calibrate.py`: counterfactual veto-value engine + per-gate attribution/confidence curve/fan-out + hysteresis stats/re-tune proposals, `gate_decisions`+`calibration_runs` store tables; 304 tests / 14 suites); M5 ✅ done 2026-09-28 (commit `9b5c0fb`; `jev_risk.py` portfolio risk: per-pair/basket caps, global daily kill, drawdown halt w/ hysteresis, dust floor; config `config_version: 3` with `pairs`/`portfolio`; 3-pair supervisor default universe + batch `fetch_tickers` marks + `risk_state.json`; symbol-aware trades dedup key; 368 tests / 15 suites) — **M6 is next**; M7 queued |
+| 7 | M3 regime+hysteresis → M4 calibration → M5 multi-pair → M6 CoinGecko scout → M7 observability | M3 ✅ done 2026-09-27 (`jev_regime.py`, config v2, fan-out, tiers; 276 tests / 13 suites); M4 ✅ done 2026-09-28 (commit `2814ab5`; `jev_calibrate.py`: counterfactual veto-value engine + per-gate attribution/confidence curve/fan-out + hysteresis stats/re-tune proposals, `gate_decisions`+`calibration_runs` store tables; 304 tests / 14 suites); M5 ✅ done 2026-09-28 (commit `9b5c0fb`; `jev_risk.py` portfolio risk: per-pair/basket caps, global daily kill, drawdown halt w/ hysteresis, dust floor; config `config_version: 3` with `pairs`/`portfolio`; 3-pair supervisor default universe + batch `fetch_tickers` marks + `risk_state.json`; symbol-aware trades dedup key; 368 tests / 15 suites); M6 ✅ done 2026-09-28 (`jev_scout.py` reproducible CoinGecko discovery scout: trending → Binance map → liquidity/age filters → deterministic candidate_score rank → cap 5, every pass cached + `--replay` byte-identical, `scout_runs` store table, fault injection keeps last good list; opt-in `jevelin_supervisor.py --universe scout` at slow-cycle boundaries w/ static fallback; config `config_version: 4` + `scout:` section; 435 tests / 16 suites) — M7 queued |
 | 8 | Whitelabel pass: `cabbage`→`jevelin` pkg rename, `JEVELIN_*` env | P2 (cosmetic) |
 | 9 | Paper→live promotion gate (B.6 thresholds + explicit user approval) | gated on M4 data |
 | 10 | Live: Binance keys, exchange-side stops, tiny float ($100, ≤2x) | gated on #9 |

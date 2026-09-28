@@ -40,9 +40,10 @@ class DefaultsParityTests(unittest.TestCase):
         # Single source of truth: the shipped yaml values ARE the dataclass defaults.
         self.assertEqual(load_config(str(SHIPPED_YAML)), V2Config())
 
-    def test_config_version_default_is_3(self):
-        self.assertEqual(V2Config().config_version, 3)
-        self.assertEqual(CONFIG_VERSION, 3)
+    def test_config_version_default_is_4(self):
+        # M6 bumps the schema to 4 (scout section); the loader still accepts 3.
+        self.assertEqual(V2Config().config_version, 4)
+        self.assertEqual(CONFIG_VERSION, 4)
 
     def test_shipped_yaml_exists(self):
         self.assertTrue(SHIPPED_YAML.exists())
@@ -150,8 +151,9 @@ class BadValueTests(unittest.TestCase):
 
 
 class ConfigVersionTests(unittest.TestCase):
-    def test_omitted_defaults_to_3(self):
-        self.assertEqual(load_config(_write_cfg("spot:\n  min_confidence: 0.7\n")).config_version, 3)
+    def test_omitted_defaults_to_4(self):
+        # M6: an unversioned file loads as the current schema (v4).
+        self.assertEqual(load_config(_write_cfg("spot:\n  min_confidence: 0.7\n")).config_version, 4)
 
     def test_explicit_3_ok(self):
         self.assertEqual(load_config(_write_cfg("config_version: 3\n")).config_version, 3)
@@ -261,7 +263,7 @@ class ResolvedYamlTests(unittest.TestCase):
         text = cfg.resolved_yaml_text()
         back = yaml.safe_load(text)
         self.assertEqual(back["spot"]["entry_min_pump"], 70.0)
-        self.assertEqual(back["config_version"], 3)
+        self.assertEqual(back["config_version"], 4)  # M6 schema version
         self.assertEqual(back["perps"]["entry_min_pump"], 65.0)  # defaults carried
 
 
