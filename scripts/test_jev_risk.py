@@ -311,6 +311,88 @@ class DrawdownHaltTests(unittest.TestCase):
         self.assertEqual(d["action"], "exit")
 
 
+class UniverseChangePeakTests(unittest.TestCase):
+    """The equity peak is a per-universe watermark.
+
+    Regression (2026-09-30): a 5-pair scout run latched equity_peak=100000;
+    back on the static 3-pair universe the 60000 total read as 40% dd ->
+    drawdown_halt latched FOREVER (it clears only below 5%, and the peak
+    never shrank), silently blocking every entry. A pair-universe change
+    must re-anchor the watermark, never count departed books as losses.
+    """
+
+    @staticmethod
+    def _books_for(pairs, equity=10000.0):
+        books, eq = {}, {}
+        for pair in pairs:
+            books[pair], eq[pair] = {}, {}
+            for book in ("spot", "perps"):
+                books[pair][book] = {"notional": 0.0, "margin": 0.0,
+                                     "side": None}
+                eq[pair][book] = float(equity)
+        return books, eq
+
+    def test_universe_shrink_reanchors_peak_no_false_halt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            books, eq = self._books_for(PAIRS)  # 3 pairs -> peak 60000
+            r3 = PortfolioRisk(cfg=CFG, state_path=str(path), pairs=PAIRS)
+            r3.update(books, eq, DAY1)
+            self.assertTrue(r3.save())
+            # restart on a 2-pair universe: total 40000 (old code: 33% dd -> halt)
+            subset = ("BTCUSDT", "ETHUSDT")
+            books2, eq2 = self._books_for(subset)
+            r2 = PortfolioRisk(cfg=CFG, state_path=str(path), pairs=subset)
+            self.assertTrue(r2.load())
+            flags = r2.update(books2, eq2, DAY1)
+            self.assertAlmostEqual(r2.equity_peak, 40000.0)
+            self.assertFalse(r2.drawdown_halted)
+            self.assertFalse(flags["drawdown_halt"])
+
+    def test_legacy_scalar_state_reanchors_on_first_update(self):
+        # The exact broken production file (bloomed 100000 peak, halt latched).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            legacy = {"equity_peak": 100000.0, "day": "2026-09-30",
+                      "daily_pnl_base": 59997.31, "drawdown_halted": True,
+                      "flags": {"pair_cap": {"BTCUSDT": False,
+                                             "ETHUSDT": False,
+                                             "SOLUSDT": False},
+                                "basket_long": False, "basket_short": False,
+                                "global_daily_kill": False,
+                                "drawdown_halt": True}}
+            path.write_text(json.dumps(legacy))
+            books, eq = _flat_books()
+            risk = _risk(str(path))
+            self.assertTrue(risk.load())
+            flags = risk.update(books, eq, DAY1)
+            self.assertAlmostEqual(risk.equity_peak, 60000.0)
+            self.assertFalse(risk.drawdown_halted)
+            self.assertFalse(flags["drawdown_halt"])
+            # the pair-set signature is persisted from now on
+            self.assertTrue(risk.save())
+            data = json.loads(path.read_text())
+            self.assertEqual(list(data.get("peak_pairs") or []), list(PAIRS))
+
+    def test_peak_survives_restart_within_same_universe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            books, eq = _flat_books()
+            risk = _risk(str(path))
+            risk.update(books, eq, DAY1)
+            for pair in PAIRS:
+                for book in ("spot", "perps"):
+                    eq[pair][book] = 9200.0  # -8%: dd 8%, no halt
+            risk.update(books, eq, DAY1)
+            self.assertTrue(risk.save())
+            back = _risk(str(path))
+            self.assertTrue(back.load())
+            flags = back.update(books, eq, DAY1)  # same universe
+            self.assertAlmostEqual(back.equity_peak, 60000.0)
+            self.assertAlmostEqual(back.drawdown, 0.08)
+            self.assertFalse(flags["drawdown_halt"])
+
+
 class DailyResetTests(unittest.TestCase):
     """Daily PnL base resets at UTC midnight (fixture clock)."""
 

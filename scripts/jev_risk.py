@@ -27,8 +27,10 @@ missing/non-numeric capacity is treated as 0.0 — fail-CLOSED for entries,
 exits unaffected.
 
 State (``runtime/risk_state.json``, M0 atomic write; loaded at start):
-equity peak, UTC daily-reset date + daily PnL base, drawdown-halt latch and
-the last flags snapshot. Persistence errors never raise (old file kept).
+equity peak (scoped to its ``peak_pairs`` universe — a pair-set change
+re-anchors it, legacy files re-anchor on first update), UTC daily-reset
+date + daily PnL base, drawdown-halt latch and the last flags snapshot.
+Persistence errors never raise (old file kept).
 """
 from __future__ import annotations
 
@@ -66,6 +68,7 @@ class PortfolioRisk:
         self.pairs = tuple(pairs)
         # persisted state
         self.equity_peak = 0.0
+        self.peak_pairs: Optional[list] = None  # universe the peak belongs to
         self.daily_pnl_base = 0.0
         self.day: Optional[str] = None
         self.drawdown_halted = False
@@ -148,8 +151,24 @@ class PortfolioRisk:
         self.daily_pnl_frac = ((total - self.daily_pnl_base) / self.daily_pnl_base
                                if self.daily_pnl_base > 0 else 0.0)
 
-        # running equity peak + drawdown hysteresis
-        if total > self.equity_peak:
+        # running equity peak + drawdown hysteresis.
+        # The peak is a PER-UNIVERSE watermark: it only means something for
+        # the pair set it was measured across. When the universe changes
+        # (scout rotation, config switch) the old peak would count departed
+        # books as losses — on 2026-09-30 a 5-pair scout run latched
+        # peak=100000 and the static 3-pair fallback (60000) read as 40% dd,
+        # so drawdown_halt blocked every entry forever. Re-anchor instead;
+        # a legacy state file without a signature re-anchors on first update.
+        sig = tuple(str(p) for p in pairs)
+        if tuple(self.peak_pairs or ()) != sig:
+            if self.equity_peak > total:
+                origin = (",".join(self.peak_pairs)
+                          if self.peak_pairs else "legacy")
+                print(f"risk: equity peak re-anchored (pair set {origin} -> "
+                      f"{','.join(sig)}): {self.equity_peak} -> {total}")
+            self.peak_pairs = list(sig)
+            self.equity_peak = total
+        elif total > self.equity_peak:
             self.equity_peak = total
         self.drawdown = ((self.equity_peak - total) / self.equity_peak
                          if self.equity_peak > 0 else 0.0)
@@ -264,6 +283,7 @@ class PortfolioRisk:
     def _state_dict(self) -> dict:
         return {
             "equity_peak": self.equity_peak,
+            "peak_pairs": self.peak_pairs,
             "day": self.day,
             "daily_pnl_base": self.daily_pnl_base,
             "drawdown_halted": self.drawdown_halted,
@@ -292,6 +312,9 @@ class PortfolioRisk:
         peak = _finite(data.get("equity_peak"))
         if peak is not None and peak >= 0:
             self.equity_peak = peak
+        pairs_sig = data.get("peak_pairs")
+        self.peak_pairs = ([str(p) for p in pairs_sig]
+                           if isinstance(pairs_sig, list) else None)
         base = _finite(data.get("daily_pnl_base"))
         if base is not None and base > 0:
             self.daily_pnl_base = base
