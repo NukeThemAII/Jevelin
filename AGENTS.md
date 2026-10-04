@@ -263,12 +263,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 .venv/bin/python scripts/jev_scout.py --replay <pass-ts>      # M6: reproduce a pass offline (byte-identical)
 .venv/bin/python scripts/jevelin_supervisor.py --once --universe scout  # M6: scout-driven pair universe (opt-in)
 
-# tests — all 18 script suites must stay green
+# tests — all 19 script suites must stay green
 for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
          test_jev_store test_jev_import test_jev_replay test_jev_radar \
          test_jev_cache test_jev_supervisor test_jev_regime test_jev_config \
          test_jev_calibrate test_jev_risk test_jev_scout test_jev_forward \
-         test_jev_base; do
+         test_jev_base test_jev_base_backtest; do
   .venv/bin/python scripts/$t.py; done
 
 # original engine (upstream RSI/EMA app layer, unchanged)

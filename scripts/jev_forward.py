@@ -100,21 +100,27 @@ def _http_json(url):
         return json.load(resp)
 
 
-def fetch_klines(symbol, start_ms, end_ms, fetch=None, pause_s=0.0) -> list:
-    """1m spot klines [open_time, open, high, low, close] for open_time in
-    [start_ms, end_ms], paging PAGE_LIMIT at a time. ``fetch(url) -> list``
-    is injectable (tests); the default is a keyless public GET."""
+INTERVAL_MS = {"1m": MINUTE_MS, "15m": 15 * MINUTE_MS, "1h": 60 * MINUTE_MS}
+
+
+def fetch_klines(symbol, start_ms, end_ms, fetch=None, pause_s=0.0,
+                 interval="1m") -> list:
+    """Spot klines [open_time, open, high, low, close] (default 1m) for
+    open_time in [start_ms, end_ms], paging PAGE_LIMIT at a time.
+    ``fetch(url) -> list`` is injectable (tests); the default is a keyless
+    public GET."""
     fetch = fetch or _http_json
+    step = INTERVAL_MS[interval]
     out, t = [], int(start_ms)
     while t <= end_ms:
-        url = (f"{KLINE_URL}?symbol={symbol}&interval=1m&startTime={t}"
+        url = (f"{KLINE_URL}?symbol={symbol}&interval={interval}&startTime={t}"
                f"&endTime={int(end_ms)}&limit={PAGE_LIMIT}")
         page = fetch(url)
         if not page:
             break
         out += [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])]
                 for r in page]
-        t = int(page[-1][0]) + MINUTE_MS
+        t = int(page[-1][0]) + step
         if pause_s:
             time.sleep(pause_s)
     return out
