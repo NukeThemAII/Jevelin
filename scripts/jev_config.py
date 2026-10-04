@@ -146,6 +146,11 @@ class PerpsConfig:
     entry_max_exhaustion: float = 0.55
     min_confidence: float = 0.65
     entry_phases: tuple = ("breakout", "accumulation")
+    # Short-side bars (2026-10-04): the phase + whipsaw questions are phrased
+    # for the upside ("price breaking up", "is this breakout a fakeout?"), so
+    # shorts get their own. Defaults mirror the long side (no behavior change).
+    short_entry_phases: tuple = ("breakout", "accumulation")
+    short_max_whipsaw: float = 0.45
     counter_trend: str = "block"
     exit_min_dump: float = 65.0
     exit_hard_dump: float = 75.0
@@ -369,7 +374,8 @@ _RANGES = {
     "max_position_fraction": (0.0, 1.0), "max_margin_fraction": (0.0, 1.0),
     "max_leverage": (0.0001, 125.0),
     "entry_min_pump": (0.0, 100.0), "short_min_dump": (0.0, 100.0),
-    "entry_max_whipsaw": (0.0, 1.0), "entry_max_exhaustion": (0.0, 1.0),
+    "entry_max_whipsaw": (0.0, 1.0), "short_max_whipsaw": (0.0, 1.0),
+    "entry_max_exhaustion": (0.0, 1.0),
     "min_confidence": (0.0, 1.0),
     "exit_min_dump": (0.0, 100.0), "exit_hard_dump": (0.0, 100.0),
     "exit_min_pump": (0.0, 100.0), "exit_hard_pump": (0.0, 100.0),
@@ -487,11 +493,14 @@ def _validate_sections(cfg: V2Config) -> None:
             raise ConfigError(
                 f"config: {name}.tier_fractions: fractions must be in (0, 1], "
                 f"got {list(section.tier_fractions)!r}")
-        if not section.entry_phases or any(not isinstance(p, str)
-                                           for p in section.entry_phases):
-            raise ConfigError(
-                f"config: {name}.entry_phases: expected non-empty phase names, "
-                f"got {list(section.entry_phases)!r}")
+        for key in ("entry_phases", "short_entry_phases"):
+            phases = getattr(section, key, None)
+            if phases is None:  # short_entry_phases: perps only
+                continue
+            if not phases or any(not isinstance(p, str) for p in phases):
+                raise ConfigError(
+                    f"config: {name}.{key}: expected non-empty phase names, "
+                    f"got {list(phases)!r}")
     # M5: pair universe + portfolio risk caps (strictly positive, halt > recover)
     if not cfg.pairs or any(not isinstance(p, str) or not p.strip()
                             for p in cfg.pairs):

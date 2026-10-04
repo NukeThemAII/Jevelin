@@ -181,6 +181,15 @@ is a pure function of OHLCV — free, testable, and auditable.
 **Entry/exit hysteresis (kills single-tick churn):**
 - Enter: `pump≥65` (spot) / `dump≥65` (short) AND `phase ∈ {breakout, accumulation}` AND
   `whipsaw ≤ 0.45` AND `exhaustion ≤ 0.55` AND `conf ≥ 0.65`, plus regime `≠ chop`.
+- **Short-side bars (amended 2026-10-04).** The phase and whipsaw questions are phrased for the
+  upside (`breakout` = "price breaking up"; whipsaw = "is this breakout a fakeout?"), so the shared
+  rule above made perps shorts unreachable: in the 2026-09-27 18:33 → 09-30 12:38 (+07) paper run,
+  all 432 `dump≥65` decisions had phase `capitulation` (247) / `distribution` (185) — 0 in the set —
+  and whipsaw ≥ 0.56 (0 pass at ≤0.45 or ≤0.55). Perps shorts now gate on their own
+  `perps.short_entry_phases` / `perps.short_max_whipsaw`; a phase/whipsaw gate failing on BOTH sides
+  stays a shared veto. Shipped defaults mirror the long side (no behavior change); the proposed
+  values (`[distribution]`, whipsaw bar off) wait for review — see
+  `docs/reports/2026-10-04-replay-tuning.md`. `capitulation` remains a shared block.
 - Exit: `dump≥65` (long) / `pump≥65` (short) for **2 consecutive cycles**, OR single cycle ≥75,
   OR stop/liq. Min hold: 3 cycles.
 - Whipsaw gate recalibrated: cut at **0.45** (below the observed median) after self-consistency

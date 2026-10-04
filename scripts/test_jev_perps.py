@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -493,7 +494,8 @@ class RegimeGates(unittest.TestCase):
 
 
 class FanoutPerps(unittest.TestCase):
-    """B.3 whipsaw fan-out resolves as a shared gate on the perps book too."""
+    """B.3 whipsaw fan-out resolves as a shared gate on the perps book too
+    (shared while the long/short whipsaw bars mirror — the shipped default)."""
 
     def test_fanout_tie_vetoes_shared(self):
         v = _long_v(fan_out=1, whipsaw_prob=0.44, whipsaw_prob_2=0.5)
@@ -510,6 +512,61 @@ class FanoutPerps(unittest.TestCase):
         v = _long_v(fan_out=1, whipsaw_prob=0.5, whipsaw_prob_2=0.6)
         act = decide_perps(v, _flat(), CFG, NOW, None)
         self.assertEqual(act["vetoed_by"], ["high_whipsaw", "low_dump"])
+
+
+class ShortSideGates(unittest.TestCase):
+    """Phase whitelist + whipsaw bar are SIDE-specific (2026-10-04 replay).
+
+    Both Jev questions are phrased for the upside — phase "breakout" = "price
+    breaking up", whipsaw = "is this breakout a fakeout?" — so gating shorts on
+    them made the short leg unreachable (0/432 dump>=65 rows passed in the
+    09-27..09-30 paper run). Shorts get their own ``short_entry_phases`` /
+    ``short_max_whipsaw``. A gate failing on BOTH sides stays a shared veto,
+    so the defaults (mirroring the long side) change nothing.
+    """
+
+    TUNED = replace(CFG, short_entry_phases=("distribution",),
+                    short_max_whipsaw=1.0)
+
+    def test_defaults_mirror_long_side(self):
+        self.assertEqual(CFG.short_entry_phases, CFG.entry_phases)
+        self.assertEqual(CFG.short_max_whipsaw, CFG.entry_max_whipsaw)
+
+    def test_short_enters_on_its_own_phase_set(self):
+        act = decide_perps(_short_v(phase="distribution"), _flat(), self.TUNED, NOW)
+        self.assertEqual(act["action"], "enter_short", act["reason"])
+
+    def test_long_keeps_its_phase_set(self):
+        act = decide_perps(_long_v(phase="distribution"), _flat(), self.TUNED, NOW)
+        self.assertEqual(act["action"], "skip")
+        self.assertEqual(act["vetoed_by"], ["phase_not_in_entry_set", "low_dump"])
+        self.assertTrue(act["reason"].startswith("phase_not_in_entry_set"))
+
+    def test_short_blocked_outside_its_phase_set(self):
+        act = decide_perps(_short_v(phase="breakout"), _flat(), self.TUNED, NOW)
+        self.assertEqual(act["action"], "skip")
+        self.assertEqual(act["vetoed_by"], ["low_pump", "phase_not_in_entry_set"])
+        self.assertTrue(act["reason"].startswith("phase_not_in_entry_set"))
+
+    def test_capitulation_stays_shared(self):
+        cfg = replace(self.TUNED, short_entry_phases=("distribution", "capitulation"))
+        act = decide_perps(_short_v(phase="capitulation"), _flat(), cfg, NOW)
+        self.assertEqual(act["action"], "skip")
+        self.assertEqual(act["vetoed_by"][0], "capitulation")
+
+    def test_short_whipsaw_bar_is_independent(self):
+        cfg = replace(CFG, short_max_whipsaw=1.0)  # phases left at defaults
+        act = decide_perps(_short_v(whipsaw_prob=0.9), _flat(), cfg, NOW)
+        self.assertEqual(act["action"], "enter_short", act["reason"])
+        act = decide_perps(_long_v(whipsaw_prob=0.9), _flat(), cfg, NOW)
+        self.assertEqual(act["vetoed_by"], ["high_whipsaw", "low_dump"])
+        self.assertTrue(act["reason"].startswith("high_whipsaw"))
+
+    def test_fanout_tie_is_side_specific(self):
+        v = _short_v(phase="distribution", fan_out=1, whipsaw_prob=0.44,
+                     whipsaw_prob_2=0.5)
+        act = decide_perps(v, _flat(), self.TUNED, NOW)
+        self.assertEqual(act["action"], "enter_short", act["reason"])
 
 
 class SizingTiers(unittest.TestCase):

@@ -71,6 +71,14 @@ class YamlOverrideTests(unittest.TestCase):
         self.assertEqual(cfg.spot.tier_thresholds, (0.70, 0.85))
         self.assertEqual(cfg.spot.tier_fractions, (0.6, 0.8, 1.0))
 
+    def test_perps_short_side_gates_override(self):
+        path = _write_cfg("perps:\n  short_entry_phases: [distribution]\n"
+                          "  short_max_whipsaw: 1.0\n")
+        cfg = load_config(path)
+        self.assertEqual(cfg.perps.short_entry_phases, ("distribution",))
+        self.assertEqual(cfg.perps.short_max_whipsaw, 1.0)
+        self.assertEqual(cfg.perps.entry_phases, PerpsConfig().entry_phases)
+
     def test_int_accepted_for_float_fields(self):
         path = _write_cfg("perps:\n  max_leverage: 2\n")
         self.assertEqual(load_config(path).perps.max_leverage, 2.0)
@@ -136,6 +144,12 @@ class BadValueTests(unittest.TestCase):
         self.assertConfigError("spot:\n  exit_consecutive_cycles: 0\n", "exit_consecutive_cycles")
         self.assertConfigError("perps:\n  max_leverage: 0\n", "max_leverage")
         self.assertConfigError("fanout:\n  band_low: 0.9\nband_high: 0.1\n", "band_low")
+
+    def test_short_side_gate_errors(self):
+        self.assertConfigError("perps:\n  short_entry_phases: []\n",
+                               "short_entry_phases")
+        self.assertConfigError("perps:\n  short_max_whipsaw: 1.5\n",
+                               "short_max_whipsaw")
 
     def test_tuple_shape_errors(self):
         self.assertConfigError("spot:\n  tier_thresholds: [0.9, 0.1]\n", "tier_thresholds")

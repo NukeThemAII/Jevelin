@@ -471,6 +471,26 @@ def decide_perps(verdict: dict, pf: PortfolioState, cfg: PerpsConfig, now_ms: in
         return _skip(f"malformed: {type(exc).__name__}: {exc}", ["malformed"], decision_id)
 
 
+def _phase_veto(phase, phases):
+    """(gate, reason) when ``phase`` is outside one side's whitelist, else None."""
+    if phase in phases:
+        return None
+    return ("phase_not_in_entry_set",
+            f"phase_not_in_entry_set: phase {phase} not in {list(phases)}")
+
+
+def _whipsaw_veto(whip, w2, fan_out, max_whipsaw):
+    """(gate, reason) for one side's whipsaw bar (fan-out aware), else None."""
+    gate = whipsaw_gate_name(whip, w2, fan_out, max_whipsaw)
+    if gate == "high_whipsaw":
+        return (gate, f"high_whipsaw: both fan-out samples > {max_whipsaw}"
+                if fan_out else f"high_whipsaw: {whip} > {max_whipsaw}")
+    if gate == "whipsaw_fanout_tie":
+        return (gate, f"whipsaw_fanout_tie: fan-out samples disagree or 2nd "
+                      f"sample unusable ({whip} vs {w2})")
+    return None
+
+
 def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
                   decision_id=None, regime=None, risk=None) -> dict:
     # (1) fail-open validation — same contract as jev_gates.decide
@@ -563,19 +583,24 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
         shared.append(("regime_chop", "regime_chop: chop forbids all entries"))
     if phase == "capitulation":
         shared.append(("capitulation", "capitulation: phase blocks entries"))
-    if phase not in cfg.entry_phases:
-        shared.append(("phase_not_in_entry_set",
-                       f"phase_not_in_entry_set: phase {phase} not in "
-                       f"{list(cfg.entry_phases)}"))
-    whip_gate = whipsaw_gate_name(whip, w2, fan_out, cfg.entry_max_whipsaw)
-    if whip_gate == "high_whipsaw":
-        shared.append(("high_whipsaw",
-                       f"high_whipsaw: both fan-out samples > {cfg.entry_max_whipsaw}"
-                       if fan_out else f"high_whipsaw: {whip} > {cfg.entry_max_whipsaw}"))
-    elif whip_gate == "whipsaw_fanout_tie":
-        shared.append(("whipsaw_fanout_tie",
-                       f"whipsaw_fanout_tie: fan-out samples disagree or 2nd "
-                       f"sample unusable ({whip} vs {w2})"))
+    # Phase whitelist + whipsaw bar are SIDE-specific (both Jev questions are
+    # phrased for the upside); a gate failing on BOTH sides stays shared, so
+    # mirrored long/short settings keep the original single-gate behavior.
+    long_shape, short_shape = [], []  # side-only phase/whipsaw vetoes
+    long_phase = _phase_veto(phase, cfg.entry_phases)
+    short_phase = _phase_veto(phase, cfg.short_entry_phases)
+    if long_phase and short_phase:
+        shared.append(long_phase)
+    else:
+        long_shape += [long_phase] if long_phase else []
+        short_shape += [short_phase] if short_phase else []
+    long_whip = _whipsaw_veto(whip, w2, fan_out, cfg.entry_max_whipsaw)
+    short_whip = _whipsaw_veto(whip, w2, fan_out, cfg.short_max_whipsaw)
+    if long_whip and short_whip:
+        shared.append(long_whip)
+    else:
+        long_shape += [long_whip] if long_whip else []
+        short_shape += [short_whip] if short_whip else []
     if exh > cfg.entry_max_exhaustion:
         shared.append(("high_exhaustion",
                        f"high_exhaustion: {exh} > {cfg.entry_max_exhaustion}"))
@@ -596,6 +621,7 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
     if regime == "trend_down" and cfg.counter_trend == "block":
         long_failed.append(("regime_counter",
                             "regime_counter: trend_down blocks long entries"))
+    long_failed += long_shape
     if pump < cfg.entry_min_pump:
         long_failed.append(("low_pump", f"low_pump: {pump} < {cfg.entry_min_pump}"))
     if fr is not None and fr > thr:
@@ -604,6 +630,7 @@ def _decide_perps(verdict, pf, cfg: PerpsConfig, now_ms, funding_rate,
     if regime == "trend_up" and cfg.counter_trend == "block":
         short_failed.append(("regime_counter",
                              "regime_counter: trend_up blocks short entries"))
+    short_failed += short_shape
     if dump < cfg.short_min_dump:
         short_failed.append(("low_dump", f"low_dump: {dump} < {cfg.short_min_dump}"))
     if fr is not None and fr < -thr:
