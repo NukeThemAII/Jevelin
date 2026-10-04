@@ -297,7 +297,8 @@ class Supervisor:
                  risk_cfg=None, regime_cfg=None, fanout_cfg=None,
                  market_cfg=None, portfolio_cfg=None,
                  risk_state_path: str = "runtime/risk_state.json",
-                 heartbeat_path: Optional[str] = "runtime/heartbeat.jsonl") -> None:
+                 heartbeat_path: Optional[str] = "runtime/heartbeat.jsonl",
+                 alerter=None) -> None:
         self.symbols = list(symbols)
         self.market = market
         self.client = client
@@ -341,6 +342,8 @@ class Supervisor:
         self._tailer = LogTailer()
         self._old_sig = None
         self._closed = False
+        self._alerter = alerter  # jev_telegram.TelegramAlerter-like, optional
+        self._drawdown_halt_alerted = False
 
     # -- clock / signals / lifecycle -------------------------------------
 
@@ -505,6 +508,7 @@ class Supervisor:
             books_state, equity_by_book = self._books_snapshot()
             flags = self.risk.update(books_state, equity_by_book, self._time())
             self._risk_error = None
+            self._alert_drawdown_halt(flags)
             return flags
         except Exception as exc:
             self._risk_error = f"{type(exc).__name__}: {exc}"
@@ -520,6 +524,27 @@ class Supervisor:
             return
         if self.risk.save():
             self._risk_saved = state
+
+    def _alert_drawdown_halt(self, flags) -> None:
+        """Telegram ping on a drawdown_halt transition only (never per-cycle).
+
+        Fail-open: alerting must never be able to break the risk/trading
+        loop it is reporting on, same contract as ``_heartbeat``.
+        """
+        if self._alerter is None or flags is None:
+            return
+        halted = bool(flags.get("drawdown_halt"))
+        if halted == self._drawdown_halt_alerted:
+            return
+        self._drawdown_halt_alerted = halted
+        try:
+            stamp = datetime.now(BANGKOK).strftime("%Y-%m-%d %H:%M:%S")
+            state = "ENGAGED" if halted else "cleared"
+            self._alerter.send(
+                f"Jevelin risk: drawdown_halt {state} at {stamp} Asia/Bangkok "
+                f"(paper book only, no live funds)")
+        except Exception as exc:
+            print(f"alert: drawdown_halt send error: {type(exc).__name__}: {exc}")
 
     def _entry_budget(self, symbol, book, price, leverage=1.0):
         """M5 risk dict for the gate layer. Fail-CLOSED on error (entries only).

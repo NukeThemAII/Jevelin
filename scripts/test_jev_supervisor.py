@@ -679,6 +679,78 @@ class PortfolioRiskFaultTests(unittest.TestCase):
         self.assertEqual(back.risk.equity_peak, 67000.0)
 
 
+class FakeAlerter:
+    def __init__(self) -> None:
+        self.sent = []
+
+    def send(self, text: str) -> bool:
+        self.sent.append(text)
+        return True
+
+
+class DrawdownHaltAlertTests(unittest.TestCase):
+    """Telegram fires on a drawdown_halt transition only, never per-cycle."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.clock = FakeClock()
+        self.market = FakeMarket(price=100.0, regime="trend_up")
+        self.alerter = FakeAlerter()
+
+    def _sup(self):
+        books = {s: make_pair_books(self.tmp.name, s) for s in SYMBOLS3}
+        sup = Supervisor(list(SYMBOLS3), self.market, FakeClient(), books,
+                         conn=None, clock=self.clock.now,
+                         decision_log_path=str(Path(self.tmp.name) / "paper_decisions.jsonl"),
+                         portfolio_cfg=PortfolioConfig(),
+                         risk_state_path=str(Path(self.tmp.name) / "risk_state.json"),
+                         alerter=self.alerter)
+        self.addCleanup(sup.restore_signal_handlers)
+        return sup
+
+    def test_halt_onset_sends_one_alert(self):
+        sup = self._sup()
+        sup.portfolio_risk_update()
+        sup.risk.equity_peak = 67000.0  # forces drawdown_halt on the next update
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup.portfolio_risk_update()
+        self.assertEqual(len(self.alerter.sent), 1)
+        self.assertIn("ENGAGED", self.alerter.sent[0])
+
+    def test_halt_stays_quiet_while_still_halted(self):
+        sup = self._sup()
+        sup.portfolio_risk_update()
+        sup.risk.equity_peak = 67000.0
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup.portfolio_risk_update()
+            sup.portfolio_risk_update()  # still halted -> no repeat
+        self.assertEqual(len(self.alerter.sent), 1)
+
+    def test_halt_clears_sends_second_alert(self):
+        sup = self._sup()
+        sup.portfolio_risk_update()
+        sup.risk.equity_peak = 67000.0
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup.portfolio_risk_update()  # halt onset
+            sup.risk.equity_peak = 60000.0  # back within tolerance
+            sup.portfolio_risk_update()  # halt clears
+        self.assertEqual(len(self.alerter.sent), 2)
+        self.assertIn("cleared", self.alerter.sent[1])
+
+    def test_no_alerter_configured_is_a_noop(self):
+        books = {s: make_pair_books(self.tmp.name, s) for s in SYMBOLS3}
+        sup = Supervisor(list(SYMBOLS3), self.market, FakeClient(), books,
+                         conn=None, clock=self.clock.now,
+                         decision_log_path=str(Path(self.tmp.name) / "paper_decisions.jsonl"),
+                         portfolio_cfg=PortfolioConfig(),
+                         risk_state_path=str(Path(self.tmp.name) / "risk_state.json"))
+        self.addCleanup(sup.restore_signal_handlers)
+        sup.risk.equity_peak = 67000.0
+        with contextlib.redirect_stdout(io.StringIO()):
+            sup.portfolio_risk_update()  # must not raise with alerter=None
+
+
 class MultiPairStopTests(unittest.TestCase):
     """Fast loop closes EVERY pair's stop breach in one tick (0 Jev calls)."""
 

@@ -47,6 +47,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import jev_store  # noqa: E402
+import jev_telegram  # noqa: E402
 from jev_cache import DecisionCache  # noqa: E402
 from jev_client import JevClient, load_api_key  # noqa: E402
 from jev_config import (  # noqa: E402
@@ -317,6 +318,10 @@ def main(argv=None) -> int:
         return 2
     api_key = load_api_key()  # OPENROUTER_API_KEY from repo-root .env
     client = JevClient(api_key)
+    try:  # TELEGRAM_BOT_TOKEN/CHAT_ID from repo-root .env; unconfigured = no-op sends
+        alerter = jev_telegram.from_env()
+    except FileNotFoundError:
+        alerter = None
     market = MarketData(ohlcv_ttl_seconds=cfg.market.ohlcv_ttl_seconds)
     db_path = args.db or str(Path(args.runtime_dir) / "jevelin.db")
     conn = jev_store.connect(db_path)
@@ -357,6 +362,7 @@ def main(argv=None) -> int:
         portfolio_cfg=cfg.portfolio,  # M5 portfolio risk layer
         risk_state_path=str(Path(args.runtime_dir) / "risk_state.json"),
         heartbeat_path=str(Path(args.runtime_dir) / "heartbeat.jsonl"),
+        alerter=alerter,
         **scout_kwargs)
     asyncio.run(sup.run())
     return 0
