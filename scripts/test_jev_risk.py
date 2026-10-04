@@ -393,6 +393,82 @@ class UniverseChangePeakTests(unittest.TestCase):
             self.assertFalse(flags["drawdown_halt"])
 
 
+class HaltLatchEndToEndTests(unittest.TestCase):
+    """The 2026-09-30 halt latch, end to end: state file -> risk -> real gates.
+
+    UniverseChangePeakTests pin the watermark math; these pin the path that
+    actually froze trading — persisted risk_state.json -> PortfolioRisk ->
+    entry_budget -> decide / decide_perps — and the converse safety property:
+    a REAL drawdown halt must survive a pair-universe change (re-anchoring the
+    watermark must never launder a genuine loss).
+    """
+
+    BROKEN = {"equity_peak": 100000.0, "day": "2026-09-30",
+              "daily_pnl_base": 59997.31, "drawdown_halted": True,
+              "flags": {"pair_cap": {"BTCUSDT": False, "ETHUSDT": False,
+                                     "SOLUSDT": False},
+                        "basket_long": False, "basket_short": False,
+                        "global_daily_kill": False, "drawdown_halt": True}}
+
+    _books_for = staticmethod(UniverseChangePeakTests._books_for)
+
+    def test_broken_production_state_no_longer_blocks_entries(self):
+        # Flat books, equity untouched at 10000 each: there is NO drawdown.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            path.write_text(json.dumps(self.BROKEN))
+            books, eq = _flat_books()
+            risk = _risk(str(path))
+            self.assertTrue(risk.load())
+            risk.update(books, eq, DAY1)
+            spot = decide(_pump_verdict(), _flat_pf(), RiskConfig(), NOW_MS,
+                          regime="trend_up",
+                          risk=risk.entry_budget("spot", "BTCUSDT", 10_000.0))
+            perps = decide_perps(
+                _pump_verdict(),
+                PerpsPortfolioState(has_position=False, equity_usd=10_000.0,
+                                    daily_pnl_pct=0.0),
+                PerpsConfig(), NOW_MS, funding_rate=0.0, regime="trend_up",
+                risk=risk.entry_budget("perps", "BTCUSDT", 10_000.0,
+                                       leverage=3.0))
+            self.assertEqual(spot["action"], "enter", spot["reason"])
+            self.assertEqual(perps["action"], "enter_long", perps["reason"])
+            self.assertNotIn("drawdown_halt", spot["vetoed_by"])
+            self.assertNotIn("drawdown_halt", perps["vetoed_by"])
+
+    def test_real_halt_survives_in_process_universe_change(self):
+        three = PAIRS
+        two = ("BTCUSDT", "ETHUSDT")
+        risk = PortfolioRisk(cfg=CFG, state_path="unused.json", pairs=three)
+        books, eq = self._books_for(three)
+        risk.update(books, eq, DAY1)                       # peak 60000
+        books, eq = self._books_for(three, equity=8800.0)  # -12%: real loss
+        self.assertTrue(risk.update(books, eq, DAY1)["drawdown_halt"])
+        # scout rotation drops SOL; the remaining books are still -12%
+        risk.pairs = two
+        books, eq = self._books_for(two, equity=8800.0)
+        flags = risk.update(books, eq, DAY1)
+        self.assertAlmostEqual(risk.drawdown, 0.12)
+        self.assertTrue(flags["drawdown_halt"])
+
+    def test_real_halt_survives_restart_on_a_new_universe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "risk_state.json"
+            r3 = PortfolioRisk(cfg=CFG, state_path=str(path), pairs=PAIRS)
+            books, eq = self._books_for(PAIRS)
+            r3.update(books, eq, DAY1)
+            books, eq = self._books_for(PAIRS, equity=8800.0)
+            self.assertTrue(r3.update(books, eq, DAY1)["drawdown_halt"])
+            self.assertTrue(r3.save())
+            two = ("BTCUSDT", "ETHUSDT")
+            r2 = PortfolioRisk(cfg=CFG, state_path=str(path), pairs=two)
+            self.assertTrue(r2.load())
+            books, eq = self._books_for(two, equity=8800.0)
+            flags = r2.update(books, eq, DAY1)
+            self.assertAlmostEqual(r2.drawdown, 0.12)
+            self.assertTrue(flags["drawdown_halt"])
+
+
 class DailyResetTests(unittest.TestCase):
     """Daily PnL base resets at UTC midnight (fixture clock)."""
 

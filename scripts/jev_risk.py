@@ -28,8 +28,10 @@ exits unaffected.
 
 State (``runtime/risk_state.json``, M0 atomic write; loaded at start):
 equity peak (scoped to its ``peak_pairs`` universe — a pair-set change
-re-anchors it, legacy files re-anchor on first update), UTC daily-reset
-date + daily PnL base, drawdown-halt latch and the last flags snapshot.
+re-anchors it, carrying the current drawdown fraction so a rotation never
+clears a real halt; legacy files re-anchor on first update with no carried
+drawdown), the last drawdown fraction, UTC daily-reset date + daily PnL
+base, drawdown-halt latch and the last flags snapshot.
 Persistence errors never raise (old file kept).
 """
 from __future__ import annotations
@@ -159,15 +161,21 @@ class PortfolioRisk:
         # peak=100000 and the static 3-pair fallback (60000) read as 40% dd,
         # so drawdown_halt blocked every entry forever. Re-anchor instead;
         # a legacy state file without a signature re-anchors on first update.
+        # A REAL drawdown belongs to the account, not the pair set: carry the
+        # last fraction across the re-anchor (new peak sits dd above total)
+        # so a scout rotation can never launder a genuine halt.
         sig = tuple(str(p) for p in pairs)
         if tuple(self.peak_pairs or ()) != sig:
-            if self.equity_peak > total:
+            carried = min(max(self.drawdown, 0.0), 0.99)
+            new_peak = total / (1.0 - carried)
+            if self.equity_peak > new_peak or carried > 0:
                 origin = (",".join(self.peak_pairs)
                           if self.peak_pairs else "legacy")
                 print(f"risk: equity peak re-anchored (pair set {origin} -> "
-                      f"{','.join(sig)}): {self.equity_peak} -> {total}")
+                      f"{','.join(sig)}): {self.equity_peak} -> {new_peak} "
+                      f"(carried dd {carried:.4f})")
             self.peak_pairs = list(sig)
-            self.equity_peak = total
+            self.equity_peak = new_peak
         elif total > self.equity_peak:
             self.equity_peak = total
         self.drawdown = ((self.equity_peak - total) / self.equity_peak
@@ -286,6 +294,7 @@ class PortfolioRisk:
             "peak_pairs": self.peak_pairs,
             "day": self.day,
             "daily_pnl_base": self.daily_pnl_base,
+            "drawdown": self.drawdown,
             "drawdown_halted": self.drawdown_halted,
             "flags": self.flags,
         }
@@ -320,6 +329,9 @@ class PortfolioRisk:
             self.daily_pnl_base = base
         day = data.get("day")
         self.day = str(day) if isinstance(day, str) and day else None
+        # carried across a universe re-anchor; legacy/missing -> no carry
+        dd = _finite(data.get("drawdown"))
+        self.drawdown = dd if dd is not None and 0.0 <= dd < 1.0 else 0.0
         halted = data.get("drawdown_halted")
         self.drawdown_halted = bool(halted) if isinstance(halted, bool) else False
         flags = data.get("flags")
