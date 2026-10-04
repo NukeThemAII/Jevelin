@@ -19,6 +19,32 @@
 </header>
 
 <main id="main">
+  <section class="panel status-panel" aria-labelledby="status-heading">
+    <h2 id="status-heading">Daemon status <span class="hint">(live, polls every 5s)</span></h2>
+    <div class="status-row">
+      <div class="status-tile">
+        <span class="status-label">Heartbeat</span>
+        <span id="heartbeat-badge" class="status-value num-blue">—</span>
+        <span id="heartbeat-detail" class="status-sub">—</span>
+      </div>
+      <div class="status-tile">
+        <span class="status-label">Latest equity</span>
+        <span id="pnl-equity" class="status-value num-blue">—</span>
+        <span class="status-sub">this book/symbol</span>
+      </div>
+      <div class="status-tile">
+        <span class="status-label">Realized P&amp;L</span>
+        <span id="pnl-realized" class="status-value num-blue">—</span>
+        <span id="pnl-trade-count" class="status-sub">—</span>
+      </div>
+      <div class="status-tile">
+        <span class="status-label">Last trade</span>
+        <span id="pnl-last-trade" class="status-value num-blue">—</span>
+        <span class="status-sub">this series</span>
+      </div>
+    </div>
+  </section>
+
   <section class="panel" aria-labelledby="equity-heading">
     <h2 id="equity-heading">Equity curve</h2>
     <div class="chart-wrap">

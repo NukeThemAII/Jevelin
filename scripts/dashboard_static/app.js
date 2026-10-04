@@ -1,5 +1,7 @@
 const API = "";
 const PAGE_SIZE = 50;
+const LIVE_POLL_MS = 5000;
+const DATA_POLL_MS = 15000;
 
 const state = {
   book: null,
@@ -297,6 +299,74 @@ async function loadPriceChart(trades) {
   }
 }
 
+function fmtAge(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 0) return "bad timestamp (future-dated)";
+  if (seconds < 90) return `${Math.round(seconds)}s ago`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  return `${Math.round(seconds / 3600)}h ago`;
+}
+
+async function loadHeartbeat() {
+  const badge = $("heartbeat-badge");
+  const detail = $("heartbeat-detail");
+  try {
+    const hb = await getJSON(`${API}/api/heartbeat`);
+    badge.classList.remove("num-green", "num-blue", "num-yellow", "num-red", "pulse");
+    if (hb.last_ts_ms === null) {
+      badge.textContent = "NO DATA";
+      badge.classList.add("num-yellow");
+      detail.textContent = "heartbeat.jsonl missing or empty — daemon has never ticked";
+    } else if (hb.stale) {
+      badge.textContent = "STALE";
+      badge.classList.add("num-red");
+      detail.textContent = `last tick ${fmtAge(hb.age_s)} (${fmtTime(hb.last_ts_ms)}) — daemon likely not running`;
+    } else {
+      badge.textContent = "LIVE";
+      badge.classList.add("num-green", "pulse");
+      detail.textContent = `last tick ${fmtAge(hb.age_s)} (${fmtTime(hb.last_ts_ms)})`;
+    }
+  } catch (err) {
+    badge.textContent = "ERROR";
+    badge.classList.remove("num-green", "num-blue", "num-yellow", "pulse");
+    badge.classList.add("num-red");
+    detail.textContent = `Failed to load heartbeat: ${err.message}`;
+  }
+}
+
+async function loadPnlSummary() {
+  const equityEl = $("pnl-equity");
+  const realizedEl = $("pnl-realized");
+  const countEl = $("pnl-trade-count");
+  const lastTradeEl = $("pnl-last-trade");
+  const key = pickTradeSeriesKey();
+  if (!key) {
+    equityEl.textContent = "—";
+    realizedEl.textContent = "—";
+    countEl.textContent = "no trade series for this book/symbol";
+    lastTradeEl.textContent = "—";
+    return;
+  }
+  try {
+    const data = await getJSON(
+      `${API}/api/pnl-summary?series=${encodeURIComponent(key)}&book=${encodeURIComponent(
+        state.book
+      )}&symbol=${encodeURIComponent(state.symbol)}`
+    );
+    equityEl.textContent = data.latest_equity !== null ? data.latest_equity.toFixed(2) : "—";
+    equityEl.className = `status-value ${numClass(data.latest_equity)}`;
+    realizedEl.textContent = data.realized_pnl.toFixed(4);
+    realizedEl.className = `status-value ${numClass(data.realized_pnl)}`;
+    countEl.textContent = `${data.trade_count} trades`;
+    lastTradeEl.textContent = data.last_trade_ts_ms ? fmtTime(data.last_trade_ts_ms) : "no trades yet";
+  } catch (err) {
+    equityEl.textContent = "ERR";
+    realizedEl.textContent = "ERR";
+    countEl.textContent = err.message;
+    lastTradeEl.textContent = "—";
+  }
+}
+
 async function loadDecisions() {
   setOverlay("decisions-state", "show", "Loading…");
   try {
@@ -362,6 +432,23 @@ function refreshAll() {
   loadVetoBreakdown();
   loadTradesAndPrice();
   loadDecisions();
+  loadPnlSummary();
+}
+
+// Price chart overlay hits the public Binance klines API, so it stays on
+// filter-change/manual refresh only. Heartbeat + P&L are local log reads —
+// cheap to poll. Equity/veto/decisions are local too but redraw charts, so
+// they get a slower interval to keep the UI calm.
+function startPolling() {
+  setInterval(() => {
+    loadHeartbeat();
+    loadPnlSummary();
+  }, LIVE_POLL_MS);
+  setInterval(() => {
+    loadEquity();
+    loadVetoBreakdown();
+    loadDecisions();
+  }, DATA_POLL_MS);
 }
 
 function wirePager() {
@@ -382,9 +469,11 @@ function wirePager() {
 
 async function init() {
   wirePager();
+  loadHeartbeat();
   try {
     await loadMeta();
     refreshAll();
+    startPolling();
   } catch (err) {
     setOverlay("equity-state", "error", `Failed to load dashboard: ${err.message}`);
   }
