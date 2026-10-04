@@ -739,6 +739,48 @@ class Simulated24hThreePairs(unittest.TestCase):
             self.assertLessEqual(client.calls / 864, 0.40)
 
 
+class HeartbeatTests(unittest.TestCase):
+    """Liveness line lands on every fast/slow tick; a write error never breaks the loop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.clock = FakeClock()
+        self.market = FakeMarket(price=100.0)
+        self.client = FakeClient()
+        self.books = make_books(self.tmp.name)
+        self.hb_path = Path(self.tmp.name) / "heartbeat.jsonl"
+        self.sup = Supervisor([SYMBOL], self.market, self.client, {SYMBOL: self.books},
+                              clock=self.clock.now, heartbeat_path=str(self.hb_path),
+                              decision_log_path=str(Path(self.tmp.name) / "paper_decisions.jsonl"))
+        self.addCleanup(self.sup.restore_signal_handlers)
+
+    def test_fast_and_slow_ticks_append_heartbeat_lines(self):
+        self.sup.fast_tick()
+        self.sup._heartbeat("fast")
+        self.sup.slow_cycle()
+        self.sup._heartbeat("slow")
+
+        lines = read_jsonl(self.hb_path)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["loop"], "fast")
+        self.assertEqual(lines[1]["loop"], "slow")
+        self.assertIn("ts", lines[0])
+
+    def test_disabled_heartbeat_writes_nothing(self):
+        self.sup.heartbeat_path = None
+        self.sup._heartbeat("fast")
+        self.assertFalse(self.hb_path.exists())
+
+    def test_write_failure_is_swallowed(self):
+        # Point at a path whose parent can't be created (a file, not a dir) —
+        # the tick must not raise even though the heartbeat write fails.
+        blocker = Path(self.tmp.name) / "blocker"
+        blocker.write_text("x")
+        self.sup.heartbeat_path = str(blocker / "heartbeat.jsonl")
+        self.sup._heartbeat("fast")  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

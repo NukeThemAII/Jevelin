@@ -296,7 +296,8 @@ class Supervisor:
                  once: bool = False, max_cycles: Optional[int] = None,
                  risk_cfg=None, regime_cfg=None, fanout_cfg=None,
                  market_cfg=None, portfolio_cfg=None,
-                 risk_state_path: str = "runtime/risk_state.json") -> None:
+                 risk_state_path: str = "runtime/risk_state.json",
+                 heartbeat_path: Optional[str] = "runtime/heartbeat.jsonl") -> None:
         self.symbols = list(symbols)
         self.market = market
         self.client = client
@@ -310,6 +311,7 @@ class Supervisor:
         self.burst_cycles = int(burst_cycles)
         self._clock = clock
         self.decision_log_path = str(decision_log_path)
+        self.heartbeat_path = str(heartbeat_path) if heartbeat_path else None
         self.once = bool(once)
         self.max_cycles = int(max_cycles) if max_cycles is not None else None
         self.caches = {
@@ -910,6 +912,21 @@ class Supervisor:
                   f"decision={decision_id}")
             return {"error": f"{type(exc).__name__}: {exc}"}
 
+    def _heartbeat(self, loop: str) -> None:
+        """Append a timestamped liveness line; failure here must never break the loop."""
+        if not self.heartbeat_path:
+            return
+        try:
+            path = Path(self.heartbeat_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            line = {"ts": self.now_ms(), "loop": loop,
+                    "fast_ticks": self._counts.get("fast_ticks"),
+                    "slow_cycles": self._counts.get("slow_cycles")}
+            with open(path, "a") as fh:
+                fh.write(json.dumps(line) + "\n")
+        except OSError as exc:
+            print(f"heartbeat: write failed: {type(exc).__name__}: {exc}")
+
     # -- asyncio loops ----------------------------------------------------
 
     async def _sleep(self, seconds) -> None:
@@ -933,6 +950,7 @@ class Supervisor:
     async def run_fast_loop(self) -> None:
         while not self._shutdown.is_set():
             self.fast_tick()
+            self._heartbeat("fast")
             if self._shutdown.is_set():
                 break
             await self._sleep(self.fast_interval)
@@ -941,6 +959,7 @@ class Supervisor:
         cycles = 0
         while not self._shutdown.is_set():
             self.slow_cycle()
+            self._heartbeat("slow")
             cycles += 1
             if self.max_cycles is not None and cycles >= self.max_cycles:
                 self.request_shutdown()
@@ -957,6 +976,7 @@ class Supervisor:
                 self.fast_tick()   # one slow cycle + N fast ticks, then exit
                 self.slow_cycle()
                 self.fast_tick()
+                self._heartbeat("once")
             else:
                 await asyncio.gather(self.run_fast_loop(), self.run_slow_loop())
         finally:

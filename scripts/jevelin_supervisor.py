@@ -356,6 +356,7 @@ def main(argv=None) -> int:
         market_cfg=cfg.market,
         portfolio_cfg=cfg.portfolio,  # M5 portfolio risk layer
         risk_state_path=str(Path(args.runtime_dir) / "risk_state.json"),
+        heartbeat_path=str(Path(args.runtime_dir) / "heartbeat.jsonl"),
         **scout_kwargs)
     asyncio.run(sup.run())
     return 0

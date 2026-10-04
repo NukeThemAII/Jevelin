@@ -1,0 +1,28 @@
+[Unit]
+Description=Jevelin supervisor — paper/monitor mode only (no broker writes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xaos
+WorkingDirectory=/home/xaos/Jevelin
+ExecStart=/home/xaos/Jevelin/.venv/bin/python scripts/jevelin_supervisor.py --config config/v2.yaml
+Restart=on-failure
+RestartSec=10
+# Paper/monitor mode is the only mode this entrypoint supports — see
+# scripts/jevelin_supervisor.py docstring and the Jevelin safety gate
+# (War Room, 2026-10-04): broker-write code is never imported by this
+# process, so there is no live/paper flag to set here.
+Environment=PYTHONUNBUFFERED=1
+
+# Hardening: this process only reads public market data and local JSON/DB
+# state under WorkingDirectory, and POSTs to openrouter.ai / api.telegram.org.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/xaos/Jevelin/runtime
+
+[Install]
+WantedBy=multi-user.target
