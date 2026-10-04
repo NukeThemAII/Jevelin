@@ -10,6 +10,7 @@ import math
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -314,13 +315,16 @@ class Grids(unittest.TestCase):
     def test_grid1_is_the_published_1h_grid(self):
         g = bt.GRIDS["g1"]
         self.assertEqual((g.timeframe, g.seeds, g.pass_pctile), ("1h", 200, 0.95))
+        self.assertEqual(g.timeframes, ("1h",))
         self.assertIs(g.configs, bt.GRID)
         self.assertEqual([name for name, _ in g.configs],
                          ["dc20", "dc55", "dc20-ema", "dc20-regime", "ts48", "ts48-ema"])
 
     def test_grid2_is_frozen_as_pre_registered(self):
-        # Pre-registered 2026-10-04 before any 4h run on the fit window:
-        # editing this grid after results exist must fail here, visibly.
+        # Pre-registered 2026-10-04 before any run on the fit window; amended
+        # once the same day on Oracle's design check, still before any run
+        # (dc55-4h-ema-w -> dc20-1h-w). Editing this grid after results exist
+        # must fail here, visibly.
         g = bt.GRIDS["g2"]
         self.assertEqual((g.timeframe, g.seeds, g.min_trades), ("4h", 1000, 100))
         self.assertAlmostEqual(g.pass_pctile, 1 - 0.05 / 12)   # Bonferroni, 12 configs
@@ -329,13 +333,71 @@ class Grids(unittest.TestCase):
             "dc20-4h-w": {"stop_atr": 3.0, "trail_atr": 5.0},
             "dc20-4h-ema-w": {"trend": "ema", "stop_atr": 3.0, "trail_atr": 5.0},
             "dc55-4h-w": {"entry_period": 55, "stop_atr": 3.0, "trail_atr": 5.0},
-            "dc55-4h-ema-w": {"entry_period": 55, "trend": "ema",
-                              "stop_atr": 3.0, "trail_atr": 5.0},
             "dc55-x20-4h": {"entry_period": 55, "exit_period": 20, "trail_atr": 0.0},
+            # wider exits on grid 1's 1h bars: isolates the exit lever
+            "dc20-1h-w": {"timeframe": "1h", "stop_atr": 3.0, "trail_atr": 5.0},
         })
         self.assertEqual(len(g.configs), len(dict(g.configs)))  # unique names
+        self.assertEqual(g.timeframes, ("4h", "1h"))
         for _, overrides in g.configs:
             BaseConfig(**overrides)                              # all valid
+
+    def test_unknown_config_timeframe_is_refused(self):
+        with self.assertRaises(ValueError):
+            bt.Grid("4h", (("x", {"timeframe": "2h"}),), seeds=1, pass_pctile=0.5)
+        with self.assertRaises(ValueError):
+            bt.Grid("1H", (), seeds=1, pass_pctile=0.5)
+
+
+class Run(unittest.TestCase):
+    def test_each_config_runs_on_its_own_timeframe(self):
+        small = {"entry_period": 3, "atr_period": 2}
+        grid = bt.Grid("4h", (("on4h", dict(small)),
+                              ("on1h", dict(small, timeframe="1h"))),
+                       seeds=2, pass_pctile=0.5)
+        series = {"4h": {"S": (_flat(30, step=4 * H), None)},          # never breaks out
+                  "1h": {"S": (_breakout_then((103, 104, 102.5, 103.5),
+                                              (103.5, 105, 103, 104.5)), None)}}
+        res = bt.run(series, T0, T0 + 200 * H, 0.0005, 0.0005, ("long", "short"),
+                     seeds=2, grid=grid, funding=(0.0, 0.02, 1.0))
+        got = {r["name"]: r for r in res}
+        self.assertEqual((got["on4h"]["tf"], got["on4h"]["all"]["n"]), ("4h", 0))
+        self.assertEqual((got["on1h"]["tf"], got["on1h"]["all"]["n"]), ("1h", 1))
+        self.assertEqual(got["on1h"]["seeds"], 2)
+        # one winning long (+1.36%) held 2 x 1h: 2%/8h costs 0.5%, 100%/8h flips it
+        # (on 4h bars 2%/8h would flip it too: funding uses the config's bars)
+        pf = got["on1h"]["all"]["pf"]
+        self.assertEqual(got["on1h"]["pf_fund"], [pf, pf, 0.0])
+
+    def test_beats_random_counts_seeds_strictly_below(self):
+        calls = []
+
+        def fake_control(ind, cfg, fee, slip, rate, long_share, seed, start_ts=None):
+            calls.append((long_share, seed, start_ts))
+            return [{"side": "long", "net_pct": (100.0, -100.0, 1.0)[seed]}]
+
+        grid = bt.Grid("1h", (("x", {"entry_period": 3, "atr_period": 2}),),
+                       seeds=3, pass_pctile=0.5)
+        series = {"1h": {"S": (_breakout_then((103, 104, 102.5, 103.5),
+                                              (103.5, 105, 103, 104.5)), None)}}
+        with mock.patch.object(bt, "random_control", fake_control):
+            r = bt.run(series, T0, T0 + 200 * H, 0.0005, 0.0005, ("long", "short"),
+                       seeds=3, grid=grid)[0]
+        self.assertAlmostEqual(r["all"]["sum_pct"], 1.3556, places=3)
+        self.assertEqual((r["beats"], r["seeds"]), (2, 3))        # -100 and +1.0 only
+        self.assertAlmostEqual(r["pctile"], 2 / 3)
+        self.assertEqual(r["rand_p50"], 1.0)
+        self.assertEqual(calls, [(1.0, 0, T0), (1.0, 1, T0), (1.0, 2, T0)])
+
+
+class Funding(unittest.TestCase):
+    def test_longs_pay_pro_rata_per_8h_held_shorts_credited_nothing(self):
+        trades = [{"side": "long", "bars": 3, "net_pct": 1.0},
+                  {"side": "short", "bars": 3, "net_pct": 1.0}]
+        got = bt.funded_pcts(trades, 0.0001, 4 * H)       # 12h = 1.5 funding periods
+        self.assertAlmostEqual(got[0], 1.0 - 0.015)
+        self.assertEqual(got[1], 1.0)
+        self.assertEqual(bt.funded_pcts(trades, 0.0, H), [1.0, 1.0])
 
 
 def _result(n=150, pf=1.2, pf_a=1.1, pf_b=1.3, sums=(5.0, 3.0, -1.0), pctile=0.999):
@@ -435,9 +497,16 @@ class Main(unittest.TestCase):
                          fetch=_wave_fetch(), now_ms=bt.FIT_CUTOFF_MS)
             self.assertEqual(rc, 0)
             text = out.read_text()
-        self.assertIn(" 4h,", text)
+        self.assertIn(" 4h+1h,", text)
         self.assertIn("grid g2", text)
         self.assertIn("99.6%", text)                      # the declared gate is printed
+        self.assertIn(">= 3/3 seeds", text)               # ... and as a raw seed count
+        self.assertIn("| dc20-1h-w | 1h |", text)
+        self.assertIn("| dc20-4h-w | 4h |", text)
+        self.assertIn("PF fund 1/3bp", text)
+        # perps -> both funding PFs reach the row (the 11th cell after tf)
+        self.assertRegex(text, r"\| dc20-1h-w \| 1h \|(?:[^|]*\|){10} [^|/]+ / [^|/]+ \|")
+        self.assertRegex(text, r"\| [0-3]/3 \| ")          # raw beats-random count
         for name, _ in bt.GRIDS["g2"].configs:
             self.assertIn(f"| {name} |", text)
 

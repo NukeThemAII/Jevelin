@@ -25,8 +25,10 @@ The random-entry control keeps the exits and swaps the entries for seeded
 coin flips at the strategy's own entry rate and long share: it measures
 whether the ENTRIES add anything beyond the exit structure.
 
-Grids are pre-declared (``GRIDS``), each with its own signal timeframe,
-seed count and pass gate (``gate_failures``), and run once on the fit window.
+Grids are pre-declared (``GRIDS``), each with a default signal timeframe (a
+config may name its own), seed count and pass gate (``gate_failures``), and
+run once on the fit window. Perps funding is a report-only stress
+(``funded_pcts``), not part of the gate.
 
 Jev is not replayed here: no verdicts exist before 2026-09-27, so the veto
 (jev_base.jev_veto) is a forward-paper concern only.
@@ -78,39 +80,62 @@ GRID = (
     ("ts48-ema", {"entry": "tsmom", "entry_period": 48, "trend": "ema"}),
 )
 
-# Pre-declared grid 2 (2026-10-04), committed before any 4h run on the fit
-# window. Hypothesis: grid 1's best gross capture (+0.089%/trade) lost to the
-# ~0.20% perps round trip; 4h bars and wider exits cut the trade count and
-# raise the move per trade, so the same cost is a smaller share of 1R. tsmom
-# and the regime filter are dropped (tsmom lost before costs; regime = no
-# filter). dc20-4h keeps grid 1's 2/3 ATR exits: timeframe-only control.
-GRID_4H = (
+# Pre-declared grid 2 (2026-10-04), committed before any run on the fit
+# window and amended once, still before any run, on Oracle's design check.
+# Hypothesis: grid 1's best gross capture (+0.089%/trade) lost to the ~0.20%
+# perps round trip; 4h bars and wider exits cut the trade count and raise the
+# move per trade, so the same cost is a smaller share of 1R. tsmom and the
+# regime filter are dropped (tsmom lost before costs; regime = no filter).
+# dc20-4h keeps grid 1's 2/3 ATR exits (timeframe lever alone); dc20-1h-w
+# keeps grid 1's 1h bars (exit lever alone); dc20-4h-w has both.
+GRID2 = (
     ("dc20-4h", {}),
     ("dc20-4h-w", {"stop_atr": 3.0, "trail_atr": 5.0}),
     ("dc20-4h-ema-w", {"trend": "ema", "stop_atr": 3.0, "trail_atr": 5.0}),
     ("dc55-4h-w", {"entry_period": 55, "stop_atr": 3.0, "trail_atr": 5.0}),
-    ("dc55-4h-ema-w", {"entry_period": 55, "trend": "ema",
-                       "stop_atr": 3.0, "trail_atr": 5.0}),
     # Turtle System 2 exits: 2 ATR stop, opposite 20-bar channel, no trail.
     ("dc55-x20-4h", {"entry_period": 55, "exit_period": 20, "trail_atr": 0.0}),
+    ("dc20-1h-w", {"timeframe": "1h", "stop_atr": 3.0, "trail_atr": 5.0}),
 )
+
+# Report-only funding stress (perps): longs pay this per 8h held, shorts are
+# credited nothing. 0.01% is the exchange baseline; 0.03% a rally-ish level.
+FUNDING_8H = (0.0001, 0.0003)
 
 
 @dataclass(frozen=True)
 class Grid:
     """A pre-declared grid and the gate a config must clear to be a
-    forward-paper candidate (see ``gate_failures``)."""
+    forward-paper candidate (see ``gate_failures``). ``timeframe`` is the
+    default; a config's ``timeframe`` override wins."""
     timeframe: str
     configs: tuple
     seeds: int
     pass_pctile: float      # beats-random share of seeds required
     min_trades: int = 100
 
+    def __post_init__(self):
+        for tf in self.timeframes:
+            if tf not in TF_MS:
+                raise ValueError(f"timeframe must be one of {sorted(TF_MS)}: {tf!r}")
+
+    def timeframe_of(self, overrides) -> str:
+        return overrides.get("timeframe", self.timeframe)
+
+    @property
+    def timeframes(self) -> tuple:
+        """Signal timeframes the grid needs, the default first."""
+        out = [self.timeframe]
+        for _, overrides in self.configs:
+            if self.timeframe_of(overrides) not in out:
+                out.append(self.timeframe_of(overrides))
+        return tuple(out)
+
 
 GRIDS = {
     "g1": Grid("1h", GRID, seeds=200, pass_pctile=0.95),
     # 12 configs have now been tested on this one window: Bonferroni 0.05 / 12.
-    "g2": Grid("4h", GRID_4H, seeds=1000, pass_pctile=1 - 0.05 / 12),
+    "g2": Grid("4h", GRID2, seeds=1000, pass_pctile=1 - 0.05 / 12),
 }
 
 
@@ -309,6 +334,14 @@ def in_window(trades, lo_ms, hi_ms) -> list:
     return [t for t in trades if lo_ms <= t["signal_ts"] < hi_ms]
 
 
+def funded_pcts(trades, rate_8h, bar_ms) -> list:
+    """net_pct after perps funding: longs pay ``rate_8h`` per 8h held, pro
+    rata on entry notional; shorts are credited nothing (conservative). Held
+    time is ``bars`` x bar length, so a stop's exit bar counts in full."""
+    return [t["net_pct"] - (rate_8h * 100.0 * t["bars"] * bar_ms / (8 * H)
+                            if t["side"] == "long" else 0.0) for t in trades]
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -340,15 +373,19 @@ def gate_failures(r, grid: Grid) -> list:
     return fails
 
 
-def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"]) -> list:
-    """series: {symbol: (bars, regimes)} -> one result dict per grid config."""
+def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"],
+        funding=()) -> list:
+    """series: {timeframe: {symbol: (bars, regimes)}} -> one result dict per
+    grid config, each on its own timeframe's bars. ``funding``: 8h rates for
+    the report-only PF stress (empty = no funding, e.g. spot)."""
     mid = start_ms + (end_ms - start_ms) // 2
     results = []
     for name, overrides in grid.configs:
-        cfg = replace(BaseConfig(), timeframe=grid.timeframe, sides=sides, **overrides)
+        tf = grid.timeframe_of(overrides)
+        cfg = replace(BaseConfig(), **{"timeframe": tf, "sides": sides, **overrides})
         trades, rand_sums, per_symbol = [], [], {}
         inds = {}
-        for sym, (bars, regimes) in series.items():
+        for sym, (bars, regimes) in series[tf].items():
             ind = indicators(bars, cfg)
             got = simulate(ind, cfg, fee, slip, start_ts=start_ms, regimes=regimes)
             inds[sym] = (ind, got)
@@ -365,22 +402,28 @@ def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"]) -> 
                                          seed=seed, start_ts=start_ms)
             rand_sums.append(sum(t["net_pct"] for t in pooled))
         m = metrics(trades)
+        beats = sum(s < m["sum_pct"] for s in rand_sums) if m["n"] else 0
         results.append({
-            "name": name, "all": m, "per_symbol": per_symbol,
+            "name": name, "tf": tf, "all": m, "per_symbol": per_symbol,
             "a": metrics(in_window(trades, start_ms, mid)),
             "b": metrics(in_window(trades, mid, end_ms)),
             "rand_p50": statistics.median(rand_sums) if rand_sums else None,
-            "pctile": (sum(s < m["sum_pct"] for s in rand_sums) / len(rand_sums)
-                       if rand_sums and m["n"] else None)})
+            "beats": beats, "seeds": len(rand_sums),
+            "pctile": beats / len(rand_sums) if rand_sums and m["n"] else None,
+            "pf_fund": [profit_factor(funded_pcts(trades, f, TF_MS[tf]))
+                        for f in funding]})
     return results
 
 
 def build_report(results, symbols, start_ms, end_ms, grid_name, book, fee, slip,
-                 seeds) -> str:
+                 seeds, funding=()) -> str:
     grid = GRIDS[grid_name]
     mid = start_ms + (end_ms - start_ms) // 2
+    need = math.ceil(grid.pass_pctile * seeds - 1e-9)
+    fund = "/".join(f"{f * 1e4:g}" for f in funding)
     lines = [
-        f"# jev_base backtest grid {grid_name} — {','.join(symbols)} {grid.timeframe}, "
+        f"# jev_base backtest grid {grid_name} — {','.join(symbols)} "
+        f"{'+'.join(grid.timeframes)}, "
         f"{_ts_bkk(start_ms)[:10]} .. {_ts_bkk(end_ms)[:10]} (+07, end exclusive)",
         "",
         "SIMULATED unit-notional returns on historical Binance spot klines — not real "
@@ -391,20 +434,25 @@ def build_report(results, symbols, start_ms, end_ms, grid_name, book, fee, slip,
         f"{seeds} seeds, same exits, rate- and side-matched entries.",
         f"Gate (pre-declared): n >= {grid.min_trades}, net PF > 1 overall and in both "
         f"halves, sum% > 0 in a majority of symbols, beats random >= "
-        f"{grid.pass_pctile:.1%} of seeds.",
+        f"{grid.pass_pctile:.1%} of seeds (>= {need}/{seeds} seeds).",
+        (f"Funding stress (report-only, not in the gate): longs pay {fund} bp per 8h "
+         "held (pro rata, exit bar counted in full), shorts credited nothing."
+         if funding else "Funding: none (spot)."),
         "",
-        "| config | n | L/S | PF | win | sum% | maxDD% | avgR | SQN | PF A | PF B "
-        "| rand sum% p50 | beats rand | gate |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        f"| config | tf | n | L/S | PF | win | sum% | maxDD% | avgR | SQN | PF A | PF B "
+        f"| PF fund {fund or 'n/a'}bp | rand sum% p50 | beats rand | gate |",
+        "|---" * 16 + "|",
     ]
     for r in results:
         m = r["all"]
         lines.append(
-            f"| {r['name']} | {m['n']} | {m['longs']}/{m['shorts']} | {_fmt_pf(m['pf'])} "
+            f"| {r['name']} | {r['tf']} | {m['n']} | {m['longs']}/{m['shorts']} "
+            f"| {_fmt_pf(m['pf'])} "
             f"| {_f(m['win'], '{:.0%}')} | {m['sum_pct']:+.1f} | {m['max_dd_pct']:.1f} "
             f"| {_f(m['avg_r'], '{:+.3f}')} | {_f(m['sqn'])} | {_fmt_pf(r['a']['pf'])} "
-            f"| {_fmt_pf(r['b']['pf'])} | {_f(r['rand_p50'], '{:+.1f}')} "
-            f"| {_f(r['pctile'], '{:.1%}')} "
+            f"| {_fmt_pf(r['b']['pf'])} "
+            f"| {' / '.join(_fmt_pf(x) for x in r['pf_fund']) or 'n/a'} "
+            f"| {_f(r['rand_p50'], '{:+.1f}')} | {r['beats']}/{r['seeds']} "
             f"| {', '.join(gate_failures(r, grid)) or 'PASS'} |")
     lines += ["", "Per symbol (n / PF / sum%):", ""]
     lines.append("| config | " + " | ".join(symbols) + " |")
@@ -449,21 +497,24 @@ def main(argv=None, fetch=None, now_ms=None) -> int:
     symbols = args.symbols.split(",") if args.symbols else list(cfg.pairs)
     if args.book == "spot":
         fee, slip, sides = cfg.execution.spot_fee_rate, cfg.execution.slippage_rate, ("long",)
+        funding = ()
     else:
         fee, slip, sides = cfg.perps.taker_fee_rate, cfg.perps.slippage_rate, ("long", "short")
-    tf_ms = TF_MS[grid.timeframe]
-    warmup = max(WARMUP_SIGNAL_BARS * tf_ms, (REGIME_1H_BARS + 24) * H)
+        funding = FUNDING_8H
+    warmup = max(WARMUP_SIGNAL_BARS * max(TF_MS[tf] for tf in grid.timeframes),
+                 (REGIME_1H_BARS + 24) * H)
 
-    series = {}
+    series = {tf: {} for tf in grid.timeframes}
     for sym in symbols:
         sub = load_history(sym, start_ms - warmup, end_ms, args.cache, fetch=fetch,
                            now_ms=now_ms, pause_s=0.0 if fetch else 0.2)
-        bars = resample(sub, tf_ms, M15)
-        series[sym] = (bars, regime_series(sub, bars, cfg.regime, tf_ms))
-        print(f"{sym}: {len(sub)} x 15m -> {len(bars)} x {grid.timeframe}")
-    results = run(series, start_ms, end_ms, fee, slip, sides, seeds, grid)
+        for tf in grid.timeframes:
+            bars = resample(sub, TF_MS[tf], M15)
+            series[tf][sym] = (bars, regime_series(sub, bars, cfg.regime, TF_MS[tf]))
+            print(f"{sym}: {len(sub)} x 15m -> {len(bars)} x {tf}")
+    results = run(series, start_ms, end_ms, fee, slip, sides, seeds, grid, funding)
     report = build_report(results, symbols, start_ms, end_ms, args.grid,
-                          args.book, fee, slip, seeds)
+                          args.book, fee, slip, seeds, funding)
     if args.out:
         Path(args.out).write_text(report)
         print(f"report -> {args.out}")
