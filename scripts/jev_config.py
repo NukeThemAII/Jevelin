@@ -148,9 +148,11 @@ class PerpsConfig:
     entry_phases: tuple = ("breakout", "accumulation")
     # Short-side bars (2026-10-04): the phase + whipsaw questions are phrased
     # for the upside ("price breaking up", "is this breakout a fakeout?"), so
-    # shorts get their own. Defaults mirror the long side (no behavior change).
-    short_entry_phases: tuple = ("breakout", "accumulation")
-    short_max_whipsaw: float = 0.45
+    # shorts get their own. Ratified 2026-10-04 (paper-only experiment):
+    # shorts enter on ``distribution``, whipsaw bar off. The pre-ratification
+    # mirror of the long side was ("breakout", "accumulation") / 0.45.
+    short_entry_phases: tuple = ("distribution",)
+    short_max_whipsaw: float = 1.0
     counter_trend: str = "block"
     exit_min_dump: float = 65.0
     exit_hard_dump: float = 75.0

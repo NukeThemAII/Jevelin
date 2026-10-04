@@ -115,8 +115,9 @@ perps:
   entry_max_exhaustion: 0.55
   min_confidence: 0.65
   entry_phases: [breakout, accumulation]
-  short_entry_phases: [breakout, accumulation]  # short-side bars: defaults mirror
-  short_max_whipsaw: 0.45                       # long (see docs/V2-DESIGN.md B.3)
+  short_entry_phases: [distribution]  # short-side bars, ratified 2026-10-04 as a
+  short_max_whipsaw: 1.0              # paper-only experiment (whipsaw bar off);
+                                      # see docs/V2-DESIGN.md B.3
   counter_trend: block
   exit_min_dump: 65.0
   exit_hard_dump: 75.0

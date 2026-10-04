@@ -100,7 +100,7 @@ reason, never fabricate a verdict.
 3. **Portfolio risk (M5, entries only — exits/stops never risk-blocked)**: portfolio daily PnL ≤ −5% → `global_daily_kill`; drawdown ≥ 10% from running peak → `drawdown_halt` (clears only below 5%); per-pair caps → `pair_cap`; basket caps → `basket_cap`; remaining capacity < 1% equity → dust veto `pair_cap`/`basket_cap`. Risk computation error → entries fail CLOSED. See the caps table below (`scripts/jev_risk.py`)
 4. Daily loss ≤ −5% → block entries only (`daily_loss_kill`); exits and stops always allowed
 5. Regime (deterministic `jev_regime`, computed before Jev): `chop` → ALL entries blocked (`regime_chop`); `trend_down` blocks longs / `trend_up` blocks shorts (`regime_counter`; `counter_trend: allow` re-enables by config)
-6. `phase ∈ {breakout, accumulation}` (`phase_not_in_entry_set`; `capitulation` keeps its own flag for attribution)
+6. `phase ∈ {breakout, accumulation}` (`phase_not_in_entry_set`; `capitulation` keeps its own flag for attribution). Perps shorts gate on their own bars (ratified 2026-10-04, paper-only): `short_entry_phases: [distribution]`, `short_max_whipsaw: 1.0` (whipsaw bar off for shorts)
 7. Shared entry gates: `whipsaw≤0.45` (2-sample fan-out majority vote when raw noul ∈ 0.40–0.60; split → `whipsaw_fanout_tie` fail-closed), `exhaustion≤0.55`, `confidence≥0.65`, 15-min cooldown
 8. Long needs `pump≥65`; short needs `dump≥65`; funding veto per book table
 9. Both sides qualify → prefer the stronger (`pump≥dump` → long, else short)

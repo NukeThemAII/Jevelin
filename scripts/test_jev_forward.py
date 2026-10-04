@@ -271,11 +271,12 @@ class SimulateTests(unittest.TestCase):
         ef, xf, fee = 100.0 * 1.0005, 110.0 * 0.9995, 0.001
         self.assertAlmostEqual(t["net_pct"], (xf / ef - 1 - fee - fee * xf / ef) * 100)
 
-    def test_baseline_perps_never_shorts_a_distribution_dump(self):
+    def test_mirrored_short_bars_never_short_a_distribution_dump(self):
         rows = [_row(T0 + i * MIN, 100.0, book="perps", regime="trend_down",
                      pump_0_100=10.0, dump_0_100=80.0, phase="distribution")
                 for i in range(5)]
-        self.assertEqual(fw.simulate(rows, _cfg(), "perps", {}), [])
+        cfg = _cfg(perps=dict(fw._MIRRORED_SHORTS["perps"]))
+        self.assertEqual(fw.simulate(rows, cfg, "perps", {}), [])
 
     def test_tuned_short_stops_out_intrabar(self):
         cfg = _cfg(perps={"short_entry_phases": ("distribution",),

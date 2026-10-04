@@ -25,7 +25,11 @@ from jev_perps import (
 from paper_loop import parse_args, run_cycle
 
 NOW = 1_800_000_000_000
-CFG = PerpsConfig()
+# Gate-mechanics fixture: pins the pre-2026-10-04 short bars (mirror of the
+# long side), so short verdicts here use phase "breakout" like the long ones.
+# The ratified shipped short bars are covered in ShortSideGates.
+CFG = replace(PerpsConfig(), short_entry_phases=("breakout", "accumulation"),
+              short_max_whipsaw=0.45)
 SYM = "BTC/USDT"
 EXPECTED_FLAG = {
     "high_whipsaw": VetoFlags.WHIPSAW,
@@ -482,7 +486,7 @@ class RegimeGates(unittest.TestCase):
                                       regime="trend_down")["action"], "enter_short")
 
     def test_counter_trend_allow_config(self):
-        cfg = PerpsConfig(counter_trend="allow")
+        cfg = replace(CFG, counter_trend="allow")
         self.assertEqual(decide_perps(_short_v(), _flat(), cfg, NOW, None,
                                       regime="trend_up")["action"], "enter_short")
 
@@ -495,7 +499,8 @@ class RegimeGates(unittest.TestCase):
 
 class FanoutPerps(unittest.TestCase):
     """B.3 whipsaw fan-out resolves as a shared gate on the perps book too
-    (shared while the long/short whipsaw bars mirror — the shipped default)."""
+    (shared while the long/short whipsaw bars mirror — the CFG fixture; the
+    shipped short bar is off since 2026-10-04)."""
 
     def test_fanout_tie_vetoes_shared(self):
         v = _long_v(fan_out=1, whipsaw_prob=0.44, whipsaw_prob_2=0.5)
@@ -528,9 +533,21 @@ class ShortSideGates(unittest.TestCase):
     TUNED = replace(CFG, short_entry_phases=("distribution",),
                     short_max_whipsaw=1.0)
 
-    def test_defaults_mirror_long_side(self):
-        self.assertEqual(CFG.short_entry_phases, CFG.entry_phases)
-        self.assertEqual(CFG.short_max_whipsaw, CFG.entry_max_whipsaw)
+    def test_shipped_short_bars_are_ratified(self):
+        # 2026-10-04 (paper-only experiment): shorts on distribution, whipsaw off.
+        shipped = PerpsConfig()
+        self.assertEqual(shipped.short_entry_phases, ("distribution",))
+        self.assertEqual(shipped.short_max_whipsaw, 1.0)
+        self.assertEqual(shipped.entry_phases, ("breakout", "accumulation"))
+        self.assertEqual(shipped.entry_max_whipsaw, 0.45)
+        act = decide_perps(_short_v(phase="distribution", whipsaw_prob=0.8),
+                           _flat(), shipped, NOW)
+        self.assertEqual(act["action"], "enter_short", act["reason"])
+
+    def test_mirrored_bars_never_short_a_distribution_dump(self):
+        act = decide_perps(_short_v(phase="distribution"), _flat(), CFG, NOW)
+        self.assertEqual(act["action"], "skip")
+        self.assertIn("phase_not_in_entry_set", act["vetoed_by"])
 
     def test_short_enters_on_its_own_phase_set(self):
         act = decide_perps(_short_v(phase="distribution"), _flat(), self.TUNED, NOW)

@@ -63,13 +63,15 @@ DECIMATE_MS = 15 * MINUTE_MS
 ROOT = Path(__file__).resolve().parent.parent
 
 # Sim variants: (name, {section: {field: value}} overrides, max_hold_min).
-# Proposals only — shipped config/v2.yaml is the baseline.
-_SHORTS = {"perps": {"short_entry_phases": ("distribution",),
-                     "short_max_whipsaw": 1.0}}
+# Proposals only — shipped config/v2.yaml is the baseline. Since 2026-10-04
+# the shipped short bars are [distribution] / whipsaw off; ``mirrored-shorts``
+# replays the pre-ratification bars (shorts unreachable on the 09-27 run).
+_MIRRORED_SHORTS = {"perps": {"short_entry_phases": ("breakout", "accumulation"),
+                              "short_max_whipsaw": 0.45}}
 VARIANTS = (
     ("baseline", {}, None),
-    ("shorts", _SHORTS, None),
-    ("shorts+hold60", _SHORTS, 60),
+    ("mirrored-shorts", _MIRRORED_SHORTS, None),
+    ("baseline+hold60", {}, 60),
     ("loose-longs", {"spot": {"entry_min_pump": 55.0, "counter_trend": "allow"},
                      "perps": {"entry_min_pump": 55.0, "counter_trend": "allow"}},
      None),

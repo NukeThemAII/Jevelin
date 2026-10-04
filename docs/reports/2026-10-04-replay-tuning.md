@@ -1,7 +1,9 @@
 # Replay tuning report — 2026-10-04 (Forge)
 
-Status: **analysis + proposal. Nothing in this report is applied.** The proposed config below
-waits for Ada's review; shipped `config/v2.yaml` behavior is unchanged.
+Status: **analysis + proposal.** Update 2026-10-04 (+07): the short-side config below was
+ratified by Ada as a paper-only experiment and is now shipped in `config/v2.yaml`. Everything else
+here stays a proposal. The variant names in the tables are as of writing; `jev_forward.py` now calls
+the shipped bars `baseline` and the pre-ratification ones `mirrored-shorts`.
 
 Data:
 - `runtime/paper_decisions.jsonl`, the 2026-09-27 18:33 → 09-30 12:38 (+07) paper run:
@@ -99,7 +101,7 @@ H1/H2 split at the median timestamp; a position open at the cut is marked open i
 carry into H2, so H1 + H2 can exceed ALL. Every n here is far too small for a PF to mean anything.
 The only robust read is directional: loosening the long gates lost in both halves.
 
-## Proposed config (for Ada's review — NOT applied)
+## Proposed config (ratified 2026-10-04, paper-only — shipped)
 
 ```diff
  perps:

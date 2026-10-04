@@ -187,9 +187,11 @@ is a pure function of OHLCV — free, testable, and auditable.
   all 432 `dump≥65` decisions had phase `capitulation` (247) / `distribution` (185) — 0 in the set —
   and whipsaw ≥ 0.56 (0 pass at ≤0.45 or ≤0.55). Perps shorts now gate on their own
   `perps.short_entry_phases` / `perps.short_max_whipsaw`; a phase/whipsaw gate failing on BOTH sides
-  stays a shared veto. Shipped defaults mirror the long side (no behavior change); the proposed
-  values (`[distribution]`, whipsaw bar off) wait for review — see
-  `docs/reports/2026-10-04-replay-tuning.md`. `capitulation` remains a shared block.
+  stays a shared veto. **Ratified 2026-10-04 (Ada), paper-only experiment:** shipped
+  `short_entry_phases: [distribution]`, `short_max_whipsaw: 1.0` (bar off) — see
+  `docs/reports/2026-10-04-replay-tuning.md`. Not a profit claim: shorts count as tuned only after
+  ≥30 closed shorts, PF ≥ 1.2 on both time halves and decimated `dump` IC < 0 at 1h/4h.
+  `capitulation` remains a shared block.
 - Exit: `dump≥65` (long) / `pump≥65` (short) for **2 consecutive cycles**, OR single cycle ≥75,
   OR stop/liq. Min hold: 3 cycles.
 - Whipsaw gate recalibrated: cut at **0.45** (below the observed median) after self-consistency
