@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Jevelin — Decision History (v0)</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <h1>Jevelin <span class="badge">v0 · read-only</span></h1>
+  <div class="controls" role="group" aria-label="Filters">
+    <label for="book-select">Book</label>
+    <select id="book-select" aria-label="Book"></select>
+    <label for="symbol-select">Symbol</label>
+    <select id="symbol-select" aria-label="Symbol"></select>
+  </div>
+</header>
+
+<main id="main">
+  <section class="panel" aria-labelledby="equity-heading">
+    <h2 id="equity-heading">Equity curve</h2>
+    <div class="chart-wrap">
+      <canvas id="equity-chart" role="img" aria-label="Equity curve over time"></canvas>
+      <div class="state-overlay" id="equity-state" hidden></div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="price-heading">
+    <h2 id="price-heading">Price with trade entries <span class="hint">(Binance public kline)</span></h2>
+    <div class="chart-wrap">
+      <canvas id="price-chart" role="img" aria-label="Price chart with trade entry markers"></canvas>
+      <div class="state-overlay" id="price-state" hidden></div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="veto-heading">
+    <h2 id="veto-heading">Filter-block breakdown</h2>
+    <div class="chart-wrap short">
+      <canvas id="veto-chart" role="img" aria-label="Count of decisions blocked by each filter category"></canvas>
+      <div class="state-overlay" id="veto-state" hidden></div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="trades-heading">
+    <h2 id="trades-heading">Trade log</h2>
+    <div class="table-wrap">
+      <table id="trades-table">
+        <thead>
+          <tr><th>Time</th><th>Side</th><th>Price</th><th>Qty</th><th>USD</th><th>Realized PnL</th></tr>
+        </thead>
+        <tbody id="trades-body"></tbody>
+      </table>
+      <div class="state-overlay" id="trades-state" hidden></div>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="decisions-heading">
+    <h2 id="decisions-heading">Decision log</h2>
+    <div class="table-wrap">
+      <table id="decisions-table">
+        <thead>
+          <tr><th>Time</th><th>Book</th><th>Symbol</th><th>Action</th><th>Vetoed by</th><th>Confidence</th><th>Equity</th></tr>
+        </thead>
+        <tbody id="decisions-body"></tbody>
+      </table>
+      <div class="state-overlay" id="decisions-state" hidden></div>
+    </div>
+    <div class="pager">
+      <button id="prev-page" type="button">Prev</button>
+      <span id="page-info" aria-live="polite"></span>
+      <button id="next-page" type="button">Next</button>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
