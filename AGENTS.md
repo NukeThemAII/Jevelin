@@ -72,6 +72,7 @@ jev_paper.PaperPortfolio         jev_perps.PerpsPortfolio
 | `scripts/jev_risk.py` | M5 portfolio risk (per-pair/basket caps, global kill, drawdown halt) |
 | `scripts/paper_loop.py` | dual-book cycle loop (one verdict → both books) |
 | `scripts/jev_scout.py` | M6 CoinGecko discovery scout (pair-universe discovery, reproducible passes) |
+| `scripts/jev_forward.py` | Forward-return replay: logged decisions vs public Binance 1m klines — per-gate forward moves, IC, rule-faithful sim variants (offline, keyless) |
 
 The original RSI/EMA engine (`cabbage/` + vendored framework, below) remains as the runtime base.
 
@@ -257,15 +258,16 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-cabbage.txt   # N
 .venv/bin/python scripts/jev_replay.py --summary               # store vs JSONL cross-check
 .venv/bin/python scripts/jev_calibrate.py --out report.md      # M4: calibration report, on-demand (no cron)
 .venv/bin/python scripts/jev_calibrate.py --since 2026-09-27   #   (optional: filter data from a date)
+.venv/bin/python scripts/jev_forward.py --v1-calls runtime/jev_decisions.jsonl --out report.md  # forward replay vs klines (cached runtime/klines)
 .venv/bin/python scripts/jev_scout.py --once                  # M6: one discovery scout pass (CoinGecko + Binance)
 .venv/bin/python scripts/jev_scout.py --replay <pass-ts>      # M6: reproduce a pass offline (byte-identical)
 .venv/bin/python scripts/jevelin_supervisor.py --once --universe scout  # M6: scout-driven pair universe (opt-in)
 
-# tests — all 16 script suites must stay green
+# tests — all 17 script suites must stay green
 for t in test_jev_client test_jev_scorer test_jev_gates test_jev_paper test_jev_perps \
          test_jev_store test_jev_import test_jev_replay test_jev_radar \
          test_jev_cache test_jev_supervisor test_jev_regime test_jev_config \
-         test_jev_calibrate test_jev_risk test_jev_scout; do
+         test_jev_calibrate test_jev_risk test_jev_scout test_jev_forward; do
   .venv/bin/python scripts/$t.py; done
 
 # original engine (upstream RSI/EMA app layer, unchanged)
