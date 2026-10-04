@@ -310,6 +310,70 @@ class Folds(unittest.TestCase):
         self.assertEqual(bt.FIT_CUTOFF_MS, 1_789_578_000_000)
 
 
+class Grids(unittest.TestCase):
+    def test_grid1_is_the_published_1h_grid(self):
+        g = bt.GRIDS["g1"]
+        self.assertEqual((g.timeframe, g.seeds, g.pass_pctile), ("1h", 200, 0.95))
+        self.assertIs(g.configs, bt.GRID)
+        self.assertEqual([name for name, _ in g.configs],
+                         ["dc20", "dc55", "dc20-ema", "dc20-regime", "ts48", "ts48-ema"])
+
+    def test_grid2_is_frozen_as_pre_registered(self):
+        # Pre-registered 2026-10-04 before any 4h run on the fit window:
+        # editing this grid after results exist must fail here, visibly.
+        g = bt.GRIDS["g2"]
+        self.assertEqual((g.timeframe, g.seeds, g.min_trades), ("4h", 1000, 100))
+        self.assertAlmostEqual(g.pass_pctile, 1 - 0.05 / 12)   # Bonferroni, 12 configs
+        self.assertEqual(dict(g.configs), {
+            "dc20-4h": {},
+            "dc20-4h-w": {"stop_atr": 3.0, "trail_atr": 5.0},
+            "dc20-4h-ema-w": {"trend": "ema", "stop_atr": 3.0, "trail_atr": 5.0},
+            "dc55-4h-w": {"entry_period": 55, "stop_atr": 3.0, "trail_atr": 5.0},
+            "dc55-4h-ema-w": {"entry_period": 55, "trend": "ema",
+                              "stop_atr": 3.0, "trail_atr": 5.0},
+            "dc55-x20-4h": {"entry_period": 55, "exit_period": 20, "trail_atr": 0.0},
+        })
+        self.assertEqual(len(g.configs), len(dict(g.configs)))  # unique names
+        for _, overrides in g.configs:
+            BaseConfig(**overrides)                              # all valid
+
+
+def _result(n=150, pf=1.2, pf_a=1.1, pf_b=1.3, sums=(5.0, 3.0, -1.0), pctile=0.999):
+    return {"name": "x", "all": {"n": n, "pf": pf}, "a": {"pf": pf_a},
+            "b": {"pf": pf_b}, "pctile": pctile,
+            "per_symbol": {f"S{k}": {"sum_pct": s} for k, s in enumerate(sums)}}
+
+
+class Gate(unittest.TestCase):
+    GRID = bt.Grid("4h", (), seeds=10, pass_pctile=0.996, min_trades=100)
+
+    def test_pass(self):
+        self.assertEqual(bt.gate_failures(_result(), self.GRID), [])
+        self.assertEqual(bt.gate_failures(_result(pf=math.inf), self.GRID), [])
+
+    def test_each_rule_fails_alone(self):
+        cases = {
+            "n<100": {"n": 99},
+            "PF<=1": {"pf": 1.0},
+            "PF A<=1": {"pf_a": 0.99},
+            "PF B<=1": {"pf_b": None},
+            "symbols": {"sums": (5.0, -1.0, 0.0)},       # 1 of 3 positive
+            "rand": {"pctile": 0.995},
+        }
+        for reason, kw in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(bt.gate_failures(_result(**kw), self.GRID), [reason])
+
+    def test_symbol_tie_is_not_a_majority(self):
+        self.assertEqual(bt.gate_failures(_result(sums=(5.0, 3.0, -1.0, -2.0)),
+                                          self.GRID), ["symbols"])
+
+    def test_no_trades_fails_everything_it_can(self):
+        got = bt.gate_failures(_result(n=0, pf=None, pf_a=None, pf_b=None,
+                                       sums=(0.0, 0.0, 0.0), pctile=None), self.GRID)
+        self.assertEqual(got, ["n<100", "PF<=1", "PF A<=1", "PF B<=1", "symbols", "rand"])
+
+
 def _wave_fetch(calls=None):
     """Keyless-API stand-in: deterministic 15m wave (3-day cycle + drift)."""
     def fetch(url):
@@ -351,6 +415,31 @@ class Main(unittest.TestCase):
         self.assertIn("simulated", text.lower())          # never reads as real P&L
         for name, _ in bt.GRID:
             self.assertIn(name, text)
+        self.assertIn(" 1h,", text)
+        self.assertIn("| gate |", text)
+
+    def test_refuses_timeframe_that_contradicts_the_grid(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = bt.main(["--grid", "g2", "--timeframe", "1h", "--end", "2026-08-01",
+                          "--cache", tmp], fetch=_wave_fetch(calls))
+        self.assertEqual(rc, 2)
+        self.assertEqual(calls, [])                       # refused before any fetch
+
+    def test_grid2_end_to_end_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "r.md"
+            rc = bt.main(["--grid", "g2", "--symbols", "BTCUSDT", "--start", "2026-04-01",
+                          "--end", "2026-08-01", "--cache", tmp, "--seeds", "3",
+                          "--out", str(out)],
+                         fetch=_wave_fetch(), now_ms=bt.FIT_CUTOFF_MS)
+            self.assertEqual(rc, 0)
+            text = out.read_text()
+        self.assertIn(" 4h,", text)
+        self.assertIn("grid g2", text)
+        self.assertIn("99.6%", text)                      # the declared gate is printed
+        for name, _ in bt.GRIDS["g2"].configs:
+            self.assertIn(f"| {name} |", text)
 
 
 if __name__ == "__main__":
