@@ -5,8 +5,8 @@
 SIMULATED unit-notional returns on synthetic klines — not real funds, not compounded. Fit window only: nothing at or after 2026-09-17 00:00 +07 is used.
 Costs (spot): fee 0.100% + slippage 0.050% per side. Halves split by entry-signal time at 2025-05-10 00:00 +07. Random control: 5 seeds, same exits, rate- and side-matched entries.
 Gate (pre-declared): n >= 100, net PF > 1 overall and in both halves, sum% > 0 in a majority of symbols, beats random >= 99.8% of seeds (>= 5/5 seeds).
-Nulls (5 seeds each; routed exits follow the same labels in every arm): uncond = random entries on any flat bar; matched = random entries only on bars the config's router labels with-trend (CH-1); shift = the strategy's own entries with its exit labels circularly shifted by >= 42 bars (router timing). Control rates are exact: trades per eligible flat decision bar. "beats random" is the matched null for routed configs, uncond otherwise.
-Routed configs must also beat the baseline c1-base's sum% (base).
+Nulls (5 seeds each; routed exits follow the same labels in every arm): uncond = random entries on any flat bar; matched = random entries only on bars the config's router labels with-trend (CH-1); shift = the strategy's own entries with its exit router's labels circularly shifted by >= 42 bars (router timing). Control rates are exact: trades per eligible flat decision bar. "beats random" is the matched null for routed configs, uncond otherwise.
+Routed configs must also beat the baseline c1-base's sum% (base). c1-base is the baseline only (D7): its gate is reported, never promoted to forward paper.
 Funding: none (spot).
 
 | config | tf | n | L/S | PF | win | sum% | maxDD% | avgR | SQN | PF A | PF B | PF fund n/abp | rand sum% p50 | beats rand | gate |
@@ -14,7 +14,7 @@ Funding: none (spot).
 | c1-base | 4h | 133 | 133/0 | 10.39 | 57% | +2616.0 | 21.2 | +3.375 | 6.06 | 11.77 | 9.23 | n/a | +1649.0 | 5/5 | PASS |
 | c2-r1-gate | 4h | 133 | 133/0 | 10.39 | 57% | +2616.0 | 21.2 | +3.375 | 6.06 | 11.78 | 9.23 | n/a | +2510.0 | 5/5 | PASS |
 | c3-r1-trail | 4h | 223 | 223/0 | 7.41 | 57% | +2127.9 | 32.1 | +1.655 | 7.40 | 7.79 | 7.10 | n/a | +2029.9 | 5/5 | base |
-| c4-clf-trail | 4h | 218 | 218/0 | 7.60 | 56% | +2159.6 | 32.0 | +1.720 | 7.44 | 8.30 | 7.04 | n/a | +2189.9 | 1/5 | rand, base |
+| c4-clf-trail | 4h | 218 | 218/0 | 7.58 | 56% | +2158.7 | 32.0 | +1.719 | 7.43 | 8.24 | 7.04 | n/a | +2053.6 | 5/5 | base |
 
 Per symbol (n / PF / sum%):
 
@@ -23,9 +23,9 @@ Per symbol (n / PF / sum%):
 | c1-base | 49 / 5.05 / +588.0 | 45 / 15.77 / +1019.6 | 39 / 16.63 / +1008.4 |
 | c2-r1-gate | 49 / 5.05 / +588.0 | 45 / 15.77 / +1019.6 | 39 / 16.64 / +1008.4 |
 | c3-r1-trail | 74 / 4.91 / +516.0 | 73 / 11.15 / +930.3 | 76 / 7.30 / +681.6 |
-| c4-clf-trail | 74 / 4.86 / +509.0 | 71 / 11.38 / +950.3 | 73 / 7.76 / +700.3 |
+| c4-clf-trail | 74 / 4.86 / +509.0 | 71 / 11.38 / +950.3 | 73 / 7.69 / +699.4 |
 
-Nulls and routing (per-arm n and hold-time percentiles in bars, CH-2; on-share = share of window / held bars labelled with-trend):
+Nulls and routing (per-arm n and hold-time percentiles in bars, CH-2; on-share = share of window / held bars the exit router labels with-trend):
 
 | config | router | on-share bars / held | arm | n p5/p50/p95 | hold p50/p90 | sum% p50 | beats | gates |
 |---|---|---|---|---|---|---|---|---|
@@ -38,16 +38,16 @@ Nulls and routing (per-arm n and hold-time percentiles in bars, CH-2; on-share =
 | c3-r1-trail | r1 | 47% / 78% | uncond | 244/253/259 | 16/66 | +1114.4 | 5/5 |  |
 | c3-r1-trail | r1 | 47% / 78% | matched | 235/241/252 | 22/79 | +2029.9 | 5/5 | yes |
 | c3-r1-trail | r1 | 47% / 78% | shift | 202/214/217 | 31/91 | +2168.4 | 1/5 |  |
-| c4-clf-trail | clf | 47% / 85% | strategy | 218 | 28/88 | +2159.6 | | |
-| c4-clf-trail | clf | 47% / 85% | uncond | 240/251/255 | 17/67 | +1125.6 | 5/5 |  |
-| c4-clf-trail | clf | 47% / 85% | matched | 216/228/231 | 26/85 | +2189.9 | 1/5 | yes |
-| c4-clf-trail | clf | 47% / 85% | shift | 201/202/213 | 31/96 | +2262.3 | 1/5 |  |
+| c4-clf-trail | r1, exits clf | 47% / 85% | strategy | 218 | 28/88 | +2158.7 | | |
+| c4-clf-trail | r1, exits clf | 47% / 85% | uncond | 240/251/255 | 17/67 | +1125.6 | 5/5 |  |
+| c4-clf-trail | r1, exits clf | 47% / 85% | matched | 229/236/247 | 24/81 | +2053.6 | 5/5 | yes |
+| c4-clf-trail | r1, exits clf | 47% / 85% | shift | 201/202/213 | 31/96 | +2261.4 | 1/5 |  |
 
 Claims:
 
 - Router timing, c3-r1-trail: beats its shift null in 1/5 seeds (need >= 5/5) -> router claim NOT supported (needs the gate AND the shift null).
 - Router timing, c4-clf-trail: beats its shift null in 1/5 seeds (need >= 5/5) -> router claim NOT supported (needs the gate AND the shift null).
-- AI increment, c4-clf-trail vs c3-r1-trail: sum% +2159.6 vs +2127.9 (+31.7); c4-clf-trail gate rand, base -> AI claim REJECTED (the AI added nothing) (needs the gate AND sum% above its r1 twin).
+- AI increment, c4-clf-trail vs c3-r1-trail: sum% +2158.7 vs +2127.9 (+30.7); c4-clf-trail gate base -> AI claim REJECTED (the AI added nothing) (needs the gate AND sum% above its r1 twin).
 
 Classifier folds (4h; walk-forward, purged, threshold exposure-matched to r1 on the training rows; weights not printed):
 
