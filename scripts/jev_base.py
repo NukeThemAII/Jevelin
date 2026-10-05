@@ -23,7 +23,10 @@ Exits, all in ATR units: initial stop ``stop_atr`` x ATR from the fill (a
 resting stop, gap-aware: a gap through it fills at the open); chandelier trail
 ``trail_atr`` x ATR from the extreme since entry (ratchets, never loosens;
 0 = off); optional opposite ``exit_period`` channel and ``max_hold_bars`` time
-stop, both acted on at the next price.
+stop, both acted on at the next price. Per-regime exits (grid g3): with
+``trail_atr_off`` > 0 the trail uses that multiple on any bar whose regime is
+not the trade's trend (trend_up for longs, trend_down for shorts; missing ->
+off, fail closed); 0 = the trail ignores regime.
 """
 from __future__ import annotations
 
@@ -47,6 +50,7 @@ class BaseConfig:
     atr_period: int = 14             # Wilder ATR
     stop_atr: float = 2.0            # initial stop distance (ATR)
     trail_atr: float = 3.0           # chandelier trail (ATR); 0 = off
+    trail_atr_off: float = 0.0       # trail on off-regime bars (ATR); 0 = trail_atr
     exit_period: int = 0             # opposite-channel exit lookback; 0 = off
     max_hold_bars: int = 0           # time stop; 0 = off
     trend: str = "none"              # none | ema | regime
@@ -69,8 +73,10 @@ class BaseConfig:
                 raise ValueError(f"{name} must be >= 0")
         if self.stop_atr <= 0:
             raise ValueError("stop_atr must be > 0")
-        if self.trail_atr < 0 or self.entry_buffer_atr < 0 or self.entry_z <= 0:
-            raise ValueError("trail_atr/entry_buffer_atr must be >= 0, entry_z > 0")
+        if self.trail_atr < 0 or self.trail_atr_off < 0 or self.entry_buffer_atr < 0 \
+                or self.entry_z <= 0:
+            raise ValueError("trail_atr/trail_atr_off/entry_buffer_atr must be >= 0, "
+                             "entry_z > 0")
 
 
 @dataclass(frozen=True)
@@ -267,21 +273,26 @@ def stop_exit(pos: Position, o, h, lo) -> Optional[tuple]:
     return None
 
 
-def after_close(pos: Position, ind, j, cfg: BaseConfig) -> Optional[str]:
+def after_close(pos: Position, ind, j, cfg: BaseConfig,
+                regime: Optional[str] = None) -> Optional[str]:
     """Bar j closed with the position still open: ratchet the trail (after the
     intrabar stop check, so a bar never raises its own stop), then return a
-    signal exit ("channel" | "time") to act on at the next price, or None."""
+    signal exit ("channel" | "time") to act on at the next price, or None.
+    ``regime`` is bar j's label; it only matters when ``trail_atr_off`` > 0."""
     pos.bars_held += 1
     atr = ind["atr"][j]
     long_ = pos.side == "long"
+    trail = cfg.trail_atr
+    if cfg.trail_atr_off > 0 and regime != ("trend_up" if long_ else "trend_down"):
+        trail = cfg.trail_atr_off
     if long_:
         pos.extreme = max(pos.extreme, ind["high"][j])
-        if cfg.trail_atr > 0 and atr is not None:
-            pos.stop = max(pos.stop, pos.extreme - cfg.trail_atr * atr)
+        if trail > 0 and atr is not None:
+            pos.stop = max(pos.stop, pos.extreme - trail * atr)
     else:
         pos.extreme = min(pos.extreme, ind["low"][j])
-        if cfg.trail_atr > 0 and atr is not None:
-            pos.stop = min(pos.stop, pos.extreme + cfg.trail_atr * atr)
+        if trail > 0 and atr is not None:
+            pos.stop = min(pos.stop, pos.extreme + trail * atr)
     if cfg.exit_period:
         close = ind["close"][j]
         if long_ and ind["exit_lower"][j] is not None and close < ind["exit_lower"][j]:

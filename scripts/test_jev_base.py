@@ -221,6 +221,40 @@ class PositionManagement(unittest.TestCase):
                "exit_upper": [110.0], "exit_lower": [98.0]}
         self.assertEqual(after_close(p, ind, 0, cfg), "channel")
 
+    def test_off_regime_trail_tightens_and_ratchets(self):
+        # g3 per-regime exits: trail_atr while the bar reads the trade's trend,
+        # trail_atr_off otherwise; the stop still never loosens.
+        cfg = replace(self.CFG, trail_atr=5.0, trail_atr_off=3.0)
+        p = Position("long", T0, 100.0, stop=70.0, extreme=100.0, init_risk=30.0)
+        ind = {"high": [120.0, 120.0, 130.0], "low": [100.0, 100.0, 110.0],
+               "close": [118.0, 115.0, 128.0], "atr": [5.0, 5.0, 5.0],
+               "exit_upper": [None] * 3, "exit_lower": [None] * 3}
+        after_close(p, ind, 0, cfg, regime="trend_up")
+        self.assertEqual(p.stop, 95.0)                            # 120 - 5*5
+        after_close(p, ind, 1, cfg, regime="chop")
+        self.assertEqual(p.stop, 105.0)                           # 120 - 3*5
+        after_close(p, ind, 2, cfg, regime="trend_up")
+        self.assertEqual(p.stop, 105.0)                           # 130 - 25 = 105: held
+
+    def test_off_regime_trail_fails_closed_and_mirrors_shorts(self):
+        cfg = replace(self.CFG, trail_atr=5.0, trail_atr_off=3.0)
+        ind = {"high": [100.0], "low": [80.0], "close": [82.0], "atr": [4.0],
+               "exit_upper": [None], "exit_lower": [None]}
+        for regime, stop in ((None, 92.0), ("trend_up", 92.0), ("trend_down", 100.0)):
+            with self.subTest(regime=regime):
+                p = Position("short", T0, 100.0, stop=120.0, extreme=100.0, init_risk=20.0)
+                after_close(p, ind, 0, cfg, regime=regime)
+                self.assertEqual(p.stop, stop)     # only trend_down is with-trend
+
+    def test_off_regime_trail_zero_is_the_legacy_trail(self):
+        p = Position("long", T0, 100.0, stop=90.0, extreme=100.0, init_risk=10.0)
+        ind = {"high": [120.0], "low": [100.0], "close": [118.0], "atr": [5.0],
+               "exit_upper": [None], "exit_lower": [None]}
+        after_close(p, ind, 0, self.CFG, regime="chop")
+        self.assertEqual(p.stop, 105.0)                           # 120 - 3*5, unchanged
+        with self.assertRaises(ValueError):
+            BaseConfig(trail_atr_off=-1.0)
+
     def test_time_stop(self):
         cfg = replace(self.CFG, max_hold_bars=2)
         p = Position("long", T0, 100.0, stop=80.0, extreme=100.0, init_risk=20.0)
