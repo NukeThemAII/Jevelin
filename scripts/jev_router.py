@@ -3,8 +3,9 @@
 
 One question per signal bar: keep the trend settings (``ON`` = "trend_up")
 or not (``OFF`` = "chop"). The router never creates, sizes or exits a trade;
-the base strategy consumes its label exactly like a jev_regime label (entry
-filter ``trend: regime`` and the per-regime trail ``trail_atr_off``).
+c4 reads its label exactly like a jev_regime label, on the per-regime trail
+``trail_atr_off`` only. c4's entries stay c3's r1 gate (D6, Oracle 2026-10-05:
+the AI routes exits, never picks entries).
 
 Features (``FEATURES``), causal (bars closed by the signal close) and
 scale-free (CH-3: no absolute-USD level reaches the model):
@@ -21,7 +22,7 @@ quarter (+07) from the window start. A fold trains on every row from
 ``train_start`` whose label window closes by the fold start (purged) and
 labels that quarter only. Threshold: exposure-matched — tau switches the same
 share of TRAINING rows on as the R1 router has on them, so c4 vs c3 compares
-routers at equal exposure, not more vs less time in the market.
+when the trail is wide at equal exposure, not more vs less time on it.
 """
 from __future__ import annotations
 

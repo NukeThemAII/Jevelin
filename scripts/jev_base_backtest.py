@@ -34,8 +34,9 @@ Jev is not replayed here: no verdicts exist before 2026-09-27, so the veto
 (jev_base.jev_veto) is a forward-paper concern only.
 
 Routed grids (g3): a config may name a ``router`` whose labels feed its
-entry filter and per-regime trail (``ROUTERS``: live, r1, clf); each routed
-config is also judged against the matched and shift nulls (``NULLS``), and
+entry filter and per-regime trail (``ROUTERS``: live, r1, clf), and an
+``exit_router`` that takes over the trail alone; each routed config is also
+judged against the matched and shift nulls (``NULLS``), and
 ``--prescreen`` prints return-blind label/signal counts without simulating a
 trade. ``--synthetic`` swaps the market for a seeded random walk (temp cache,
 no network) to dry-run the harness end to end.
@@ -122,14 +123,16 @@ GRID2 = (
 # regime-routed exits on a fresh venue (spot, long-only). c1 = grid 2's best
 # shape (dc20-4h-w) at spot costs; c2 gates entries on the r1 router; c3 also
 # routes the trail (5 ATR on trend_up bars, grid 2's 3 ATR default off them);
-# c4 = c3 with r1 swapped for the local classifier. c4 vs c3 is the entire AI
-# increment.
+# c4 = c3 with the trail's r1 labels swapped for the local classifier's; its
+# entries stay c3's (D6, Oracle 2026-10-05: the AI routes exits, never picks
+# entries). c4 vs c3 is the entire AI increment.
 _WIDE = {"stop_atr": 3.0, "trail_atr": 5.0}
 GRID3 = (
     ("c1-base", dict(_WIDE)),
     ("c2-r1-gate", {**_WIDE, "trend": "regime", "router": "r1"}),
     ("c3-r1-trail", {**_WIDE, "trend": "regime", "trail_atr_off": 3.0, "router": "r1"}),
-    ("c4-clf-trail", {**_WIDE, "trend": "regime", "trail_atr_off": 3.0, "router": "clf"}),
+    ("c4-clf-trail", {**_WIDE, "trend": "regime", "trail_atr_off": 3.0, "router": "r1",
+                      "exit_router": "clf"}),
 )
 
 # Report-only funding stress (perps): longs pay this per 8h held, shorts are
@@ -166,12 +169,14 @@ class Grid:
         if self.train_start is not None:
             since_ms(self.train_start)
         for name, overrides in self.configs:
-            router = overrides.get("router", "live")
-            if router not in ROUTERS:
-                raise ValueError(f"{name}: router must be one of {ROUTERS}: {router!r}")
-            if router == "clf" and self.train_start is None:
-                raise ValueError(f"{name}: the clf router needs train_start")
+            for router in config_routers(overrides):
+                if router not in ROUTERS:
+                    raise ValueError(f"{name}: router must be one of {ROUTERS}: {router!r}")
+                if router == "clf" and self.train_start is None:
+                    raise ValueError(f"{name}: the clf router needs train_start")
             cfg = BaseConfig(**base_overrides(overrides))
+            if "exit_router" in overrides and cfg.trail_atr_off <= 0:
+                raise ValueError(f"{name}: an exit_router needs routed exits")
             if not is_routed(cfg) or self.routed_gate == "uncond":
                 continue
             if self.routed_gate == "matched" and cfg.trend != "regime":
@@ -192,9 +197,11 @@ class Grid:
         """Routers the routed configs read, in config order."""
         out = []
         for _, overrides in self.configs:
-            r = overrides.get("router", "live")
-            if is_routed(BaseConfig(**base_overrides(overrides))) and r not in out:
-                out.append(r)
+            cfg = BaseConfig(**base_overrides(overrides))
+            entry, exit_ = config_routers(overrides)
+            for r in [entry] * (cfg.trend == "regime") + [exit_] * (cfg.trail_atr_off > 0):
+                if r not in out:
+                    out.append(r)
         return tuple(out)
 
     @property
@@ -207,9 +214,19 @@ class Grid:
         return tuple(out)
 
 
+GRID_KEYS = ("router", "exit_router")
+
+
 def base_overrides(overrides) -> dict:
-    """Config overrides minus the grid-level ``router`` key."""
-    return {k: v for k, v in overrides.items() if k != "router"}
+    """Config overrides minus the grid-level router keys."""
+    return {k: v for k, v in overrides.items() if k not in GRID_KEYS}
+
+
+def config_routers(overrides) -> tuple:
+    """(entry router, exit router): the trail reads ``exit_router`` if given,
+    else the entry filter's ``router`` (default live)."""
+    router = overrides.get("router", "live")
+    return router, overrides.get("exit_router", router)
 
 
 def is_routed(cfg: BaseConfig) -> bool:
@@ -399,12 +416,12 @@ WITH_TREND = {"long": "trend_up", "short": "trend_down"}
 
 
 def random_control(ind, cfg, fee, slip, rate, long_share, seed, start_ts=None,
-                   regimes=None, matched=False) -> list:
+                   regimes=None, exit_regimes=None, matched=False) -> list:
     """Seeded coin-flip entries (``rate`` per bar while flat) with the same
     exits. Two draws per bar regardless of state: the schedule is fixed by
-    the seed, not by the path. ``regimes`` route the exits as they do the
-    strategy's; ``matched`` also discards a drawn entry unless its bar is
-    labelled with-trend for the drawn side (regime-matched control, CH-1)."""
+    the seed, not by the path. ``regimes`` / ``exit_regimes`` route the exits
+    as they do the strategy's; ``matched`` also discards a drawn entry unless
+    ``regimes`` labels its bar with-trend for the drawn side (CH-1)."""
     rng = random.Random(seed)
     entries = []
     for k, _ in enumerate(ind["ts"]):
@@ -414,7 +431,7 @@ def random_control(ind, cfg, fee, slip, rate, long_share, seed, start_ts=None,
             side = None
         entries.append(side)
     return simulate(ind, cfg, fee, slip, start_ts=start_ts, regimes=regimes,
-                    entries=entries)
+                    entries=entries, exit_regimes=exit_regimes)
 
 
 def shift_routes(labels, lo, rng, min_shift) -> list:
@@ -553,23 +570,27 @@ def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"],
 
     Every config gets the unconditional null; in an extended grid a routed
     config also gets the matched null (routed entries) and the shift null
-    (routed exits), and ``grid.routed_gate`` picks the one that gates it."""
+    (routed exits), and ``grid.routed_gate`` picks the one that gates it.
+    Entries and the matched draw read the config's router; the trail and the
+    shift null read its exit router (the same one unless split)."""
     mid = start_ms + (end_ms - start_ms) // 2
     results = []
     for name, overrides in grid.configs:
         tf = grid.timeframe_of(overrides)
-        router = overrides.get("router", "live")
+        router, exit_router = config_routers(overrides)
         cfg = replace(BaseConfig(), **{"timeframe": tf, "sides": sides,
                                        **base_overrides(overrides)})
         routed = is_routed(cfg)
         trades, per_symbol, arms = [], {}, {}
         for sym, (bars, routes) in series[tf].items():
             labels = _route_labels(routes, router, routed)
+            exits = (labels if exit_router == router else
+                     _route_labels(routes, exit_router, routed))
             ind = indicators(bars, cfg)
             dec = []
             got = simulate(ind, cfg, fee, slip, start_ts=start_ms, regimes=labels,
-                           decisions=dec)
-            arms[sym] = (ind, got, labels, dec)
+                           exit_regimes=exits, decisions=dec)
+            arms[sym] = (ind, got, labels, exits, dec)
             per_symbol[sym] = metrics(got)
             trades += got
         m = metrics(trades)
@@ -582,9 +603,9 @@ def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"],
             for seed in range(seeds):
                 pooled = []
                 rng = random.Random(seed)
-                for sym, (ind, got, labels, dec) in arms.items():
+                for sym, (ind, got, labels, exits, dec) in arms.items():
                     if kind == "shift":
-                        shifted = shift_routes(labels, bisect_left(ind["ts"], start_ms), rng,
+                        shifted = shift_routes(exits, bisect_left(ind["ts"], start_ms), rng,
                                                SHIFT_MIN_BARS)
                         pooled += simulate(ind, cfg, fee, slip, start_ts=start_ms,
                                            regimes=labels, exit_regimes=shifted)
@@ -600,7 +621,7 @@ def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"],
                         rate = _entry_rate(ind, got, start_ms)
                     pooled += random_control(ind, cfg, fee, slip, rate, share, seed=seed,
                                              start_ts=start_ms, regimes=labels,
-                                             matched=matched)
+                                             exit_regimes=exits, matched=matched)
                 if kind == "shift":      # metrics' order: a no-op shift ties exactly
                     pooled.sort(key=lambda t: t.get("exit_ts", 0))
                 sums.append(sum(t["net_pct"] for t in pooled))
@@ -613,16 +634,16 @@ def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"],
         on_share = None
         if grid.extended and routed:
             bars_on = held_on = held = n_bars = 0
-            for sym, (ind, got, labels, dec) in arms.items():
+            for sym, (ind, got, labels, exits, dec) in arms.items():
                 for k, t in enumerate(ind["ts"]):
                     if start_ms <= t < end_ms:
                         n_bars += 1
-                        bars_on += _on(labels[k], sides)
+                        bars_on += _on(exits[k], sides)
                 for t in got:
                     e = bisect_left(ind["ts"], t["entry_ts"])
                     for k in range(e, e + t["bars"]):
                         held += 1
-                        held_on += _on(labels[k], sides)
+                        held_on += _on(exits[k], sides)
             on_share = {"bars": bars_on / n_bars if n_bars else None,
                         "held": held_on / held if held else None}
         results.append({
@@ -633,7 +654,9 @@ def run(series, start_ms, end_ms, fee, slip, sides, seeds, grid=GRIDS["g1"],
             "pctile": g["pctile"],
             "pf_fund": [profit_factor(funded_pcts(trades, f, TF_MS[tf]))
                         for f in funding],
-            "router": router if routed else None, "nulls": nulls, "gated": gated,
+            "router": router if routed else None,
+            "exit_router": exit_router if routed else None,
+            "nulls": nulls, "gated": gated,
             "on_share": on_share,
             "holds": (_q([t["bars"] for t in trades], 0.5),
                       _q([t["bars"] for t in trades], 0.9)),
@@ -662,9 +685,11 @@ def _claims(results, grid, need, seeds) -> list:
                      f"router claim {'SUPPORTED' if ok else 'NOT supported'} "
                      "(needs the gate AND the shift null).")
     for name, overrides in grid.configs:
-        if overrides.get("router") != "clf":
+        routers = config_routers(overrides)
+        if "clf" not in routers:
             continue
-        twin = next((n for n, o in grid.configs if o.get("router") == "r1" and
+        want = tuple("r1" if r == "clf" else r for r in routers)
+        twin = next((n for n, o in grid.configs if config_routers(o) == want and
                      base_overrides(o) == base_overrides(overrides)), None)
         if twin is None:
             continue
@@ -685,7 +710,10 @@ def _nulls_table(results) -> list:
         on = r["on_share"]
         cell = ("n/a" if on is None else
                 f"{_f(on['bars'], '{:.0%}')} / {_f(on['held'], '{:.0%}')}")
-        head = f"| {r['name']} | {r['router'] or 'none'} | {cell} "
+        rt = r["router"] or "none"
+        if r.get("exit_router") not in (None, r["router"]):
+            rt += f", exits {r['exit_router']}"
+        head = f"| {r['name']} | {rt} | {cell} "
         lines.append(head + f"| strategy | {r['all']['n']} "
                      f"| {_f(r['holds'][0], '{}')}/{_f(r['holds'][1], '{}')} "
                      f"| {r['all']['sum_pct']:+.1f} | | |")
@@ -729,12 +757,14 @@ def build_report(results, symbols, start_ms, end_ms, grid_name, book, fee, slip,
             f"Nulls ({seeds} seeds each; routed exits follow the same labels in every arm): "
             "uncond = random entries on any flat bar; matched = random entries only on "
             "bars the config's router labels with-trend (CH-1); shift = the strategy's "
-            f"own entries with its exit labels circularly shifted by >= {SHIFT_MIN_BARS} "
-            "bars (router timing). Control rates are exact: trades per eligible flat "
+            "own entries with its exit router's labels circularly shifted by >= "
+            f"{SHIFT_MIN_BARS} bars (router timing). Control rates are exact: trades per "
+            "eligible flat "
             f"decision bar. \"beats random\" is the {grid.routed_gate} null for routed "
             "configs, uncond otherwise.",
-        ] + ([f"Routed configs must also beat the baseline {grid.baseline}'s sum% (base)."]
-             if grid.baseline else [])
+        ] + ([f"Routed configs must also beat the baseline {grid.baseline}'s sum% (base). "
+              f"{grid.baseline} is the baseline only (D7): its gate is reported, never "
+              "promoted to forward paper."] if grid.baseline else [])
     lines += [
         (f"Funding stress (report-only, not in the gate): longs pay {fund} bp per 8h "
          "held (pro rata, exit bar counted in full), shorts credited nothing."
@@ -764,7 +794,8 @@ def build_report(results, symbols, start_ms, end_ms, grid_name, book, fee, slip,
         lines.append(f"| {r['name']} | " + " | ".join(cells) + " |")
     if grid.extended:
         lines += ["", "Nulls and routing (per-arm n and hold-time percentiles in bars, "
-                      "CH-2; on-share = share of window / held bars labelled with-trend):",
+                      "CH-2; on-share = share of window / held bars the exit router "
+                      "labels with-trend):",
                   ""] + _nulls_table(results)
         lines += ["", "Claims:", ""] + _claims(results, grid, need, seeds)
     if extra:

@@ -490,7 +490,7 @@ class Grids(unittest.TestCase):
             "c3-r1-trail": {**wide, "trend": "regime", "trail_atr_off": 3.0,
                             "router": "r1"},
             "c4-clf-trail": {**wide, "trend": "regime", "trail_atr_off": 3.0,
-                             "router": "clf"},
+                             "router": "r1", "exit_router": "clf"},
         })
         self.assertEqual(g.timeframes, ("4h",))
         self.assertEqual(g.routers, ("r1", "clf"))
@@ -506,6 +506,19 @@ class Grids(unittest.TestCase):
         with self.assertRaises(ValueError):                       # clf needs training history
             bt.Grid("4h", (("x", {"trend": "regime", "router": "clf"}),), seeds=1,
                     pass_pctile=0.5)
+        with self.assertRaises(ValueError):                       # unknown exit router
+            bt.Grid("4h", (("x", {"trail_atr_off": 2.0, "exit_router": "gpt"}),), seeds=1,
+                    pass_pctile=0.5)
+        with self.assertRaises(ValueError):                       # exit router, unrouted exits
+            bt.Grid("4h", (("x", {"trend": "regime", "router": "r1", "exit_router": "live"}),),
+                    seeds=1, pass_pctile=0.5)
+        with self.assertRaises(ValueError):                       # clf exits need training history
+            bt.Grid("4h", (("x", {"trail_atr_off": 2.0, "exit_router": "clf"}),), seeds=1,
+                    pass_pctile=0.5)
+        split = bt.Grid("4h", (("x", {"trend": "regime", "trail_atr_off": 2.0, "router": "r1",
+                                      "exit_router": "clf"}),), seeds=1, pass_pctile=0.5,
+                        train_start="2022-01-01")
+        self.assertEqual(split.routers, ("r1", "clf"))
         with self.assertRaises(ValueError):                       # shift gate needs routed exits
             bt.Grid("4h", (("x", {"trend": "regime"}),), seeds=1, pass_pctile=0.5,
                     routed_gate="shift")
@@ -547,7 +560,7 @@ class Run(unittest.TestCase):
         calls = []
 
         def fake_control(ind, cfg, fee, slip, rate, long_share, seed, start_ts=None,
-                         regimes=None, matched=False):
+                         regimes=None, exit_regimes=None, matched=False):
             calls.append((long_share, seed, start_ts))
             return [{"side": "long", "net_pct": (100.0, -100.0, 1.0)[seed]}]
 
@@ -581,9 +594,22 @@ class RunRouted(unittest.TestCase):
         return _breakout_then(*Simulate.RUN_UP, (103.2, 104, 102.8, 103.5),
                               (103.5, 104, 103, 103.8), *[(103.8, 104.3, 103.3, 103.8)] * 8)
 
-    def _run(self, r1, grid=None, live=None, **kw):
+    def _split_grid(self, seeds=3):
+        # c3/c4's shape: "split" keeps trail's entries and routes only its trail on clf
+        return bt.Grid("1h", (("base", dict(self.SMALL)),
+                              ("trail", dict(self.SMALL, trend="regime", trail_atr_off=1.0,
+                                             router="r1")),
+                              ("split", dict(self.SMALL, trend="regime", trail_atr_off=1.0,
+                                             router="r1", exit_router="clf"))),
+                       seeds=seeds, pass_pctile=0.5, book="spot", routed_gate="matched",
+                       exact_rate=True, baseline="base", train_start="2022-01-01")
+
+    def _run(self, r1, grid=None, live=None, clf=None, **kw):
         bars = self._bars()
-        series = {"1h": {"S": (bars, {"live": live or ["chop"] * len(bars), "r1": r1})}}
+        routes = {"live": live or ["chop"] * len(bars), "r1": r1}
+        if clf is not None:
+            routes["clf"] = clf
+        series = {"1h": {"S": (bars, routes)}}
         with mock.patch.object(bt, "SHIFT_MIN_BARS", 2):
             res = bt.run(series, T0, T0 + 200 * H, self.FEE, self.SLIP, ("long",),
                          seeds=3, grid=grid or self._grid(), **kw)
@@ -604,7 +630,7 @@ class RunRouted(unittest.TestCase):
         calls = []
 
         def fake_control(ind, cfg, fee, slip, rate, long_share, seed, start_ts=None,
-                         regimes=None, matched=False):
+                         regimes=None, exit_regimes=None, matched=False):
             calls.append((cfg.trail_atr_off, matched, rate))
             return [{"side": "long", "net_pct": -1.0 + seed, "bars": 2}]
 
@@ -663,6 +689,68 @@ class RunRouted(unittest.TestCase):
         self.assertEqual(t["on_share"]["held"], 1.0)
         self.assertIsNone(got["base"]["on_share"])
         self.assertEqual(len(t["holds"]), 2)
+
+    def test_exit_router_routes_only_the_trail(self):
+        from jev_base import indicators
+        n = len(self._bars())
+        up, chop = ["trend_up"] * n, ["chop"] * n
+        got = self._run(up, grid=self._split_grid(), clf=chop)
+        s = got["split"]
+        self.assertEqual(s["all"]["n"], 1)          # entries read r1: clf "chop" blocks none
+        self.assertEqual((s["router"], s["exit_router"]), ("r1", "clf"))
+        self.assertEqual((got["trail"]["router"], got["trail"]["exit_router"]), ("r1", "r1"))
+        self.assertEqual((got["base"]["router"], got["base"]["exit_router"]), (None, None))
+        cfg = replace(BaseConfig(), **dict(self.SMALL, trend="regime", trail_atr_off=1.0,
+                                           timeframe="1h", sides=("long",)))
+        want = bt.simulate(indicators(self._bars(), cfg), cfg, self.FEE, self.SLIP,
+                           start_ts=T0, regimes=up, exit_regimes=chop)
+        self.assertEqual(s["all"], bt.metrics(want))          # the trail reads clf
+        self.assertNotEqual(s["all"]["sum_pct"], got["trail"]["all"]["sum_pct"])
+        same = self._run(up, grid=self._split_grid(), clf=up)
+        self.assertEqual(same["split"]["all"], same["trail"]["all"])
+
+    def test_split_nulls_match_entries_on_the_router_and_exits_on_the_exit_router(self):
+        n = len(self._bars())
+        r1 = ["chop"] * 3 + ["trend_up"] * (n - 3)
+        clf = ["trend_up"] * 7 + ["chop"] * (n - 7)
+        calls, rotated = [], []
+        real_shift = bt.shift_routes
+
+        def fake_control(ind, cfg, fee, slip, rate, long_share, seed, start_ts=None,
+                         regimes=None, exit_regimes=None, matched=False):
+            calls.append((matched, regimes, exit_regimes))
+            return [{"side": "long", "net_pct": -1.0 + seed, "bars": 2}]
+
+        def spy_shift(labels, lo, rng, min_shift):
+            rotated.append(labels)
+            return real_shift(labels, lo, rng, min_shift)
+
+        with mock.patch.object(bt, "random_control", fake_control), \
+                mock.patch.object(bt, "shift_routes", spy_shift):
+            got = self._run(r1, grid=self._split_grid(), clf=clf)
+        self.assertEqual(set(got["split"]["nulls"]), {"uncond", "matched", "shift"})
+        self.assertEqual(got["split"]["gated"], "matched")
+        self.assertEqual(len(calls), 3 + 6 + 6)                      # base, trail, split
+        routed = calls[3:]                                           # base reads no labels
+        self.assertTrue(all(reg == r1 for _, reg, _ in routed))      # entries: r1 always
+        self.assertEqual([ex == clf for _, _, ex in routed], [False] * 6 + [True] * 6)
+        self.assertEqual(sorted(m for m, _, _ in routed[6:]), [False] * 3 + [True] * 3)
+        self.assertEqual(rotated, [r1] * 3 + [clf] * 3)              # each shifts its own trail
+
+    def test_split_on_share_reads_the_exit_router_and_its_ai_twin_is_the_r1_config(self):
+        n = len(self._bars())
+        clf = ["trend_up"] * 7 + ["chop"] * (n - 7)
+        grid = self._split_grid()
+        got = self._run(["trend_up"] * n, grid=grid, clf=clf)
+        self.assertAlmostEqual(got["split"]["on_share"]["bars"], 7 / n)
+        self.assertEqual(got["trail"]["on_share"]["bars"], 1.0)
+        lines = bt._claims(list(got.values()), grid, 2, 3)
+        ai = [ln for ln in lines if "AI increment" in ln]
+        self.assertEqual(len(ai), 1)
+        self.assertTrue(ai[0].startswith("- AI increment, split vs trail:"), ai[0])
+        table = "\n".join(bt._nulls_table(list(got.values())))
+        self.assertIn("| split | r1, exits clf |", table)
+        self.assertIn("| trail | r1 |", table)
 
 
 class Funding(unittest.TestCase):
@@ -827,7 +915,9 @@ class Main(unittest.TestCase):
         for arm in ("uncond", "matched", "shift"):
             self.assertIn(f"| {arm} |", text)
         self.assertIn("Classifier folds", text)
-        self.assertIn("AI increment", text)
+        self.assertIn("AI increment, c4-clf-trail vs c3-r1-trail", text)
+        self.assertIn("| c4-clf-trail | r1, exits clf |", text)
+        self.assertIn("c1-base is the baseline only (D7)", text)
 
     def test_synthetic_history_is_deterministic_and_chunk_consistent(self):
         fetch = bt.synthetic_fetch()
