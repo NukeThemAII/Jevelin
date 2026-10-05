@@ -713,7 +713,8 @@ def build_report(results, symbols, start_ms, end_ms, grid_name, book, fee, slip,
         lines += ["**SYNTHETIC DATA — seeded random walk with Markov drift, NOT market data. "
                   "Harness dry run only: these numbers say nothing about any strategy.**", ""]
     lines += [
-        "SIMULATED unit-notional returns on historical Binance spot klines — not real "
+        f"SIMULATED unit-notional returns on "
+        f"{'synthetic' if synthetic else 'historical Binance spot'} klines — not real "
         "funds, not compounded. Fit window only: nothing at or after "
         f"{_ts_bkk(FIT_CUTOFF_MS)} +07 is used.",
         f"Costs ({book}): fee {fee * 100:.3f}% + slippage {slip * 100:.3f}% per side. "

@@ -818,6 +818,7 @@ class Main(unittest.TestCase):
             self.assertEqual(list(Path(cache).iterdir()), [])     # cache never touched
             text = out.read_text()
         self.assertIn("SYNTHETIC", text)
+        self.assertNotIn("historical Binance", text)
         self.assertIn("grid g3", text)
         self.assertIn("Costs (spot)", text)
         self.assertIn(">= 2/2 seeds", text)
